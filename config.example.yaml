@@ -1,0 +1,28 @@
+# Optional. Copy to config.yaml to override defaults.
+# Write decimals as strings. A bare 0.01 is a binary float and is rejected.
+# Every risk limit below is at the hard cap. You may lower them. You may not raise them.
+
+mode: paper
+starting_cash: "1000"
+symbols:
+  - BTC-USD
+  - ETH-USD
+cost_per_side: "0.01"
+max_position_pct: "0.50"
+max_total_exposure_pct: "1"
+max_daily_drawdown_pct: "0.05"
+max_drawdown_pct: "0.10"
+max_trades_per_day: 4
+max_quote_age_seconds: 120
+max_daily_turnover_pct: "1"
+max_spread_pct: "0.03"
+min_order_notional: "1"
+# Chosen before any backtest. Do not retune these because a week looked good.
+sma_window: 20
+trend_band: "0.01"
+min_hold_days: 5
+trend_target_weight: "0.50"
+dca_notional: "25"
+loop_seconds: 60
+market_data: public
+public_provider: coinbase

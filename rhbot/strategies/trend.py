@@ -1,0 +1,141 @@
+"""Hold when the daily close is above a simple moving average, else cash.
+
+The window, band, and minimum hold were chosen before any backtest.
+They are not searched or picked because they looked best.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+
+from rhbot.config import Settings
+from rhbot.models import Bar, Fill, MarketSnapshot, OrderIntent
+from rhbot.money import q_cent
+
+
+def closed_bars(bars: list[Bar], now: datetime) -> list[Bar]:
+    cutoff = now - timedelta(days=1)
+    return sorted((bar for bar in bars if bar.ts <= cutoff), key=lambda bar: bar.ts)
+
+
+class TrendDaily:
+    name = "trend_daily"
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+
+    def initial_state(self) -> dict:
+        return {
+            "last_decision_date": None,
+            "evaluated_on": {},
+            "holding_since": {},
+            "flat_since": {},
+        }
+
+    def decide(
+        self,
+        view: MarketSnapshot,
+        state: dict,
+        positions: dict,
+        cash: Decimal,
+        equity: Decimal,
+        now: datetime,
+    ) -> tuple[list[OrderIntent], dict, str]:
+        del cash
+        today = now.astimezone(timezone.utc).date().isoformat()
+        evaluated = dict(state.get("evaluated_on") or {})
+        orders: list[OrderIntent] = []
+        notes: list[str] = []
+        for symbol in self.settings.symbols:
+            if evaluated.get(symbol) == today:
+                notes.append(f"{symbol}:already_decided_today")
+                continue
+            closed = closed_bars(view.bars.get(symbol, []), now)
+            if len(closed) < self.settings.sma_window:
+                notes.append(f"{symbol}:insufficient_history")
+                continue
+            if now - closed[-1].ts > timedelta(days=3):
+                notes.append(f"{symbol}:stale_candles")
+                continue
+            window = closed[-self.settings.sma_window :]
+            sma = sum((bar.close for bar in window), Decimal(0)) / Decimal(len(window))
+            last = window[-1].close
+            upper = sma * (Decimal(1) + self.settings.trend_band)
+            lower = sma * (Decimal(1) - self.settings.trend_band)
+            qty = positions.get(symbol, Decimal(0))
+            in_pos = qty > 0
+            if last > upper:
+                want_long = True
+            elif last < lower:
+                want_long = False
+            else:
+                want_long = in_pos
+            evaluated[symbol] = today
+            if want_long == in_pos:
+                notes.append(f"{symbol}:hold")
+                continue
+            if in_pos and not want_long:
+                held = (state.get("holding_since") or {}).get(symbol)
+                if held is not None and self._days(held, today) < self.settings.min_hold_days:
+                    notes.append(f"{symbol}:min_hold")
+                    continue
+                orders.append(
+                    OrderIntent(
+                        symbol=symbol,
+                        side="sell",
+                        reason="trend_exit",
+                        base_quantity=qty,
+                    )
+                )
+                notes.append(f"{symbol}:exit")
+                continue
+            flat_since = (state.get("flat_since") or {}).get(symbol)
+            if flat_since is not None and self._days(flat_since, today) < self.settings.min_hold_days:
+                notes.append(f"{symbol}:min_flat")
+                continue
+            quote = view.quotes.get(symbol)
+            current_value = qty * quote.mid if quote is not None else Decimal(0)
+            target = q_cent(equity * self.settings.trend_target_weight)
+            buy_amount = q_cent(target - current_value)
+            if buy_amount < self.settings.min_order_notional:
+                notes.append(f"{symbol}:below_min")
+                continue
+            orders.append(
+                OrderIntent(
+                    symbol=symbol,
+                    side="buy",
+                    reason="trend_entry",
+                    quote_amount=buy_amount,
+                )
+            )
+            notes.append(f"{symbol}:enter")
+        updated = dict(state)
+        updated["evaluated_on"] = evaluated
+        if evaluated and all(evaluated.get(symbol) == today for symbol in self.settings.symbols):
+            updated["last_decision_date"] = today
+        return orders, updated, ";".join(notes) or "no_trade"
+
+    def commit(self, state: dict, fills: list[Fill], positions: dict, now: datetime) -> dict:
+        del fills
+        today = now.astimezone(timezone.utc).date().isoformat()
+        holding = dict(state.get("holding_since") or {})
+        flat = dict(state.get("flat_since") or {})
+        for symbol in self.settings.symbols:
+            qty = positions.get(symbol, Decimal(0))
+            if qty > 0:
+                holding.setdefault(symbol, today)
+                flat.pop(symbol, None)
+            elif symbol in holding:
+                flat[symbol] = today
+                holding.pop(symbol, None)
+        updated = dict(state)
+        updated["holding_since"] = holding
+        updated["flat_since"] = flat
+        return updated
+
+    @staticmethod
+    def _days(start: str, today: str) -> int:
+        from datetime import date
+
+        return (date.fromisoformat(today) - date.fromisoformat(start)).days

@@ -1,0 +1,18 @@
+[Unit]
+Description=Paper-only BTC/ETH bot (rhbot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+WorkingDirectory=/opt/rhbot
+ExecStart=/opt/rhbot/.venv/bin/rhbot run --state-dir /var/lib/rhbot
+Restart=on-failure
+RestartSec=30
+WatchdogSec=180
+NoNewPrivileges=true
+# Optional read-only Robinhood quote key. Never commit that file.
+# EnvironmentFile=-/etc/rhbot/robinhood.env
+
+[Install]
+WantedBy=default.target
