@@ -233,21 +233,16 @@ class Engine:
         self.ledger.set_meta("portfolio_peak", money_str(peak))
 
     def mark(self, sleeve: str, snapshot: MarketSnapshot):
-        equity = self.ledger.cash(sleeve)
-        for symbol, qty in self.ledger.positions(sleeve).items():
-            quote = snapshot.quotes.get(symbol)
-            if quote is None:
-                raise RuntimeError(f"no quote to mark {symbol}")
-            equity += qty * quote.mid
-        return q8(equity)
-
-    def mark_to_bid(self, sleeve: str, snapshot: MarketSnapshot):
+        """Sleeve equity at the same mark-to-bid the freeze and kill use."""
         return mark_to_bid_equity(
             self.ledger.cash(sleeve),
             self.ledger.positions(sleeve),
             snapshot.quotes,
             self.settings.cost_per_side,
         )
+
+    def mark_to_bid(self, sleeve: str, snapshot: MarketSnapshot):
+        return self.mark(sleeve, snapshot)
 
     def heartbeat_body(self) -> dict:
         buy_pause = self._any_frozen()
@@ -427,13 +422,12 @@ class Engine:
         self.ledger.shadow_snapshot(shadow, equity, market_now)
 
     def shadow_mark(self, sleeve: str, snapshot: MarketSnapshot):
-        equity = self.ledger.shadow_cash(sleeve)
-        for symbol, qty in self.ledger.shadow_positions(sleeve).items():
-            quote = snapshot.quotes.get(symbol)
-            if quote is None:
-                raise RuntimeError(f"no quote to mark shadow {symbol}")
-            equity += qty * quote.mid
-        return q8(equity)
+        return mark_to_bid_equity(
+            self.ledger.shadow_cash(sleeve),
+            self.ledger.shadow_positions(sleeve),
+            snapshot.quotes,
+            self.settings.cost_per_side,
+        )
 
     def _shadow_context(self, sleeve: str, snapshot: MarketSnapshot, market_now: datetime) -> RiskContext:
         row = self.ledger.shadow_sleeve_row(sleeve)

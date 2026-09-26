@@ -9,7 +9,7 @@ import pytest
 
 from rhbot.errors import ConfigError, OrderRejected
 from rhbot.models import Bar, MarketSnapshot, OrderIntent, Quote
-from rhbot.money import D, money_str
+from rhbot.money import D, money_str, q8
 from rhbot.ops import engage_kill, iso, read_kill, utcnow
 from rhbot.status import assess
 
@@ -532,8 +532,9 @@ def test_f001_mark_to_bid_trips_when_mid_drawdown_does_not(tmp_path, now):
     later = now + timedelta(days=1)
     view = snapshot(later, mid="100")
     bot.run_once(now=later, snapshot=view)
-    assert bot.mark("trend_daily", view) == Decimal("905.00000000")
-    assert bot.mark_to_bid("trend_daily", view) == Decimal("895.95000000")
+    assert bot.mark("trend_daily", view) == Decimal("895.95000000")
+    assert bot.mark_to_bid("trend_daily", view) == bot.mark("trend_daily", view)
+    assert bot.ledger.sleeve_row("trend_daily")["last_equity"] == "895.95000000"
     mid_dd = D("905") / D("1000") - 1
     mtb_dd = D("895.95") / D("1000") - 1
     assert mid_dd > Decimal("-0.10")
@@ -541,6 +542,78 @@ def test_f001_mark_to_bid_trips_when_mid_drawdown_does_not(tmp_path, now):
     assert bot.ledger.overlay_row("trend_daily")["state"] == "FROZEN"
     assert bot.ledger.overlay_row("dca_weekly")["state"] == "ARMED"
     assert bot.ledger.positions("buy_and_hold")
+    bot.ledger.close()
+
+
+def test_ir002_equity_peak_daily_loss_and_report_use_the_bid(tmp_path, now):
+    """Mid can sit above a limit while the venue bid is already through it."""
+    from rhbot.models import MarketSnapshot
+    from rhbot.risk import RiskEngine, daily_buy_block
+    from rhbot.status import build_report
+
+    from tests.conftest import make_quote
+
+    bot = engine(tmp_path, sma_window=200)
+    view = snapshot(now)
+    bot.run_once(now=now, snapshot=view)
+    total = Decimal(0)
+    for name in ("buy_and_hold", "dca_weekly", "trend_daily"):
+        equity = D(bot.ledger.sleeve_row(name)["last_equity"])
+        assert equity == bot.mark(name, view) == bot.mark_to_bid(name, view)
+        total += equity
+        mid_value = bot.ledger.cash(name)
+        for symbol, qty in bot.ledger.positions(name).items():
+            mid_value += qty * view.quotes[symbol].mid
+        if bot.ledger.positions(name):
+            assert equity < q8(mid_value)
+    assert D(bot.ledger.get_meta("portfolio_peak")) == q8(total)
+    report = build_report(bot.settings, "7d", now=utcnow())
+    assert report["sleeves"]["buy_and_hold"]["equity"] == bot.ledger.sleeve_row("buy_and_hold")["last_equity"]
+
+    day_start = D(bot.ledger.sleeve_row("buy_and_hold")["day_start_equity"])
+    bot.ledger.conn.execute("DELETE FROM positions WHERE sleeve='buy_and_hold'")
+    bot.ledger.conn.execute("UPDATE sleeves SET cash='0.00000000' WHERE name='buy_and_hold'")
+    bot.ledger.conn.executemany(
+        "INSERT INTO positions(sleeve, symbol, qty) VALUES('buy_and_hold', ?, ?)",
+        (("BTC-USD", "5.00000000"), ("ETH-USD", "5.00000000")),
+    )
+    bot.ledger.conn.commit()
+    bid_view = MarketSnapshot(
+        bars={"BTC-USD": [], "ETH-USD": []},
+        quotes={
+            "BTC-USD": make_quote("BTC-USD", "100", now, bid=Decimal("90")),
+            "ETH-USD": make_quote("ETH-USD", "100", now, bid=Decimal("90")),
+        },
+        source="test",
+    )
+    bid_equity = bot.mark("buy_and_hold", bid_view)
+    assert bid_equity == Decimal("900.00000000")
+    assert daily_buy_block(Decimal("1000"), day_start, bot.settings) is None
+    assert daily_buy_block(bid_equity, day_start, bot.settings) is not None
+    ctx = bot._context("buy_and_hold", bid_view, now)
+    assert ctx.equity == bid_equity
+    ctx.ordered_symbols_today = set()
+    denied = RiskEngine(bot.settings).evaluate(
+        OrderIntent("BTC-USD", "buy", "bid_loss", quote_amount=Decimal("20")),
+        ctx,
+        "buy_and_hold:BTC-USD:buy:bid-loss",
+    )
+    assert denied.reasons[0].startswith("daily_loss")
+    ctx.equity = Decimal("1000")
+    mid_ok = RiskEngine(bot.settings).evaluate(
+        OrderIntent("BTC-USD", "buy", "mid_inside", quote_amount=Decimal("20")),
+        ctx,
+        "buy_and_hold:BTC-USD:buy:mid-inside",
+    )
+    assert "daily_loss" not in mid_ok.reasons
+    bot.run_once(now=now, snapshot=bid_view)
+    assert bot.ledger.sleeve_row("buy_and_hold")["last_equity"] == "900.00000000"
+    assert bot.ledger.sleeve_row("buy_and_hold")["day_start_equity"] == money_str(day_start)
+    assert D(bot.ledger.get_meta("portfolio_peak")) == q8(total)
+    again = build_report(bot.settings, "7d", now=utcnow())
+    assert again["sleeves"]["buy_and_hold"]["equity"] == "900.00000000"
+    status = assess(bot.settings, now=utcnow())
+    assert status["equity"]["buy_and_hold"] == "900.00000000"
     bot.ledger.close()
 
 

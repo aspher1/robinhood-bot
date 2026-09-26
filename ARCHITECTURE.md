@@ -66,7 +66,7 @@ Drawdown is mark-to-bid equity divided by that book's running peak, minus one. I
 | 10% (`freeze_drawdown_pct`) | Sets that book to FROZEN, logs `freeze_trip`, and blocks its new buys until `rhbot ack-drawdown --strategy <name> --by operator|randy --note "..."`. Exits stay allowed. Nothing is force-sold. |
 | 40% (`kill_drawdown_pct`) | Sets that book to KILLED, logs a `kill_trip`, and flattens that book only. A leftover position is retried on the next cycle. Until that book is flat, health is critical (`kill_flatten_incomplete`) and resume stays blocked. It does not write the process-wide `state/KILL`, so the other book is not blocked. Human resume is still required for the killed book. Resume does not move the peak. The same flattened mark does not kill again. After drawdown recovers above −40%, the next cross of that original peak does. |
 
-There is no 5% or 7.5% exposure cut. A 4% loss versus the UTC day-start equity still blocks new buys in that sleeve until the next UTC day. It does not freeze, kill, or sell. The engine never clears `state/KILL`. Drawdown uses mark-to-bid equity against that book's own peak.
+There is no 5% or 7.5% exposure cut. A 4% loss versus the UTC day-start equity still blocks new buys in that sleeve until the next UTC day. It does not freeze, kill, or sell. Sleeve equity, the day-start mark, the portfolio peak, and the report all use the same mark-to-bid as that drawdown. The engine never clears `state/KILL`. Drawdown uses mark-to-bid equity against that book's own peak.
 
 The two acknowledgements are not interchangeable:
 

@@ -57,6 +57,10 @@ The audited head `7f34324` is behind this branch. F-022 and F-023 were already c
 - **I-002.** A leftover flatten writes a hash-chained `kill_flatten_incomplete` event and health lists that sleeve with each symbol and quantity. Thresholds and sizes are unchanged.
 - **I-003.** `status.assess` and `build_report` open the ledger with `mode=ro`. They do not migrate schema or rewrite meta. `test_i003_status_and_report_leave_the_ledger_mtime` checks that `bot.sqlite` is unchanged.
 
+### I-R002
+
+Randy approved marking every sleeve at the same mark-to-bid the 10% freeze and 40% kill already use (the venue bid when it is below the cost-floor haircut). Sleeve equity, that book's drawdown, the portfolio peak, the 4% daily-loss check, and reports all use it. Order size, exposure still measured at mid, and the hard caps are unchanged. I-R003 and I-R004 were declined and are not in this build.
+
 ### Left open
 
 - No live Robinhood key was available here, so the quote adapter is covered with fixtures and the signature vector, not a production account.
