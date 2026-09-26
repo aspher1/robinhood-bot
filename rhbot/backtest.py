@@ -11,7 +11,7 @@ import tempfile
 from datetime import date, timedelta
 from pathlib import Path
 
-from rhbot.config import Settings
+from rhbot.config import Settings, frozen_params_hash
 from rhbot.engine import Engine, ensure_utc
 from rhbot.errors import ConfigError
 from rhbot.ledger import Ledger, parse_ts
@@ -54,6 +54,7 @@ def replay(
     engine.ledger.set_meta("mode", "replay")
     if paper_day1:
         engine.ledger.set_meta("paper_day1", paper_day1)
+        engine.ledger.set_meta("frozen_params_hash", frozen_params_hash())
         start = ensure_utc(parse_ts(paper_day1))
         times = _days_from(start, bars_by_symbol)
     else:
@@ -69,10 +70,13 @@ def replay(
             closed = [bar for bar in history if ensure_utc(bar.ts) <= cutoff]
             if not closed:
                 continue
+            close = closed[-1].close
             quotes[symbol] = Quote(
                 symbol=symbol,
                 ts=market_now,
-                mid=closed[-1].close,
+                mid=close,
+                bid=close,
+                ask=close,
                 source="backtest",
             )
         if len(quotes) != len(tuple(settings.symbols)):

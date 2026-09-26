@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from rhbot.config import Settings
+from rhbot.config import FROZEN_SMA_WINDOW, FROZEN_STARTING_CASH, FROZEN_SYMBOLS, FROZEN_TREND_BAND, Settings
 from rhbot.models import Bar, Fill, MarketSnapshot, OrderIntent
 from rhbot.money import q_cent
 
@@ -55,7 +55,7 @@ class TrendDaily:
         evaluated = dict(state.get("evaluated_on") or {})
         orders: list[OrderIntent] = []
         notes: list[str] = []
-        for symbol in self.settings.symbols:
+        for symbol in FROZEN_SYMBOLS:
             if evaluated.get(symbol) == today:
                 notes.append(f"{symbol}:already_decided_today")
                 continue
@@ -64,14 +64,14 @@ class TrendDaily:
             if not has_latest_closed_bar(series, now):
                 notes.append(f"{symbol}:stale_candles")
                 continue
-            if len(closed) < self.settings.sma_window:
+            if len(closed) < FROZEN_SMA_WINDOW:
                 notes.append(f"{symbol}:insufficient_history")
                 continue
-            window = closed[-self.settings.sma_window :]
+            window = closed[-FROZEN_SMA_WINDOW :]
             sma = sum((bar.close for bar in window), Decimal(0)) / Decimal(len(window))
             last = window[-1].close
-            upper = sma * (Decimal(1) + self.settings.trend_band)
-            lower = sma * (Decimal(1) - self.settings.trend_band)
+            upper = sma * (Decimal(1) + FROZEN_TREND_BAND)
+            lower = sma * (Decimal(1) - FROZEN_TREND_BAND)
             qty = positions.get(symbol, Decimal(0))
             in_pos = qty > 0
             if last > upper:
@@ -102,7 +102,7 @@ class TrendDaily:
                 notes.append(f"{symbol}:exit")
                 continue
             # One sleeve per coin: half the book, which is the full cash of that sleeve.
-            sleeve_cash = q_cent(self.settings.starting_cash / Decimal(len(self.settings.symbols)))
+            sleeve_cash = q_cent(FROZEN_STARTING_CASH / Decimal(len(FROZEN_SYMBOLS)))
             buy_amount = min(sleeve_cash, q_cent(cash))
             evaluated[symbol] = today
             if buy_amount < self.settings.min_order_notional:
@@ -119,7 +119,7 @@ class TrendDaily:
             notes.append(f"{symbol}:enter")
         updated = dict(state)
         updated["evaluated_on"] = evaluated
-        if evaluated and all(evaluated.get(symbol) == today for symbol in self.settings.symbols):
+        if evaluated and all(evaluated.get(symbol) == today for symbol in FROZEN_SYMBOLS):
             updated["last_decision_date"] = today
         return orders, updated, ";".join(notes) or "no_trade"
 
@@ -127,7 +127,7 @@ class TrendDaily:
         del fills
         today = now.astimezone(timezone.utc).date().isoformat()
         holding = dict(state.get("holding_since") or {})
-        for symbol in self.settings.symbols:
+        for symbol in FROZEN_SYMBOLS:
             qty = positions.get(symbol, Decimal(0))
             if qty > 0:
                 holding.setdefault(symbol, today)

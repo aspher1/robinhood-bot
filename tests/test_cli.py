@@ -18,7 +18,7 @@ def test_status_before_start(tmp_path, capsys):
     assert "not_started" in body["reasons"]
 
 
-def test_kill_resume_and_audit(tmp_path, capsys):
+def test_kill_resume_and_audit(tmp_path, capsys, monkeypatch):
     assert main(["kill", "--state-dir", str(tmp_path), "--reason", "pause"]) == 0
     kill_body = json.loads(capsys.readouterr().out)
     assert kill_body["kill_switch"] is True
@@ -28,7 +28,13 @@ def test_kill_resume_and_audit(tmp_path, capsys):
     assert health == 2
     assert health_body["health"] == "critical"
     assert "kill_switch" in health_body["reasons"]
-    assert main(["resume", "--state-dir", str(tmp_path)]) == 0
+    assert main(["resume", "--state-dir", str(tmp_path)]) == 2
+    assert (tmp_path / "KILL").exists()
+    assert main(["resume", "--ack", "--state-dir", str(tmp_path)]) == 2
+    secret = tmp_path / "human-code"
+    secret.write_text("resume-ok\n", encoding="utf-8")
+    monkeypatch.setenv("RHBOT_HUMAN_RESUME_FILE", str(secret))
+    assert main(["resume", "--ack", "--human-code", "resume-ok", "--state-dir", str(tmp_path)]) == 0
     capsys.readouterr()
     assert not (tmp_path / "KILL").exists()
     assert main(["audit", "verify", "--state-dir", str(tmp_path)]) == 0
@@ -51,7 +57,7 @@ def test_selftest_is_offline_and_does_not_touch_state(tmp_path, capsys, monkeypa
 
 
 def test_report_after_a_cycle(tmp_path, capsys, now):
-    bot = engine(tmp_path, sma_window=3)
+    bot = engine(tmp_path)
     # Use wall-clock quotes so health sees fresh data, while the strategy
     # clock stays explicit for the fills.
     from datetime import datetime, timezone
@@ -116,7 +122,7 @@ def test_backtest_replay_uses_the_engine(tmp_path, now):
 
     last_open = now - timedelta(days=1)
     closes = ["10", "10", "10", "12", "12"]
-    settings = make_settings(tmp_path, sma_window=3, trend_band=__import__("decimal").Decimal("0.01"))
+    settings = make_settings(tmp_path)
     bars = {
         "BTC-USD": make_bars("BTC-USD", closes, last_open),
         "ETH-USD": make_bars("ETH-USD", closes, last_open),
@@ -138,7 +144,7 @@ def test_replay_separates_risk_blocks_from_fidelity(tmp_path, now):
 
     last_open = now - timedelta(days=1)
     closes = ["100", "100", "100", "60"]
-    settings = make_settings(tmp_path, sma_window=20)
+    settings = make_settings(tmp_path)
     bars = {
         "BTC-USD": make_bars("BTC-USD", closes, last_open),
         "ETH-USD": make_bars("ETH-USD", closes, last_open),

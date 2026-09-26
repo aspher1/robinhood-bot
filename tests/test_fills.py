@@ -30,7 +30,7 @@ def test_public_mid_charges_one_percent_per_side():
 def test_round_trip_loses_about_two_percent(tmp_path, now):
     from datetime import timedelta
 
-    bot = engine(tmp_path, sma_window=3)
+    bot = engine(tmp_path)
     bot.ledger.ensure_sleeve("buy_and_hold", now, {})
     view = snapshot(now)
     buy = OrderIntent("BTC-USD", "buy", "test", quote_amount=Decimal("101"))

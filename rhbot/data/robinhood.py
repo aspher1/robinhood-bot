@@ -121,7 +121,7 @@ def parse_best_bid_ask(payload: object, symbols: list[str]) -> dict[str, Quote]:
             raise DataError("quote row missing inclusive bid or ask") from exc
         if ask < bid:
             raise DataError("crossed quote")
-        mid = D(row["price"]) if row.get("price") not in (None, "") else (bid + ask) / Decimal(2)
+        mid = (bid + ask) / Decimal(2)
         if row.get("timestamp") in (None, ""):
             raise DataError("quote timestamp missing")
         found[symbol] = Quote(

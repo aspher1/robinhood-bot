@@ -14,6 +14,15 @@ from rhbot.money import D
 
 ALLOWED_SYMBOLS = ("BTC-USD", "ETH-USD")
 
+# Chosen before any backtest. Config cannot set a different value.
+# DCA buys BTC then ETH because the symbol order is this tuple.
+FROZEN_SMA_WINDOW = 200
+FROZEN_TREND_BAND = Decimal("0.02")
+FROZEN_DCA_NOTIONAL = Decimal("19.23")
+FROZEN_STARTING_CASH = Decimal("1000")
+FROZEN_TREND_TARGET_WEIGHT = Decimal("0.50")
+FROZEN_SYMBOLS = ALLOWED_SYMBOLS
+
 # Spot only. These are not settings. No config key or environment variable turns them off.
 PRODUCT = "spot"
 LEVERAGE = Decimal("1")
@@ -67,8 +76,8 @@ class Settings(BaseModel):
 
     mode: str = "paper"
     state_dir: Path = Path("state")
-    starting_cash: Decimal = Decimal("1000")
-    symbols: tuple[str, ...] = ALLOWED_SYMBOLS
+    starting_cash: Decimal = FROZEN_STARTING_CASH
+    symbols: tuple[str, ...] = FROZEN_SYMBOLS
     cost_per_side: Decimal = Decimal("0.01")
     max_position_pct: Decimal = Decimal("0.50")
     max_total_exposure_pct: Decimal = Decimal("1")
@@ -83,12 +92,12 @@ class Settings(BaseModel):
     max_spread_per_side: Decimal = Decimal("0.02")
     min_order_notional: Decimal = Decimal("10")
     # Chosen before any backtest. The hold is the risk floor. See ARCHITECTURE.md.
-    sma_window: int = 200
-    trend_band: Decimal = Decimal("0.02")
+    sma_window: int = FROZEN_SMA_WINDOW
+    trend_band: Decimal = FROZEN_TREND_BAND
     min_hold_days: int = 7
-    trend_target_weight: Decimal = Decimal("0.50")
+    trend_target_weight: Decimal = FROZEN_TREND_TARGET_WEIGHT
     # $1,000 / 52 weeks, rounded down to the cent. One coin per period.
-    dca_notional: Decimal = Decimal("19.23")
+    dca_notional: Decimal = FROZEN_DCA_NOTIONAL
     loop_seconds: int = 60
     market_data: str = "public"
     public_provider: str = "coinbase"
@@ -189,27 +198,48 @@ class Settings(BaseModel):
             problems.append(f"symbols not on the allowlist: {unknown}")
         if len(set(self.symbols)) != len(self.symbols):
             problems.append("symbols contains a duplicate")
-        if self.starting_cash <= 0:
-            problems.append("starting_cash must be positive")
+        if self.starting_cash != FROZEN_STARTING_CASH:
+            problems.append("starting_cash is frozen at 1000")
+        if self.symbols != FROZEN_SYMBOLS:
+            problems.append("symbols are frozen at BTC-USD then ETH-USD")
         if not HARD_CAPS["min_cost_per_side"] <= self.cost_per_side <= Decimal("0.05"):
             problems.append("cost_per_side must be at least 0.01 and at most 0.05")
-        if not 2 <= self.sma_window <= 400:
-            problems.append("sma_window must be between 2 and 400")
-        if not Decimal("0") <= self.trend_band <= Decimal("0.20"):
-            problems.append("trend_band must be between 0 and 0.20")
+        if self.sma_window != FROZEN_SMA_WINDOW:
+            problems.append("sma_window is frozen at 200")
+        if self.trend_band != FROZEN_TREND_BAND:
+            problems.append("trend_band is frozen at 0.02")
         if not int(HARD_CAPS["min_hold_days"]) <= self.min_hold_days <= 90:
             problems.append("min_hold_days must be at least 7 and at most 90")
-        if self.trend_target_weight <= 0 or self.trend_target_weight > self.max_position_pct:
-            problems.append("trend_target_weight must be positive and within max_position_pct")
-        if self.dca_notional < self.min_order_notional:
-            problems.append("dca_notional is below min_order_notional")
-        if self.dca_notional > self.starting_cash:
-            problems.append("dca_notional exceeds starting cash")
+        if self.trend_target_weight != FROZEN_TREND_TARGET_WEIGHT:
+            problems.append("trend_target_weight is frozen at 0.50")
+        elif self.trend_target_weight > self.max_position_pct:
+            problems.append("trend_target_weight must stay within max_position_pct")
+        if self.dca_notional != FROZEN_DCA_NOTIONAL:
+            problems.append("dca_notional is frozen at 19.23")
         if not 10 <= self.loop_seconds <= 3600:
             problems.append("loop_seconds must be between 10 and 3600")
         if problems:
             raise ValueError("; ".join(problems))
         return self
+
+
+def frozen_params_hash() -> str:
+    """Hash of the strategy constants stamped on paper day 1."""
+    import hashlib
+
+    from rhbot.money import canonical
+
+    payload = canonical(
+        {
+            "dca_notional": format(FROZEN_DCA_NOTIONAL, "f"),
+            "sma_window": FROZEN_SMA_WINDOW,
+            "starting_cash": format(FROZEN_STARTING_CASH, "f"),
+            "symbols": list(FROZEN_SYMBOLS),
+            "trend_band": format(FROZEN_TREND_BAND, "f"),
+            "trend_target_weight": format(FROZEN_TREND_TARGET_WEIGHT, "f"),
+        }
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def resolve_config_path(explicit: str | None) -> Path | None:

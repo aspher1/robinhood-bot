@@ -21,8 +21,6 @@ from rhbot.ops import (
     iso,
     kill_active,
     read_heartbeat,
-    read_kill,
-    resume_needs_ack,
     utcnow,
 )
 from rhbot.status import (
@@ -195,8 +193,10 @@ def cmd_resume(args: argparse.Namespace) -> int:
     if not global_on and not waiting:
         _emit({"ok": True, "kill_switch": False, "detail": "already_clear"})
         return 0
-    payload = read_kill(settings.state_dir) if global_on else None
-    needs_ack = bool(waiting) or (global_on and resume_needs_ack(payload))
+    code_ok = _human_code_ok(args.human_code)
+    # Every process-wide kill file, and every book still waiting on a human,
+    # takes the same ack. A manual kill is not a lighter path.
+    needs_ack = bool(waiting) or global_on
     if needs_ack and not args.ack:
         _emit(
             {
@@ -206,11 +206,11 @@ def cmd_resume(args: argparse.Namespace) -> int:
             }
         )
         return 2
-    if needs_ack and not _human_code_ok(args.human_code):
+    if needs_ack and not code_ok:
         _emit(
             {
                 "ok": False,
-                "error": "drawdown resume requires --human-code matching RHBOT_HUMAN_RESUME_FILE",
+                "error": "resume requires --human-code matching RHBOT_HUMAN_RESUME_FILE",
                 "ack_required": True,
             }
         )
@@ -250,7 +250,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
             ledger.close()
     if global_on:
         clear_kill(settings.state_dir)
-    actor = "human" if args.ack else "operator"
+    actor = "human" if code_ok else "operator"
     _log_if_db(
         settings,
         "resume",
@@ -375,7 +375,7 @@ def cmd_flatten(args: argparse.Namespace) -> int:
         result = engine.flatten()
     finally:
         engine.ledger.close()
-    ok = not result["errors"]
+    ok = not result["errors"] and not result.get("remaining")
     _emit({"ok": ok, **result})
     return 0 if ok else 2
 

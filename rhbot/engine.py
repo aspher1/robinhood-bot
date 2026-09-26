@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from rhbot.brokers.paper import PaperBroker
-from rhbot.config import Settings, reject_live_env
+from rhbot.config import Settings, frozen_params_hash, reject_live_env
 from rhbot.data.public import PublicMarketData
 from rhbot.data.robinhood import RobinhoodMarketData
 from rhbot.errors import DataError, OrderRejected
@@ -34,7 +34,7 @@ from rhbot.strategies import build_strategies
 
 
 # A later cycle the same UTC day may still pass these. Other denials stick.
-_TRANSIENT_DENIALS = ("min_hold", "stale_quote", "spread_too_wide")
+_TRANSIENT_DENIALS = ("min_hold", "stale_quote", "spread_too_wide", "missing_bid_ask")
 
 
 def _transient_denial(reasons: list[str]) -> bool:
@@ -137,8 +137,7 @@ class Engine:
         self._require_quotes(snapshot)
         self._note_quotes(snapshot, market_now, wall)
         self._store_closed_bars(snapshot, market_now)
-        if not self.ledger.get_meta("paper_day1"):
-            self.ledger.set_meta("paper_day1", iso(market_now))
+        self._stamp_frozen_params(market_now)
         if kill_active(self.settings.state_dir):
             self.ledger.cancel_open_orders(market_now, "kill_switch")
         self._enforce_overlays(market_now, snapshot)
@@ -187,6 +186,7 @@ class Engine:
             self.ledger.ensure_sleeve(strategy.name, market_now, strategy.initial_state())
             sleeve_fills = []
             for symbol, qty in list(self.ledger.positions(strategy.name).items()):
+                before = qty
                 intent = OrderIntent(symbol, "sell", reason, base_quantity=qty)
                 client_order_id = self._client_id(strategy.name, intent, market_now)
                 try:
@@ -201,6 +201,12 @@ class Engine:
                 except OrderRejected as exc:
                     errors.append(
                         {"sleeve": strategy.name, "symbol": symbol, "reasons": exc.reasons}
+                    )
+                    continue
+                after = self.ledger.positions(strategy.name).get(symbol, Decimal(0))
+                if after >= before:
+                    errors.append(
+                        {"sleeve": strategy.name, "symbol": symbol, "reasons": ["nothing_sold"]}
                     )
                     continue
                 sleeve_fills.append(fill)
@@ -220,7 +226,13 @@ class Engine:
         )
         self.ledger.set_meta("last_successful_action_at", iso(utcnow()))
         write_heartbeat(self.settings.state_dir, self.heartbeat_body())
-        return {"fills": fills_out, "errors": errors}
+        remaining = [
+            {"sleeve": name, "symbol": symbol, "qty": money_str(qty)}
+            for name in self.ledger.sleeve_names()
+            for symbol, qty in self.ledger.positions(name).items()
+            if qty > 0
+        ]
+        return {"fills": fills_out, "errors": errors, "remaining": remaining}
 
     def serve(self, *, once: bool = False, sleep=time.sleep) -> None:
         sd_notify("READY=1")
@@ -328,6 +340,9 @@ class Engine:
             new_state, orders, reason = self._dca_freeze_skip(
                 new_state, orders, reason, market_now
             )
+            new_state, orders, reason = self._dca_killed_once(
+                new_state, orders, reason, market_now
+            )
         self.ledger.log_event(
             "decision",
             {
@@ -339,14 +354,12 @@ class Engine:
         )
         filled: list[Fill] = []
         fresh: list[Fill] = []
-        planned_strategy = 0
         transient: set[str] = set()
+        ctx = self._context(strategy.name, snapshot, market_now)
         for intent in orders:
             if kill_active(self.settings.state_dir):
                 break
             client_order_id = self._client_id(strategy.name, intent, market_now)
-            ctx = self._context(strategy.name, snapshot, market_now)
-            ctx.trades_today += planned_strategy
             try:
                 planned = self.broker.plan(
                     strategy.name,
@@ -362,8 +375,7 @@ class Engine:
             filled.append(planned)
             if self.ledger.get_fill(planned.client_order_id) is None:
                 fresh.append(planned)
-                if intent.reason not in RISK_REDUCTION_REASONS:
-                    planned_strategy += 1
+                self._fold_planned(ctx, planned)
         with self.ledger.transaction():
             for fill in fresh:
                 if self.ledger.get_fill(fill.client_order_id) is None:
@@ -399,6 +411,7 @@ class Engine:
         )
         filled: list[Fill] = []
         transient: set[str] = set()
+        ctx = self._shadow_context(shadow, snapshot, market_now)
         for intent in orders:
             client_order_id = self._client_id(shadow, intent, market_now)
             existing = self.ledger.get_shadow_fill(client_order_id)
@@ -407,7 +420,7 @@ class Engine:
                 continue
             decision = self.risk.evaluate(
                 intent,
-                self._shadow_context(shadow, snapshot, market_now),
+                ctx,
                 client_order_id,
                 ignore_overlay=True,
             )
@@ -445,6 +458,7 @@ class Engine:
             except OrderRejected:
                 continue
             filled.append(fill)
+            self._fold_planned(ctx, fill)
         positions = self.ledger.shadow_positions(shadow)
         if transient:
             new_state = _release_transient_trend(new_state, transient)
@@ -566,6 +580,73 @@ class Engine:
                 detail="freeze",
             )
         return updated, [], "freeze"
+
+    def _dca_killed_once(
+        self,
+        state: dict,
+        orders: list[OrderIntent],
+        reason: str,
+        market_now: datetime,
+    ) -> tuple[dict, list[OrderIntent], str]:
+        """Log one denial when a killed DCA book would buy, not one per loop."""
+        killed = self._overlay_state("dca_weekly") == "KILLED"
+        if not killed:
+            if state.get("killed_denial_logged"):
+                return {**state, "killed_denial_logged": False}, orders, reason
+            return state, orders, reason
+        if not orders or state.get("killed_denial_logged"):
+            return state, [], "killed"
+        for intent in orders:
+            self.ledger.record_risk_event(
+                "risk_denial",
+                market_now,
+                sleeve="dca_weekly",
+                symbol=intent.symbol,
+                side=intent.side,
+                reason="killed",
+                limit_name="overlay_state",
+                limit_value="KILLED",
+                observed="KILLED",
+                client_order_id="",
+                detail="killed",
+            )
+        return {**state, "killed_denial_logged": True}, [], "killed"
+
+    def _stamp_frozen_params(self, market_now: datetime) -> None:
+        """Record the strategy constants on paper day 1 and refuse a later change."""
+        expected = frozen_params_hash()
+        if not self.ledger.get_meta("paper_day1"):
+            self.ledger.set_meta("paper_day1", iso(market_now))
+            self.ledger.set_meta("frozen_params_hash", expected)
+            return
+        stored = self.ledger.get_meta("frozen_params_hash")
+        if stored != expected:
+            raise RuntimeError("frozen strategy parameters changed since paper day 1")
+
+    def _fold_planned(self, ctx: RiskContext, fill: Fill) -> None:
+        """Make the next order in this cycle see this fill."""
+        ctx.cash = q8(ctx.cash + fill.cash_delta)
+        positions = dict(ctx.positions)
+        qty = q8(positions.get(fill.symbol, Decimal(0)) + fill.qty_delta)
+        if qty > 0:
+            positions[fill.symbol] = qty
+        else:
+            positions.pop(fill.symbol, None)
+        ctx.positions = positions
+        ctx.ordered_symbols_today.add(fill.symbol)
+        ctx.known_client_ids.add(fill.client_order_id)
+        ctx.turnover_today = q8(ctx.turnover_today + fill.notional)
+        if fill.reason not in RISK_REDUCTION_REASONS:
+            ctx.trades_today += 1
+        opened = dict(ctx.opened_at)
+        if qty <= 0:
+            opened.pop(fill.symbol, None)
+        elif fill.side == "buy" and fill.symbol not in opened:
+            opened[fill.symbol] = fill.ts
+        ctx.opened_at = opened
+        ctx.equity = mark_to_bid_equity(
+            ctx.cash, ctx.positions, ctx.quotes, self.settings.cost_per_side
+        )
 
     def _enforce_overlays(self, market_now: datetime, snapshot: MarketSnapshot) -> None:
         """Option B on trend_daily and dca_weekly only. Never touches buy_and_hold.
@@ -794,7 +875,7 @@ class Engine:
         for symbol in self.settings.symbols:
             age = (market_now - snapshot.quotes[symbol].ts).total_seconds()
             ages.append(age)
-            if age > self.settings.max_quote_age_seconds or age < -5:
+            if age >= self.settings.max_quote_age_seconds or age < -5:
                 fresh = False
         self.ledger.set_meta("last_quote_age_at_cycle_s", str(int(max(ages) if ages else 0)))
         if fresh:
@@ -815,9 +896,20 @@ class Engine:
             key = ensure_utc(market_now).date().isoformat()
         order_id = f"{sleeve}:{intent.symbol}:{intent.side}:{key}"
         # A same-day strategy sell must not satisfy a later risk-reduction sell.
+        # Each flatten attempt gets its own id so a later cycle can still sell.
+        if intent.reason in ("flatten", "drawdown_flatten"):
+            token = self._next_flatten_token(sleeve, intent.reason, market_now)
+            return f"{order_id}:{intent.reason}:{token}"
         if intent.reason in RISK_REDUCTION_REASONS:
             return f"{order_id}:{intent.reason}"
         return order_id
+
+    def _next_flatten_token(self, sleeve: str, reason: str, market_now: datetime) -> str:
+        day = ensure_utc(market_now).date().isoformat()
+        key = f"flatten_seq:{sleeve}:{reason}:{day}"
+        token = self.ledger.meta_int(key)
+        self.ledger.set_meta(key, str(token + 1))
+        return str(token)
 
 
 def _intent_payload(intent: OrderIntent) -> dict:

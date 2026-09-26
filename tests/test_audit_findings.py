@@ -13,7 +13,7 @@ from rhbot.money import D, money_str, q8
 from rhbot.ops import engage_kill, iso, read_kill, utcnow
 from rhbot.status import assess
 
-from tests.conftest import engine, make_bars, snapshot
+from tests.conftest import engine, make_bars, padded_closes, snapshot
 
 UTC = timezone.utc
 
@@ -55,8 +55,8 @@ def _ack(tmp_path, strategy: str, by: str = "operator") -> int:
 
 
 def test_f001_freeze_at_ten_percent_denies_entries_and_is_not_caught_up(tmp_path, now):
-    bot = engine(tmp_path, sma_window=3, trend_band=Decimal("0.01"))
-    flat = snapshot(now, closes=["10", "10", "10"], last_open=now - timedelta(days=1))
+    bot = engine(tmp_path)
+    flat = snapshot(now, closes=padded_closes("10"), last_open=now - timedelta(days=1))
     bot.run_once(now=now, snapshot=flat)
     peak = bot.ledger.overlay_row("trend_daily")["peak"]
     assert bot.ledger.overlay_row("trend_daily")["state"] == "ARMED"
@@ -67,7 +67,7 @@ def test_f001_freeze_at_ten_percent_denies_entries_and_is_not_caught_up(tmp_path
     _set_cash(bot, "trend_daily", "900")
     _set_cash(bot, "dca_weekly", "800")
     later = now + timedelta(days=7)
-    hot = snapshot(later, closes=["10", "10", "12"], last_open=later - timedelta(days=1))
+    hot = snapshot(later, closes=padded_closes("12"), last_open=later - timedelta(days=1))
     bot.run_once(now=later, snapshot=hot)
 
     assert bot.ledger.overlay_row("trend_daily")["state"] == "FROZEN"
@@ -98,7 +98,7 @@ def test_f001_freeze_at_ten_percent_denies_entries_and_is_not_caught_up(tmp_path
     assert _ack(tmp_path, "trend_daily", "operator") == 0
     assert _ack(tmp_path, "dca_weekly", "randy") == 0
 
-    bot = engine(tmp_path, sma_window=3, trend_band=Decimal("0.01"))
+    bot = engine(tmp_path)
     assert bot.ledger.overlay_row("trend_daily")["state"] == "ACKED"
     assert bot.ledger.overlay_row("trend_daily")["peak"] == peak
     assert Decimal(bot.ledger.overlay_row("trend_daily")["dd"]) <= Decimal("-0.10")
@@ -129,7 +129,7 @@ def test_f001_freeze_at_ten_percent_denies_entries_and_is_not_caught_up(tmp_path
     bot.ledger.conn.execute("DELETE FROM positions WHERE sleeve='trend_daily'")
     bot.ledger.conn.commit()
     again = later + timedelta(days=1)
-    bot.run_once(now=again, snapshot=snapshot(again, closes=["10", "10", "12"], last_open=again - timedelta(days=1)))
+    bot.run_once(now=again, snapshot=snapshot(again, closes=padded_closes("12"), last_open=again - timedelta(days=1)))
     trend_trips = [item for item in _events(bot, "freeze_trip") if item["sleeve"] == "trend_daily"]
     assert len(trend_trips) == 2
     assert bot.ledger.overlay_row("trend_daily")["state"] == "FROZEN"
@@ -408,7 +408,7 @@ def test_f023_retry_flatten_until_book_is_flat(tmp_path, monkeypatch):
         if row["side"] == "sell" and row["reason"] == "drawdown_flatten"
     ]
     assert len(sells) == 1
-    assert str(sells[0]["client_order_id"]).endswith(":drawdown_flatten")
+    assert ":drawdown_flatten:" in str(sells[0]["client_order_id"])
     assert bot.ledger.conn.execute(
         "SELECT COUNT(*) AS n FROM fills WHERE sleeve='buy_and_hold' AND reason='drawdown_flatten'"
     ).fetchone()["n"] == 0
@@ -593,6 +593,11 @@ def test_ir002_equity_peak_daily_loss_and_report_use_the_bid(tmp_path, now):
     ctx = bot._context("buy_and_hold", bid_view, now)
     assert ctx.equity == bid_equity
     ctx.ordered_symbols_today = set()
+    # The 90 bid is the mark. The order itself still needs a quote inside the spread cap.
+    ctx.quotes = {
+        "BTC-USD": make_quote("BTC-USD", "100", now),
+        "ETH-USD": make_quote("ETH-USD", "100", now),
+    }
     denied = RiskEngine(bot.settings).evaluate(
         OrderIntent("BTC-USD", "buy", "bid_loss", quote_amount=Decimal("20")),
         ctx,
@@ -755,9 +760,9 @@ def test_f002_prefix_invariance(tmp_path):
     from rhbot.models import MarketSnapshot
     from rhbot.strategies.trend import TrendDaily
 
-    settings_bot = engine(tmp_path, sma_window=20, trend_band=Decimal("0.02"))
+    settings_bot = engine(tmp_path)
     strategy = TrendDaily(settings_bot.settings)
-    closes = ["100"] * 30 + ["130"] * 20 + ["80"] * 40
+    closes = ["100"] * 210 + ["130"] * 20 + ["80"] * 40
     start = datetime(2024, 1, 1, tzinfo=UTC)
     bars = make_bars("BTC-USD", closes, start + timedelta(days=len(closes) - 1))
     eth = make_bars("ETH-USD", closes, start + timedelta(days=len(closes) - 1))
@@ -794,8 +799,8 @@ def test_f002_prefix_invariance(tmp_path):
 
 
 def test_f003_trade_cap_is_per_book_and_skips_risk_reduction(tmp_path, now):
-    bot = engine(tmp_path, sma_window=3, trend_band=Decimal("0.01"))
-    view = snapshot(now, closes=["10", "10", "12"], last_open=now - timedelta(days=1))
+    bot = engine(tmp_path)
+    view = snapshot(now, closes=padded_closes("12"), last_open=now - timedelta(days=1))
     bot.run_once(now=now, snapshot=view)
     day = now.date().isoformat()
     assert bot.ledger.book_strategy_trades_today("buy_and_hold", day) == 2
@@ -846,7 +851,7 @@ def _aged(view: MarketSnapshot, now: datetime, seconds: int) -> MarketSnapshot:
     return MarketSnapshot(bars=view.bars, quotes=quotes, source=view.source)
 
 
-def test_f004_quote_health_uses_cycle_age(tmp_path, now):
+def test_f004_quote_health_uses_cycle_age(tmp_path, now, monkeypatch):
     bot = engine(tmp_path, sma_window=200)
     view = _aged(snapshot(now), now, 2)
     bot.run_once(now=now, snapshot=view)
@@ -876,7 +881,10 @@ def test_f004_quote_health_uses_cycle_age(tmp_path, now):
     fresh.ledger.close()
     from rhbot.cli import main
 
-    assert main(["resume", "--state-dir", str(resume_dir)]) == 0
+    secret = resume_dir / "human-code"
+    secret.write_text("resume-ok\n", encoding="utf-8")
+    monkeypatch.setenv("RHBOT_HUMAN_RESUME_FILE", str(secret))
+    assert main(["resume", "--ack", "--human-code", "resume-ok", "--state-dir", str(resume_dir)]) == 0
 
 
 def test_f005_replay_refuses_a_live_state_dir(tmp_path, now, monkeypatch):
@@ -907,9 +915,9 @@ def test_f005_replay_refuses_a_live_state_dir(tmp_path, now, monkeypatch):
 
 
 def test_f006_crash_after_fill_rerun_is_idempotent(tmp_path, now):
-    bot = engine(tmp_path, sma_window=3, trend_band=Decimal("0.01"))
+    bot = engine(tmp_path)
     last_open = now - timedelta(days=1)
-    view = snapshot(now, closes=["10", "10", "12"], last_open=last_open)
+    view = snapshot(now, closes=padded_closes("12"), last_open=last_open)
     bot.ledger.ensure_sleeve("trend_daily", now, bot.strategies[2].initial_state())
     intent = OrderIntent("BTC-USD", "buy", "trend_entry", quote_amount=Decimal("500"))
     client_id = bot._client_id("trend_daily", intent, now)
@@ -1048,7 +1056,7 @@ def test_f008_min_hold_in_the_risk_engine(tmp_path, now):
 def test_f009_open_bar_is_not_cached_and_missing_yesterday_is_stale(tmp_path, now):
     from rhbot.strategies.trend import TrendDaily
 
-    bot = engine(tmp_path, sma_window=3, trend_band=Decimal("0.01"))
+    bot = engine(tmp_path)
     open_bar = Bar(
         symbol="BTC-USD",
         ts=now,
@@ -1094,7 +1102,14 @@ def test_f010_audit_replay_matches_then_flags_an_extra_fill(tmp_path):
         market_now = series["BTC-USD"][index].ts + timedelta(days=1)
         window = {symbol: bars[: index + 1] for symbol, bars in series.items()}
         quotes = {
-            symbol: Quote(symbol=symbol, ts=market_now, mid=window[symbol][-1].close, source="test")
+            symbol: Quote(
+                symbol=symbol,
+                ts=market_now,
+                mid=window[symbol][-1].close,
+                bid=window[symbol][-1].close,
+                ask=window[symbol][-1].close,
+                source="test",
+            )
             for symbol in window
         }
         bot.run_once(
@@ -1159,7 +1174,14 @@ def test_p1a_replay_starts_at_paper_day1_and_honors_since(tmp_path):
             market_now = day + extra
             window = {symbol: list(bars) for symbol, bars in series.items()}
             quotes = {
-                symbol: Quote(symbol=symbol, ts=market_now, mid=Decimal("110"), source="test")
+                symbol: Quote(
+                    symbol=symbol,
+                    ts=market_now,
+                    mid=Decimal("110"),
+                    bid=Decimal("110"),
+                    ask=Decimal("110"),
+                    source="test",
+                )
                 for symbol in window
             }
             bot.run_once(
@@ -1194,10 +1216,10 @@ def test_p1a_replay_starts_at_paper_day1_and_honors_since(tmp_path):
 
 def test_p1b_seventh_day_exit_fills_and_day_six_does_not(tmp_path):
     opened = datetime(2026, 4, 1, 0, 0, 50, tzinfo=UTC)
-    bot = engine(tmp_path, sma_window=3, trend_band=Decimal("0.01"))
+    bot = engine(tmp_path)
     bot.run_once(
         now=opened,
-        snapshot=snapshot(opened, mid="12", closes=["10", "10", "12"], last_open=opened - timedelta(days=1)),
+        snapshot=snapshot(opened, mid="12", closes=padded_closes("12"), last_open=opened - timedelta(days=1)),
     )
     assert bot.ledger.positions("trend_daily")
     too_soon = opened + timedelta(days=6)
@@ -1207,7 +1229,7 @@ def test_p1b_seventh_day_exit_fills_and_day_six_does_not(tmp_path):
         snapshot=snapshot(
             too_soon,
             mid="8",
-            closes=["12", "12", "8"],
+            closes=padded_closes("8", base="12"),
             last_open=too_soon - timedelta(days=1),
         ),
     )
@@ -1221,7 +1243,7 @@ def test_p1b_seventh_day_exit_fills_and_day_six_does_not(tmp_path):
     stale = snapshot(
         exit_at - timedelta(seconds=45),
         mid="8",
-        closes=["12", "8", "8"],
+        closes=padded_closes("8", base="12"),
         last_open=exit_at - timedelta(days=1),
     )
     bot.run_once(now=exit_at, snapshot=stale)
@@ -1234,7 +1256,7 @@ def test_p1b_seventh_day_exit_fills_and_day_six_does_not(tmp_path):
         snapshot=snapshot(
             retry_at,
             mid="8",
-            closes=["12", "8", "8"],
+            closes=padded_closes("8", base="12"),
             last_open=retry_at - timedelta(days=1),
         ),
     )
@@ -1245,16 +1267,16 @@ def test_p1b_seventh_day_exit_fills_and_day_six_does_not(tmp_path):
 
 def test_p1b_kill_flatten_on_day_two_still_sells(tmp_path):
     opened = datetime(2026, 5, 1, 0, 0, 50, tzinfo=UTC)
-    bot = engine(tmp_path, sma_window=3, trend_band=Decimal("0.01"))
+    bot = engine(tmp_path)
     bot.run_once(
         now=opened,
-        snapshot=snapshot(opened, mid="12", closes=["10", "10", "12"], last_open=opened - timedelta(days=1)),
+        snapshot=snapshot(opened, mid="12", closes=padded_closes("12"), last_open=opened - timedelta(days=1)),
     )
     held_bh = dict(bot.ledger.positions("buy_and_hold"))
     day2 = opened + timedelta(days=2)
     bot.run_once(
         now=day2,
-        snapshot=snapshot(day2, mid="1", closes=["12", "12", "1"], last_open=day2 - timedelta(days=1)),
+        snapshot=snapshot(day2, mid="1", closes=padded_closes("1", base="12"), last_open=day2 - timedelta(days=1)),
     )
     assert day2 < opened + timedelta(days=7)
     assert bot.ledger.positions("trend_daily") == {}
@@ -1343,11 +1365,11 @@ def test_p2_five_dollar_position_is_fully_sold(tmp_path, monkeypatch):
 def test_f011_shadow_enters_while_trend_is_frozen(tmp_path, now):
     from rhbot.status import build_report
 
-    bot = engine(tmp_path, sma_window=3, trend_band=Decimal("0.01"))
-    bot.run_once(now=now, snapshot=snapshot(now, closes=["10", "10", "10"], last_open=now - timedelta(days=1)))
+    bot = engine(tmp_path)
+    bot.run_once(now=now, snapshot=snapshot(now, closes=padded_closes("10"), last_open=now - timedelta(days=1)))
     _set_cash(bot, "trend_daily", "900")
     later = now + timedelta(days=1)
-    hot = snapshot(later, closes=["10", "10", "12"], last_open=later - timedelta(days=1))
+    hot = snapshot(later, closes=padded_closes("12"), last_open=later - timedelta(days=1))
     bot.run_once(now=later, snapshot=hot)
     assert bot.ledger.overlay_row("trend_daily")["state"] == "FROZEN"
     assert bot.ledger.positions("trend_daily") == {}
@@ -1370,8 +1392,8 @@ def test_f021_shadow_trade_cap_is_per_sleeve(tmp_path, now):
     from rhbot.risk import RiskEngine
     from rhbot.status import build_report
 
-    bot = engine(tmp_path, sma_window=3, trend_band=Decimal("0.01"))
-    view = snapshot(now, closes=["10", "10", "12"], last_open=now - timedelta(days=1))
+    bot = engine(tmp_path)
+    view = snapshot(now, closes=padded_closes("12"), last_open=now - timedelta(days=1))
     bot.run_once(now=now, snapshot=view)
     day = now.date().isoformat()
     assert len(bot.ledger.fills_for("buy_and_hold")) == 2
@@ -1468,7 +1490,7 @@ def test_f022_kill_flatten_does_not_reuse_same_day_strategy_sell(tmp_path):
     assert {row["reason"] for row in sells} == {"trend_exit", "drawdown_flatten"}
     flatten = next(row for row in sells if row["reason"] == "drawdown_flatten")
     assert flatten["client_order_id"] != exit_id
-    assert flatten["client_order_id"].endswith(":drawdown_flatten")
+    assert ":drawdown_flatten:" in flatten["client_order_id"]
     assert D(flatten["qty"]) == remaining
     assert bot.ledger.get_fill(exit_id).qty == partial
     bot.ledger.close()

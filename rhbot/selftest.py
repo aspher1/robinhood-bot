@@ -38,7 +38,14 @@ def run_selftest(settings: Settings) -> dict:
         drill = settings.model_copy(update={"state_dir": Path(tmp)})
         now = utcnow()
         quotes = {
-            symbol: Quote(symbol=symbol, ts=now, mid=Decimal("100"), source="selftest")
+            symbol: Quote(
+                symbol=symbol,
+                ts=now,
+                mid=Decimal("100"),
+                bid=Decimal("100"),
+                ask=Decimal("100"),
+                source="selftest",
+            )
             for symbol in drill.symbols
         }
         snapshot = MarketSnapshot(

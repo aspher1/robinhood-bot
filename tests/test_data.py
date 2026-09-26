@@ -21,7 +21,7 @@ def test_coinbase_and_kraken_parsers():
     assert candles[0].source == "coinbase"
     ticker = parse_coinbase_ticker(
         "ETH-USD",
-        {"price": "200.5", "time": "2026-03-16T15:00:00Z", "bid": "200", "ask": "201"},
+        {"price": "199", "time": "2026-03-16T15:00:00Z", "bid": "200", "ask": "201"},
     )
     assert ticker.mid == Decimal("200.5")
     assert ticker.spread_included is False
@@ -38,7 +38,7 @@ def test_coinbase_and_kraken_parsers():
         {"error": [], "result": {"XXBTZUSD": {"c": ["64000.1", "0.1"], "a": ["64010", "1", "1"], "b": ["63990", "1", "1"]}}},
         {"Date": "Mon, 16 Mar 2026 15:00:00 GMT"},
     )
-    assert quote.mid == Decimal("64000.1")
+    assert quote.mid == Decimal("64000")
     assert quote.bid == Decimal("63990")
     assert quote.spread_included is False
 
@@ -48,7 +48,7 @@ def test_robinhood_quote_parser_marks_spread_included():
         "results": [
             {
                 "symbol": "BTC-USD",
-                "price": "100",
+                "price": "999",
                 "bid_inclusive_of_sell_spread": "99",
                 "ask_inclusive_of_buy_spread": "101",
                 "timestamp": "2026-03-16T15:00:00Z",
@@ -64,6 +64,7 @@ def test_robinhood_quote_parser_marks_spread_included():
     }
     quotes = parse_best_bid_ask(payload, ["BTC-USD", "ETH-USD"])
     assert quotes["BTC-USD"].spread_included is True
+    assert quotes["BTC-USD"].mid == Decimal("100")
     assert quotes["BTC-USD"].ask == Decimal("101")
     assert quotes["ETH-USD"].bid == Decimal("198")
 

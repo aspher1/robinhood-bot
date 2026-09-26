@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from rhbot.config import Settings
+from rhbot.config import FROZEN_SYMBOLS, Settings
 from rhbot.models import Fill, MarketSnapshot, OrderIntent
 from rhbot.money import q_cent
 
@@ -34,13 +34,13 @@ class BuyAndHold:
     ) -> tuple[list[OrderIntent], dict, str]:
         del view, equity
         today = now.astimezone(timezone.utc).date().isoformat()
-        if all(positions.get(symbol, Decimal(0)) > 0 for symbol in self.settings.symbols):
+        if all(positions.get(symbol, Decimal(0)) > 0 for symbol in FROZEN_SYMBOLS):
             return [], {**state, "done": True}, "holding"
         if state.get("attempt_date") == today:
             return [], state, "waiting_next_day"
         pending = [
             symbol
-            for symbol in self.settings.symbols
+            for symbol in FROZEN_SYMBOLS
             if positions.get(symbol, Decimal(0)) <= 0
         ]
         amount = q_cent(cash / Decimal(len(pending)))
@@ -61,8 +61,8 @@ class BuyAndHold:
     def commit(self, state: dict, fills: list[Fill], positions: dict, now: datetime) -> dict:
         del now
         updated = dict(state)
-        held = all(positions.get(symbol, Decimal(0)) > 0 for symbol in self.settings.symbols)
-        fully_flat = all(positions.get(symbol, Decimal(0)) == 0 for symbol in self.settings.symbols)
+        held = all(positions.get(symbol, Decimal(0)) > 0 for symbol in FROZEN_SYMBOLS)
+        fully_flat = all(positions.get(symbol, Decimal(0)) == 0 for symbol in FROZEN_SYMBOLS)
         updated["done"] = held
         # A flatten should be allowed to redeploy later. A rejected buy must
         # keep today's attempt stamp so the loop does not retry every minute.

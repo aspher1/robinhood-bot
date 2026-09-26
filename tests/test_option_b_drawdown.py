@@ -9,7 +9,7 @@ from tests.conftest import engine, snapshot
 
 
 def test_same_daily_intent_returns_the_original_fill(tmp_path, now):
-    bot = engine(tmp_path, sma_window=20)
+    bot = engine(tmp_path)
     view = snapshot(now)
     bot.run_once(now=now, snapshot=view)
     day = now.date().isoformat()

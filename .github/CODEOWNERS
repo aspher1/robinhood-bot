@@ -4,3 +4,12 @@
 /rhbot/config.py @aspher1
 /rhbot/risk.py @aspher1
 /rhbot/brokers/ @aspher1
+/rhbot/engine.py @aspher1
+/rhbot/overlay.py @aspher1
+/rhbot/ops.py @aspher1
+/rhbot/cli.py @aspher1
+/rhbot/pricing.py @aspher1
+/rhbot/models.py @aspher1
+/rhbot/ledger.py @aspher1
+/rhbot/strategies/ @aspher1
+/.github/workflows/ @aspher1

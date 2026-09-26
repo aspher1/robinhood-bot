@@ -8,7 +8,7 @@ from decimal import Decimal
 
 from rhbot.config import ALLOWED_SYMBOLS, Settings
 from rhbot.errors import OrderRejected
-from rhbot.models import RISK_REDUCTION_REASONS, OrderIntent, Quote
+from rhbot.models import OrderIntent, Quote
 from rhbot.money import q8
 from rhbot.ops import kill_active
 from rhbot.pricing import plan_fill
@@ -197,8 +197,8 @@ class RiskEngine:
         if spread is not None:
             return _decision(spread)
 
-        # The no-overlay shadow book skips only these two drawdown controls.
-        if not ignore_overlay and kill_active(settings.state_dir) and not reduce_only:
+        # Shadow books skip the per-book freeze and kill. They still honor state/KILL.
+        if kill_active(settings.state_dir) and not reduce_only:
             return deny("kill_switch", "kill_switch", "engaged")
         if not ignore_overlay and ctx.overlay_state == "KILLED" and not reduce_only:
             return deny("killed", "overlay_state", "KILLED", ctx.overlay_state)
@@ -272,25 +272,29 @@ class RiskEngine:
                 )
             return RiskDecision(True, [])
 
-        # Strategy sells still count as trades. Caps do not block a shrink.
-        # The 7-day hold is a hard cap here. Flatten reasons skip this function
-        # via reduce_only above.
+        # Strategy sells still count as trades. Only a reduce_only sell, which
+        # already returned, may skip the hold and the trade cap.
         assert intent.base_quantity is not None
-        if intent.reason not in RISK_REDUCTION_REASONS:
-            opened = ctx.opened_at.get(intent.symbol)
-            if opened is not None:
-                # Same UTC calendar-day count the trend book uses. A sell on
-                # day 7 is allowed even when the clock time is earlier than the entry.
-                opened_day = opened.astimezone(timezone.utc).date()
-                today = ctx.now.astimezone(timezone.utc).date()
-                held_days = (today - opened_day).days
-                if held_days < settings.min_hold_days:
-                    return deny(
-                        "min_hold",
-                        "min_hold_days",
-                        settings.min_hold_days,
-                        held_days,
-                    )
+        opened = ctx.opened_at.get(intent.symbol)
+        if opened is None:
+            return deny(
+                "min_hold",
+                "min_hold_days",
+                settings.min_hold_days,
+                "unknown",
+            )
+        # Same UTC calendar-day count the trend book uses. A sell on
+        # day 7 is allowed even when the clock time is earlier than the entry.
+        opened_day = opened.astimezone(timezone.utc).date()
+        today = ctx.now.astimezone(timezone.utc).date()
+        held_days = (today - opened_day).days
+        if held_days < settings.min_hold_days:
+            return deny(
+                "min_hold",
+                "min_hold_days",
+                settings.min_hold_days,
+                held_days,
+            )
         notional = q8(intent.base_quantity * quote.mid)
         if notional < settings.min_order_notional:
             return deny(
@@ -318,7 +322,7 @@ class RiskEngine:
         age = (now - quote.ts).total_seconds()
         if age < -5:
             return LimitHit("quote_from_the_future", "max_quote_age_seconds", "0", str(int(age)))
-        if age > self.settings.max_quote_age_seconds:
+        if age >= self.settings.max_quote_age_seconds:
             return LimitHit(
                 "stale_quote",
                 "max_quote_age_seconds",
@@ -329,7 +333,7 @@ class RiskEngine:
 
     def _spread(self, quote: Quote) -> LimitHit | None:
         if quote.bid is None or quote.ask is None:
-            return None
+            return LimitHit("missing_bid_ask", "bid_ask", "required", "missing")
         if quote.ask < quote.bid:
             return LimitHit("crossed_quote", "spread", "bid<=ask", "crossed")
         if quote.mid <= 0:

@@ -13,7 +13,7 @@ def _exposure(bot, sleeve: str, view, mid: str) -> tuple[Decimal, Decimal]:
 
 
 def test_entry_cost_does_not_freeze_or_kill(tmp_path, now):
-    bot = engine(tmp_path, sma_window=3)
+    bot = engine(tmp_path)
     bot.run_once(now=now, snapshot=snapshot(now))
     assert read_kill(tmp_path) is None
     assert not (tmp_path / "DRAWDOWN_FREEZE").exists()
@@ -30,7 +30,7 @@ def test_ack_drawdown_requires_a_strategy_and_note(tmp_path):
 
 
 def test_flatten_works_while_killed_and_blocks_new_buys(tmp_path, now):
-    bot = engine(tmp_path, sma_window=3)
+    bot = engine(tmp_path)
     view = snapshot(now)
     bot.run_once(now=now, snapshot=view)
     from rhbot.ops import engage_kill

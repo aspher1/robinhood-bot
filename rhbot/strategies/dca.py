@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from rhbot.config import Settings
+from rhbot.config import FROZEN_DCA_NOTIONAL, FROZEN_SYMBOLS, Settings
 from rhbot.models import Fill, MarketSnapshot, OrderIntent
 from rhbot.ledger import parse_ts
 
@@ -64,9 +64,9 @@ class DcaWeekly:
         updated["seen_index"] = index
         if index in filled or index in skipped:
             return [], updated, "already_scheduled"
-        symbols = self.settings.symbols
+        symbols = FROZEN_SYMBOLS
         symbol = symbols[index % len(symbols)]
-        amount = self.settings.dca_notional
+        amount = FROZEN_DCA_NOTIONAL
         if amount < self.settings.min_order_notional:
             return [], updated, "below_min"
         return [

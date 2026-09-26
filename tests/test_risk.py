@@ -132,7 +132,13 @@ def test_sleeve_drawdown_does_not_kill_and_freeze_blocks_buys_only(tmp_path, now
     sell = OrderIntent("BTC-USD", "sell", "exit", base_quantity=Decimal("1"))
     allowed = risk.evaluate(
         sell,
-        _ctx(settings, now, positions={"BTC-USD": Decimal("1")}, cash=Decimal("500")),
+        _ctx(
+            settings,
+            now,
+            positions={"BTC-USD": Decimal("1")},
+            cash=Decimal("500"),
+            opened_at={"BTC-USD": now - timedelta(days=8)},
+        ),
         "id-sell",
     )
     assert allowed.allowed
@@ -160,7 +166,14 @@ def test_short_is_refused(tmp_path, now):
 def test_fail_closed_on_bad_quote(tmp_path, now):
     settings = _settings(tmp_path)
     risk = RiskEngine(settings)
-    bad = Quote(symbol="BTC-USD", ts=now, mid=Decimal("0"), source="test")
+    bad = Quote(
+        symbol="BTC-USD",
+        ts=now,
+        mid=Decimal("0"),
+        bid=Decimal("0"),
+        ask=Decimal("0"),
+        source="test",
+    )
     other = make_quote("ETH-USD", "100", now)
     decision = risk.evaluate(
         _buy("10"),
@@ -168,7 +181,7 @@ def test_fail_closed_on_bad_quote(tmp_path, now):
         "id-bad",
     )
     assert not decision.allowed
-    assert decision.reasons[0].startswith("fail_closed:")
+    assert decision.reasons == ["bad_mid"]
 
 
 def test_config_may_only_tighten(tmp_path):
@@ -198,17 +211,27 @@ def test_config_may_only_tighten(tmp_path):
         Settings(state_dir=tmp_path, mode="live")
     with pytest.raises(ValueError):
         Settings(state_dir=tmp_path, symbols=("BTC-USD", "SOL-USD"))
+    with pytest.raises(ValueError):
+        Settings(state_dir=tmp_path, sma_window=50)
+    with pytest.raises(ValueError):
+        Settings(state_dir=tmp_path, trend_band=Decimal("0"))
+    with pytest.raises(ValueError):
+        Settings(state_dir=tmp_path, dca_notional=Decimal("500"))
+    with pytest.raises(ValueError):
+        Settings(state_dir=tmp_path, starting_cash=Decimal("2000"))
+    with pytest.raises(ValueError):
+        Settings(state_dir=tmp_path, trend_target_weight=Decimal("0.25"))
+    with pytest.raises(ValueError):
+        Settings(state_dir=tmp_path, symbols=("ETH-USD", "BTC-USD"))
     tightened = Settings(
         state_dir=tmp_path,
-        max_position_pct=Decimal("0.25"),
-        trend_target_weight=Decimal("0.25"),
         max_quote_age_seconds=20,
         min_hold_days=8,
         cost_per_side=Decimal("0.02"),
         freeze_drawdown_pct=Decimal("0.08"),
         kill_drawdown_pct=Decimal("0.25"),
     )
-    assert tightened.max_position_pct == Decimal("0.25")
+    assert tightened.max_position_pct == Decimal("0.50")
     assert tightened.min_hold_days == 8
     assert tightened.freeze_drawdown_pct == Decimal("0.08")
     assert tightened.kill_drawdown_pct == Decimal("0.25")
@@ -253,6 +276,40 @@ def test_spread_over_two_percent_per_side_is_skipped(tmp_path, now):
     assert ok.allowed
 
 
+def test_quote_at_thirty_seconds_is_stale(tmp_path, now):
+    settings = _settings(tmp_path)
+    risk = RiskEngine(settings)
+    aged = make_quote("BTC-USD", "100", now - timedelta(seconds=30))
+    fresh = make_quote("ETH-USD", "100", now)
+    decision = risk.evaluate(
+        _buy(),
+        _ctx(settings, now, quotes={"BTC-USD": aged, "ETH-USD": fresh}),
+        "id-30",
+    )
+    assert decision.reasons == ["stale_quote"]
+
+
+def test_missing_bid_or_ask_is_denied(tmp_path, now):
+    settings = _settings(tmp_path)
+    risk = RiskEngine(settings)
+    bare = Quote(symbol="BTC-USD", ts=now, mid=Decimal("100"), source="test")
+    ask_only = Quote(symbol="BTC-USD", ts=now, mid=Decimal("100"), ask=Decimal("101"), source="test")
+    other = make_quote("ETH-USD", "100", now)
+    for quote, order_id in ((bare, "id-bare"), (ask_only, "id-ask")):
+        decision = risk.evaluate(
+            _buy(),
+            _ctx(settings, now, quotes={"BTC-USD": quote, "ETH-USD": other}),
+            order_id,
+        )
+        assert decision.reasons == ["missing_bid_ask"]
+    unknown = risk.evaluate(
+        OrderIntent("BTC-USD", "sell", "trend_exit", base_quantity=Decimal("1")),
+        _ctx(settings, now, positions={"BTC-USD": Decimal("1")}, opened_at={}),
+        "id-unknown-open",
+    )
+    assert unknown.reasons == ["min_hold"]
+
+
 def test_quote_older_than_thirty_seconds_is_stale(tmp_path, now):
     settings = _settings(tmp_path)
     risk = RiskEngine(settings)
@@ -274,7 +331,7 @@ def test_order_below_ten_dollars_is_rejected(tmp_path, now):
 
 
 def test_engine_stale_data_rejects_without_killing(tmp_path, now):
-    bot = engine(tmp_path, sma_window=3)
+    bot = engine(tmp_path)
     view = snapshot_at(now - timedelta(minutes=10), now)
     bot.run_once(now=now, snapshot=view)
     assert bot.ledger.fills_for("buy_and_hold") == []

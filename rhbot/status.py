@@ -157,7 +157,7 @@ def assess(settings: Settings, now: datetime | None = None) -> dict:
             quote_window = max(180, settings.loop_seconds * 3)
             quotes_ok = (
                 cycle_age is not None
-                and cycle_age <= settings.max_quote_age_seconds
+                and cycle_age < settings.max_quote_age_seconds
                 and ok_age is not None
                 and 0 <= ok_age <= quote_window
             )
@@ -510,7 +510,7 @@ def _sleeve_report(ledger: Ledger, sleeve: str, start: datetime) -> dict:
             trades += 1
     denials = _risk_records(ledger, "risk_denial", sleeve, start)
     trips = _risk_records(ledger, "kill_trip", sleeve, start)
-    freezes = _risk_records(ledger, "drawdown_freeze", sleeve, start)
+    freezes = _risk_records(ledger, "freeze_trip", sleeve, start)
     fidelity_ok, fidelity_detail = ledger.reconcile(sleeve)
     since_pnl = q8(last_equity - starting)
     since_return = Decimal(0) if starting == 0 else (since_pnl / starting) * Decimal(100)

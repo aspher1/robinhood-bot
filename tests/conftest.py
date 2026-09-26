@@ -22,7 +22,15 @@ def make_settings(path, **overrides) -> Settings:
 
 
 def make_quote(symbol: str, mid: str, ts: datetime, **kwargs) -> Quote:
-    return Quote(symbol=symbol, ts=ts, mid=Decimal(mid), source="test", **kwargs)
+    price = Decimal(mid)
+    kwargs.setdefault("bid", price)
+    kwargs.setdefault("ask", price)
+    return Quote(symbol=symbol, ts=ts, mid=price, source="test", **kwargs)
+
+
+def padded_closes(last: str, base: str = "10", count: int = 200) -> list[str]:
+    """200 closes so the frozen 200-day average can see a last price."""
+    return [base] * (count - 1) + [last]
 
 
 def make_bars(symbol: str, closes: list[str], last_open: datetime) -> list[Bar]:

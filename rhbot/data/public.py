@@ -106,10 +106,12 @@ def parse_coinbase_ticker(symbol: str, payload: object) -> Quote:
         raise DataError("coinbase ticker missing price or time")
     bid = D(payload["bid"]) if payload.get("bid") not in (None, "") else None
     ask = D(payload["ask"]) if payload.get("ask") not in (None, "") else None
+    # Mid is the bid/ask average. The last trade is not a mid.
+    mid = (bid + ask) / Decimal(2) if bid is not None and ask is not None else D(payload["price"])
     return Quote(
         symbol=symbol,
         ts=_parse_time(payload["time"]),
-        mid=D(payload["price"]),
+        mid=mid,
         source="coinbase",
         bid=bid,
         ask=ask,
@@ -170,10 +172,11 @@ def parse_kraken_ticker(
     del headers
     trusted = trade_time is not None
     ts = trade_time if trade_time is not None else datetime.now(timezone.utc)
+    mid = (bid + ask) / Decimal(2) if bid is not None and ask is not None else D(last[0])
     return Quote(
         symbol=symbol,
         ts=ts,
-        mid=D(last[0]),
+        mid=mid,
         source="kraken",
         bid=bid,
         ask=ask,

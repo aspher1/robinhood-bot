@@ -9,7 +9,13 @@ from rhbot.data.robinhood import QUOTE_PATH, build_signature
 from rhbot.errors import LiveTradingDisabled, ReadOnlyViolation
 
 ROOT = Path(__file__).resolve().parents[1] / "rhbot"
+REPO = Path(__file__).resolve().parents[1]
 ORDER_PATH = re.compile(r"/api/v\d+/crypto/trading/orders", re.I)
+COINBASE_ORDER = re.compile(
+    r"api\.coinbase\.com/.*/(?:" + "orders|batch_orders)|" + "/api/v3/" + "brokerage/" + "orders",
+    re.I,
+)
+KRAKEN_ORDER = re.compile("/0/private/" + "AddOrder", re.I)
 HTTP_WRITE = re.compile(
     r"(?i)(?:\.(?:post|delete|put|patch)\s*\(|\b(?:httpx|requests)\s*\.\s*(?:post|delete|put|patch)\b|method\s*=\s*['\"](?:POST|PUT|PATCH|DELETE)['\"])"
 )
@@ -49,6 +55,18 @@ def test_codeowners_covers_risk_caps_and_brokers():
     assert "/rhbot/risk.py" in text
     assert "/rhbot/config.py" in text
     assert "/rhbot/brokers/" in text
+    for path in (
+        "/rhbot/engine.py",
+        "/rhbot/overlay.py",
+        "/rhbot/ops.py",
+        "/rhbot/cli.py",
+        "/rhbot/pricing.py",
+        "/rhbot/models.py",
+        "/rhbot/ledger.py",
+        "/rhbot/strategies/",
+        "/.github/workflows/",
+    ):
+        assert path in text
 
 
 def test_env_cannot_enable_live(tmp_path, monkeypatch):
@@ -95,6 +113,8 @@ def http_write_findings(source: str) -> list[str]:
                 found.append(f"from {node.module} import {sorted(names)}")
         elif isinstance(node, ast.Call):
             func = node.func
+            if isinstance(func, ast.Call) and _getattr_write(func, node):
+                found.append("getattr write")
             name = func.attr if isinstance(func, ast.Attribute) else func.id if isinstance(func, ast.Name) else ""
             if name in _HTTP_WRITE_NAMES:
                 found.append(name)
@@ -104,32 +124,87 @@ def http_write_findings(source: str) -> list[str]:
     return found
 
 
+def _getattr_write(func: ast.Call, call: ast.Call) -> bool:
+    """getattr(client, "post")(...) and getattr(client, "request")("POST", ...)."""
+    inner = func.func
+    if not isinstance(inner, ast.Name) or inner.id != "getattr":
+        return False
+    if len(func.args) < 2 or not isinstance(func.args[1], ast.Constant):
+        return False
+    method = str(func.args[1].value)
+    if method in _HTTP_WRITE_NAMES - {"request", "stream", "send"}:
+        return True
+    if method in {"request", "stream", "send"} and call.args:
+        verb = call.args[0]
+        if isinstance(verb, ast.Constant) and str(verb.value).upper() in {"POST", "PUT", "PATCH", "DELETE"}:
+            return True
+    return False
+
+
+def _py_files(root: Path):
+    skip = {".git", "__pycache__", ".venv", "venv"}
+    for path in root.rglob("*.py"):
+        if any(part in skip for part in path.parts):
+            continue
+        yield path
+
+
 def test_package_has_no_live_order_path():
     offenders = []
-    for path in ROOT.rglob("*.py"):
+    for path in _py_files(REPO):
         text = path.read_text(encoding="utf-8")
-        if ORDER_PATH.search(text) or HTTP_WRITE.search(text) or http_write_findings(text):
+        if (
+            ORDER_PATH.search(text)
+            or COINBASE_ORDER.search(text)
+            or KRAKEN_ORDER.search(text)
+            or HTTP_WRITE.search(text)
+            or http_write_findings(text)
+        ):
             offenders.append(str(path))
-        if "trading.robinhood.com" in text and re.search(r"\borders?\b", text, re.I):
+        host = "trading.robinhood." + "com"
+        if host in text and re.search(r"\borders?\b", text, re.I):
             offenders.append(str(path))
     assert offenders == []
 
 
+def _order_path(text: str) -> bool:
+    return bool(ORDER_PATH.search(text) or COINBASE_ORDER.search(text) or KRAKEN_ORDER.search(text))
+
+
 def test_http_write_forms_are_rejected(tmp_path):
+    del tmp_path
     samples = {
         "post_request.py": "def f(client):\n    client.request('POST', 'https://example')\n",
         "httpx_put.py": "import httpx\nhttpx.request('PUT', 'https://example')\n",
         "stream_post.py": "def f(client):\n    client.stream('POST', 'https://example')\n",
         "urllib_data.py": "import urllib.request\nurllib.request.Request('https://example', data=b'x')\n",
         "urlopen_data.py": "def f(urlopen):\n    urlopen('https://example', data=b'x')\n",
+        "getattr_post.py": "def f(client):\n    getattr(client, 'post')('https://example')\n",
+        "getattr_request.py": "def f(client):\n    getattr(client, 'request')('POST', 'https://example')\n",
+        "coinbase_order.py": "URL = 'https://api.coinbase.com" + "/api/v3/brokerage/" + "orders'\n",
+        "kraken_order.py": "URL = 'https://api.kraken.com" + "/0/private/" + "AddOrder'\n",
     }
+    outside = REPO / "_audit_outside.py"
+    outside.write_text(samples["getattr_post.py"], encoding="utf-8")
+    try:
+        assert str(outside) in [str(path) for path in _py_files(REPO) if http_write_findings(path.read_text(encoding="utf-8"))]
+    finally:
+        outside.unlink(missing_ok=True)
     for name, source in samples.items():
         path = ROOT / f"_audit_{name}"
         path.write_text(source, encoding="utf-8")
         try:
-            assert http_write_findings(source), name
-            offenders = [str(item) for item in ROOT.rglob("*.py") if http_write_findings(item.read_text(encoding="utf-8"))]
+            assert http_write_findings(source) or _order_path(source) or HTTP_WRITE.search(source), name
+            text = path.read_text(encoding="utf-8")
+            offenders = [
+                str(item)
+                for item in _py_files(REPO)
+                if http_write_findings(item.read_text(encoding="utf-8"))
+                or _order_path(item.read_text(encoding="utf-8"))
+                or HTTP_WRITE.search(item.read_text(encoding="utf-8"))
+            ]
             assert str(path) in offenders
+            assert http_write_findings(text) or _order_path(text) or HTTP_WRITE.search(text)
         finally:
             path.unlink(missing_ok=True)
 
@@ -171,7 +246,7 @@ def test_signer_refuses_writes_and_unlisted_paths():
             "rh-api-test",
             secret,
             "1700000000",
-            "/api/v1/crypto/trading/orders/",
+            "/api/v1/crypto/trading/" + "orders/",
             "GET",
             "",
         )

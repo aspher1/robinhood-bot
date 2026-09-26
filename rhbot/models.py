@@ -6,8 +6,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
-# Forced de-risking. These fills do not consume the daily strategy trade budget.
-RISK_REDUCTION_REASONS = ("flatten", "exposure_cut", "drawdown_flatten")
+# Reduce-only sells. These fills do not consume the daily strategy trade budget.
+# A reason string alone does not bypass a limit; the order must be reduce_only.
+RISK_REDUCTION_REASONS = ("flatten", "drawdown_flatten")
 
 
 @dataclass(frozen=True)
