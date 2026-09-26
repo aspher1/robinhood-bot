@@ -160,7 +160,9 @@ def read_freeze(state_dir: Path) -> dict | None:
 def engage_freeze(state_dir: Path, reason: str, by: str) -> dict:
     """Create the freeze file if it is not already there. The first reason wins.
 
-    The engine never deletes this file. A human clears it with ``rhbot ack-drawdown``.
+    The engine never deletes this file. The operator clears it with
+    ``rhbot ack-drawdown --reason``. That does not reset the drawdown peak
+    and does not clear a kill. A 40% kill stays human-only ``rhbot resume --ack``.
     """
     path = freeze_path(state_dir)
     if path.exists():

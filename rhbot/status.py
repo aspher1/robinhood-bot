@@ -51,6 +51,7 @@ def assess(settings: Settings, now: datetime | None = None) -> dict:
     freeze = read_freeze(settings.state_dir)
     portfolio_dd = Decimal(0)
     acknowledged = False
+    drawdown_acks: list[dict] = []
     db_exists = _db_path(settings).exists()
     limit = max(180, settings.loop_seconds * 3)
 
@@ -175,6 +176,7 @@ def assess(settings: Settings, now: datetime | None = None) -> dict:
             if kill_reason(combined, portfolio_peak, settings):
                 level = _bump("critical", "drawdown_breach", level, reasons)
             acknowledged = (ledger.get_meta("drawdown_ack_peak") or "") == money_str(portfolio_peak)
+            drawdown_acks = _ack_records(ledger, None)
         finally:
             ledger.close()
 
@@ -218,6 +220,7 @@ def assess(settings: Settings, now: datetime | None = None) -> dict:
         "kill_switch": kill is not None,
         "kill_reason": None if kill is None else kill.get("reason"),
         "drawdown_freeze": freeze is not None,
+        "drawdown_acks": drawdown_acks,
         "last_heartbeat_at": None if not heartbeat else heartbeat.get("ts"),
         "last_decision_at": last_decision_at,
         "last_quote_ok_at": last_quote_ok_at,
@@ -278,11 +281,32 @@ def build_report(settings: Settings, since_text: str, now: datetime | None = Non
             if name not in ledger.sleeve_names():
                 continue
             sleeves[name] = _sleeve_report(ledger, name, start)
-        benchmark = sleeves.get("buy_and_hold", {}).get("window", {}).get("return_pct")
+        shadow: dict[str, dict] = {}
+        for name in SLEEVES:
+            if name not in ledger.shadow_sleeve_names():
+                continue
+            shadow[name] = _shadow_report(ledger, name, start)
+            real = sleeves.get(name)
+            if real is None:
+                shadow[name]["overlay_effect"] = None
+                continue
+            equity_delta = q8(D(real["equity"]) - D(shadow[name]["equity"]))
+            return_delta = q8(
+                D(real["since_start"]["return_pct"]) - D(shadow[name]["since_start"]["return_pct"])
+            )
+            shadow[name]["overlay_effect"] = {
+                "equity_delta": money_str(equity_delta),
+                "return_delta_pct": format(return_delta, "f"),
+            }
+        using_shadow_benchmark = "buy_and_hold" in shadow
+        if using_shadow_benchmark:
+            benchmark = shadow["buy_and_hold"]["window"]["return_pct"]
+        else:
+            benchmark = sleeves.get("buy_and_hold", {}).get("window", {}).get("return_pct")
         denials = []
         fidelity_ok = True
         for name, body in sleeves.items():
-            if benchmark is None or name == "buy_and_hold":
+            if benchmark is None or (name == "buy_and_hold" and not using_shadow_benchmark):
                 body["excess_return_vs_buy_and_hold_pct"] = None
             else:
                 excess = D(body["window"]["return_pct"]) - D(benchmark)
@@ -292,6 +316,7 @@ def build_report(settings: Settings, since_text: str, now: datetime | None = Non
                 fidelity_ok = False
         trips = _risk_records(ledger, "kill_trip", None, start)
         freezes = _risk_records(ledger, "drawdown_freeze", None, start)
+        acks = _ack_records(ledger, start)
         return {
             "since": since_text,
             "from": iso(start),
@@ -301,9 +326,16 @@ def build_report(settings: Settings, since_text: str, now: datetime | None = Non
             "cost_per_side": format(settings.cost_per_side, "f"),
             "risk_denials": denials,
             "drawdown_freezes": freezes,
+            "drawdown_acks": acks,
             "kill_trips": trips,
             "fidelity_ok": fidelity_ok,
             "sleeves": sleeves,
+            "no_overlay": {
+                "benchmark": "buy_and_hold",
+                "benchmark_scored_without_overlay": using_shadow_benchmark,
+                "benchmark_return_pct": benchmark,
+                "sleeves": shadow,
+            },
         }
     finally:
         ledger.close()
@@ -374,6 +406,76 @@ def _sleeve_report(ledger: Ledger, sleeve: str, start: datetime) -> dict:
     }
 
 
+def _shadow_report(ledger: Ledger, sleeve: str, start: datetime) -> dict:
+    """No-overlay sleeve: same strategy, without the 10% freeze or the 40% kill."""
+    row = ledger.shadow_sleeve_row(sleeve)
+    starting = D(row["starting_cash"])
+    last_equity = D(row["last_equity"])
+    snaps = ledger.shadow_snapshots(sleeve)
+    prior = None
+    in_window = []
+    for snap in snaps:
+        ts = parse_ts(str(snap["ts"]))
+        if ts < start:
+            prior = snap
+        else:
+            in_window.append(snap)
+    if prior is not None:
+        start_equity = D(prior["equity"])
+    else:
+        start_equity = starting
+    end_equity = D(in_window[-1]["equity"]) if in_window else last_equity
+    window_pnl = q8(end_equity - start_equity)
+    window_return = Decimal(0) if start_equity == 0 else (window_pnl / start_equity) * Decimal(100)
+    fees = Decimal(0)
+    trades = 0
+    for fill in ledger.shadow_fills_for(sleeve):
+        if parse_ts(str(fill["ts"])) >= start:
+            fees += D(fill["cost"])
+            trades += 1
+    fidelity_ok, fidelity_detail = ledger.reconcile_shadow(sleeve)
+    since_pnl = q8(last_equity - starting)
+    since_return = Decimal(0) if starting == 0 else (since_pnl / starting) * Decimal(100)
+    return {
+        "equity": money_str(last_equity),
+        "cash": money_str(D(row["cash"])),
+        "positions": {
+            symbol: money_str(qty) for symbol, qty in ledger.shadow_positions(sleeve).items()
+        },
+        "since_start": {
+            "pnl": money_str(since_pnl),
+            "return_pct": format(q8(since_return), "f"),
+        },
+        "window": {
+            "pnl": money_str(window_pnl),
+            "return_pct": format(q8(window_return), "f"),
+            "fees": money_str(fees),
+            "trades": trades,
+        },
+        "fidelity": {"ok": fidelity_ok, "detail": fidelity_detail},
+    }
+
+
+def _ack_records(ledger: Ledger, start: datetime | None) -> list[dict]:
+    """Operator acknowledgements of a paper drawdown freeze."""
+    found = []
+    for event in ledger.conn.execute(
+        "SELECT payload FROM events WHERE kind='drawdown_ack' ORDER BY seq"
+    ):
+        payload = json.loads(event["payload"])
+        if start is not None and parse_ts(str(payload["ts"])) < start:
+            continue
+        found.append(
+            {
+                "ts": payload.get("ts") or "",
+                "actor": payload.get("actor") or payload.get("by") or "",
+                "reason": payload.get("reason") or "",
+                "peak": payload.get("peak") or "",
+            }
+        )
+    return found
+
+
 def _risk_records(
     ledger: Ledger, kind: str, sleeve: str | None, start: datetime
 ) -> list[dict]:
@@ -431,6 +533,28 @@ def render_markdown(report: dict) -> str:
             f"{excess if excess is not None else 'benchmark'} | {len(body['risk_denials'])} | "
             f"{len(body.get('drawdown_freezes', []))} | {len(body['kill_trips'])} | {fidelity} |"
         )
+    no_overlay = report.get("no_overlay") or {}
+    if no_overlay.get("sleeves"):
+        lines.append("")
+        scored = "without the drawdown overlay" if no_overlay.get("benchmark_scored_without_overlay") else "from the live book"
+        lines.append(
+            f"Buy-and-hold benchmark is scored {scored}. "
+            f"Window return: {no_overlay.get('benchmark_return_pct')}."
+        )
+        lines.append("")
+        lines.append("| No-overlay sleeve | Equity | Return % since start | Overlay equity delta |")
+        lines.append("| --- | --- | --- | --- |")
+        for name, body in no_overlay["sleeves"].items():
+            effect = body.get("overlay_effect") or {}
+            lines.append(
+                f"| {name} | {body['equity']} | {body['since_start']['return_pct']} | "
+                f"{effect.get('equity_delta', '')} |"
+            )
+    if report.get("drawdown_acks"):
+        lines.append("")
+        lines.append("Drawdown freeze acknowledgements. These do not reset the peak and do not clear a kill.")
+        for item in report["drawdown_acks"]:
+            lines.append(f"- ack {item['ts']} actor {item['actor']}: {item['reason']} peak {item['peak']}")
     if report.get("risk_denials") or report.get("drawdown_freezes") or report.get("kill_trips"):
         lines.append("")
         lines.append(

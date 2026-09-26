@@ -68,7 +68,7 @@ rhbot report --since 24h --state-dir state
 rhbot report --since 7d --md --state-dir state
 rhbot kill --reason "quotes look wrong" --state-dir state
 rhbot resume --state-dir state
-rhbot ack-drawdown --state-dir state
+rhbot ack-drawdown --reason "reviewed the paper drawdown" --state-dir state
 rhbot resume --ack --state-dir state
 rhbot flatten --paper --state-dir state
 rhbot selftest
@@ -79,7 +79,9 @@ rhbot audit verify --state-dir state
 
 `report` is P&L after costs for each sleeve, next to buy-and-hold.
 
-`resume` will not clear the kill file if something else is critically wrong (a broken ledger, for example). Drawdown is measured on the combined portfolio peak, and these limits are paper-only: they must not be carried into a live phase. A 10% drop freezes new buys until `rhbot ack-drawdown`. Sells stay allowed and nothing is force-sold. A 40% drop flattens the paper book and requires `rhbot resume --ack`. The bot never clears that freeze or that kill by itself.
+`resume` will not clear the kill file if something else is critically wrong (a broken ledger, for example). Drawdown is measured on the combined portfolio peak, and these limits are paper-only: they must not be carried into a live phase. A 10% drop freezes new buys, including weekly DCA, until the operator runs `rhbot ack-drawdown --reason "..."`. That acknowledgement does not reset the peak, and the freeze re-arms only after drawdown recovers above −10% and then falls below it again. Sells stay allowed and nothing is force-sold. A 40% drop flattens the paper book and requires a human `rhbot resume --ack`. The operator may trip that kill and must not clear it. `ack-drawdown` does not clear a kill.
+
+`report` scores buy-and-hold from a no-overlay shadow ledger (the same strategies without the freeze or the kill) and includes that shadow book so the overlay's effect is visible. `status` and `report` list each freeze acknowledgement with its actor and reason.
 
 `flatten --paper` sells what the sleeves hold. The strategies will try to buy back on a later cycle unless the kill file is still in place. To stop the book: kill, then flatten.
 

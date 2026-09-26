@@ -13,10 +13,11 @@ from rhbot.brokers.paper import PaperBroker
 from rhbot.config import Settings, reject_live_env
 from rhbot.data.public import PublicMarketData
 from rhbot.data.robinhood import RobinhoodMarketData
-from rhbot.errors import OrderRejected
+from rhbot.errors import DataError, OrderRejected
 from rhbot.ledger import Ledger
-from rhbot.models import MarketSnapshot, OrderIntent
+from rhbot.models import Fill, MarketSnapshot, OrderIntent
 from rhbot.money import D, money_str, q8
+from rhbot.pricing import plan_fill
 from rhbot.ops import (
     engage_freeze,
     engage_kill,
@@ -117,6 +118,7 @@ class Engine:
         equities: dict[str, str] = {}
         for strategy in self.strategies:
             equity = self._run_sleeve(strategy, market_now, snapshot)
+            self._run_shadow_sleeve(strategy, market_now, snapshot)
             equities[strategy.name] = money_str(equity)
         self.ledger.set_meta("last_decision_at", iso(wall))
         self.ledger.log_event(
@@ -293,6 +295,98 @@ class Engine:
         self.ledger.snapshot(strategy.name, equity, market_now)
         return equity
 
+    def _run_shadow_sleeve(self, strategy, market_now: datetime, snapshot: MarketSnapshot) -> None:
+        """Same strategy, without the 10% freeze or the 40% kill.
+
+        Other risk checks still apply. This book is the buy-and-hold benchmark
+        and the report's no-overlay ledger. It is never flattened by a kill.
+        """
+        self.ledger.ensure_shadow_sleeve(strategy.name, market_now, strategy.initial_state())
+        equity = self.shadow_mark(strategy.name, snapshot)
+        self.ledger.mark_shadow_equity(strategy.name, equity, market_now)
+        state = self.ledger.shadow_strategy_state(strategy.name) or strategy.initial_state()
+        positions = self.ledger.shadow_positions(strategy.name)
+        cash = self.ledger.shadow_cash(strategy.name)
+        orders, new_state, _reason = strategy.decide(
+            snapshot, state, positions, cash, equity, market_now
+        )
+        filled: list[Fill] = []
+        for intent in orders:
+            client_order_id = "shadow-" + self._client_id(strategy.name, intent, market_now)
+            decision = self.risk.evaluate(
+                intent,
+                self._shadow_context(strategy.name, snapshot, market_now),
+                client_order_id,
+                ignore_overlay=True,
+            )
+            if not decision.allowed:
+                continue
+            quote = snapshot.quotes.get(intent.symbol)
+            if quote is None:
+                continue
+            try:
+                qty, price, cash_delta, cost, notional = plan_fill(
+                    intent, quote, self.settings.cost_per_side
+                )
+            except DataError:
+                continue
+            qty_delta = qty if intent.side == "buy" else -qty
+            fill = Fill(
+                sleeve=strategy.name,
+                symbol=intent.symbol,
+                side=intent.side,
+                qty=qty,
+                qty_delta=qty_delta,
+                mid=quote.mid,
+                fill_price=price,
+                cash_delta=cash_delta,
+                cost=cost,
+                notional=notional,
+                ts=market_now,
+                client_order_id=client_order_id,
+                reason=intent.reason,
+            )
+            try:
+                self.ledger.commit_shadow_fill(fill)
+            except OrderRejected:
+                continue
+            filled.append(fill)
+        positions = self.ledger.shadow_positions(strategy.name)
+        self.ledger.save_shadow_strategy_state(
+            strategy.name, strategy.commit(new_state, filled, positions, market_now)
+        )
+        equity = self.shadow_mark(strategy.name, snapshot)
+        self.ledger.mark_shadow_equity(strategy.name, equity, market_now)
+        self.ledger.shadow_snapshot(strategy.name, equity, market_now)
+
+    def shadow_mark(self, sleeve: str, snapshot: MarketSnapshot):
+        equity = self.ledger.shadow_cash(sleeve)
+        for symbol, qty in self.ledger.shadow_positions(sleeve).items():
+            quote = snapshot.quotes.get(symbol)
+            if quote is None:
+                raise RuntimeError(f"no quote to mark shadow {symbol}")
+            equity += qty * quote.mid
+        return q8(equity)
+
+    def _shadow_context(self, sleeve: str, snapshot: MarketSnapshot, market_now: datetime) -> RiskContext:
+        row = self.ledger.shadow_sleeve_row(sleeve)
+        day = market_now.date().isoformat()
+        _fills, turnover = self.ledger.shadow_activity_today(sleeve, day)
+        return RiskContext(
+            now=market_now,
+            sleeve=sleeve,
+            equity=self.shadow_mark(sleeve, snapshot),
+            cash=self.ledger.shadow_cash(sleeve),
+            positions=self.ledger.shadow_positions(sleeve),
+            quotes=snapshot.quotes,
+            day_start_equity=q8(row["day_start_equity"]),
+            peak_equity=q8(row["last_equity"]),
+            trades_today=self.ledger.shadow_strategy_trades_today(day),
+            turnover_today=turnover,
+            known_client_ids=self.ledger.shadow_known_client_ids(),
+            ordered_symbols_today=self.ledger.shadow_symbols_ordered_on(sleeve, day),
+        )
+
     def _context(self, sleeve: str, snapshot: MarketSnapshot, market_now: datetime) -> RiskContext:
         row = self.ledger.sleeve_row(sleeve)
         day = market_now.date().isoformat()
@@ -337,10 +431,14 @@ class Engine:
     ) -> tuple[Decimal, Decimal]:
         """Paper-only drawdown on the combined portfolio peak.
 
-        At 10% from that peak, raise an alert and freeze new buys. Exits stay
-        allowed and nothing is force-sold. At 40%, flatten and write KILL.
-        These looser limits must not be carried into a live phase. This method
-        never clears the freeze file or the kill file.
+        At 10% from that peak, raise an alert and freeze new buys, including
+        weekly DCA. Exits stay allowed and nothing is force-sold. Acknowledging
+        the freeze does not rebase this peak. The freeze re-arms only after
+        drawdown recovers above the line and then falls through it again.
+        At 40%, flatten and write KILL. These looser limits must not be carried
+        into a live phase. This method never clears the freeze file or the kill
+        file. The AI operator may acknowledge the freeze. Only a human may
+        clear the kill, with ``rhbot resume --ack``.
         """
         equity, peak = self._mark_portfolio(market_now, snapshot)
         dd = peak_drawdown(equity, peak)
@@ -353,7 +451,8 @@ class Engine:
         if dd >= self.settings.drawdown_freeze_pct:
             self._raise_freeze(market_now, equity, peak, dd)
         elif not freeze_active(self.settings.state_dir) and self.ledger.get_meta("drawdown_ack_peak"):
-            # The acknowledged episode has recovered. A later breach may alert again.
+            # Recovered above the freeze line. The next breach of this or a new peak may alert.
+            # The portfolio peak itself is left where it is.
             self.ledger.set_meta("drawdown_ack_peak", "")
         return equity, peak
 

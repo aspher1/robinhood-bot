@@ -137,6 +137,57 @@ BEFORE DELETE ON trade_log
 BEGIN
     SELECT RAISE(ABORT, 'append-only');
 END;
+CREATE TABLE IF NOT EXISTS shadow_sleeves (
+    name TEXT PRIMARY KEY,
+    cash TEXT NOT NULL,
+    starting_cash TEXT NOT NULL,
+    day_start_equity TEXT NOT NULL,
+    day_start_date TEXT NOT NULL,
+    last_equity TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS shadow_positions (
+    sleeve TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    qty TEXT NOT NULL,
+    PRIMARY KEY (sleeve, symbol)
+);
+CREATE TABLE IF NOT EXISTS shadow_fills (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sleeve TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    qty TEXT NOT NULL,
+    qty_delta TEXT NOT NULL,
+    mid TEXT NOT NULL,
+    fill_price TEXT NOT NULL,
+    cash_delta TEXT NOT NULL,
+    cost TEXT NOT NULL,
+    notional TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    client_order_id TEXT NOT NULL UNIQUE,
+    reason TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS shadow_strategy_state (
+    sleeve TEXT PRIMARY KEY,
+    state_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS shadow_equity_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    sleeve TEXT NOT NULL,
+    equity TEXT NOT NULL,
+    cash TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS shadow_fills_no_update
+BEFORE UPDATE ON shadow_fills
+BEGIN
+    SELECT RAISE(ABORT, 'append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS shadow_fills_no_delete
+BEFORE DELETE ON shadow_fills
+BEGIN
+    SELECT RAISE(ABORT, 'append-only');
+END;
 """
 
 
@@ -636,6 +687,219 @@ class Ledger:
         ).fetchone()
         if int(fill_rows["n"]) != self.count_events("fill", sleeve):
             return False, f"{sleeve} fill rows do not match fill events"
+        return True, "ok"
+
+    def ensure_shadow_sleeve(self, name: str, now: datetime, initial_state: dict) -> None:
+        row = self.conn.execute(
+            "SELECT name FROM shadow_sleeves WHERE name=?", (name,)
+        ).fetchone()
+        if row is not None:
+            return
+        cash = money_str(self.settings.starting_cash)
+        today = now.astimezone(timezone.utc).date().isoformat()
+        self.conn.execute(
+            """
+            INSERT INTO shadow_sleeves
+                (name, cash, starting_cash, day_start_equity, day_start_date, last_equity)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (name, cash, cash, cash, today, cash),
+        )
+        self.conn.execute(
+            "INSERT INTO shadow_strategy_state(sleeve, state_json) VALUES(?, ?)",
+            (name, canonical(initial_state)),
+        )
+        self.conn.commit()
+
+    def shadow_sleeve_names(self) -> list[str]:
+        rows = self.conn.execute("SELECT name FROM shadow_sleeves ORDER BY name").fetchall()
+        return [str(row["name"]) for row in rows]
+
+    def shadow_sleeve_row(self, sleeve: str) -> sqlite3.Row:
+        row = self.conn.execute(
+            "SELECT * FROM shadow_sleeves WHERE name=?", (sleeve,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(sleeve)
+        return row
+
+    def shadow_cash(self, sleeve: str) -> Decimal:
+        return D(self.shadow_sleeve_row(sleeve)["cash"])
+
+    def shadow_positions(self, sleeve: str) -> dict[str, Decimal]:
+        rows = self.conn.execute(
+            "SELECT symbol, qty FROM shadow_positions WHERE sleeve=? ORDER BY symbol",
+            (sleeve,),
+        ).fetchall()
+        out: dict[str, Decimal] = {}
+        for row in rows:
+            qty = D(row["qty"])
+            if qty != 0:
+                out[str(row["symbol"])] = qty
+        return out
+
+    def shadow_strategy_state(self, sleeve: str) -> dict:
+        row = self.conn.execute(
+            "SELECT state_json FROM shadow_strategy_state WHERE sleeve=?",
+            (sleeve,),
+        ).fetchone()
+        if row is None:
+            return {}
+        import json
+
+        data = json.loads(row["state_json"])
+        if not isinstance(data, dict):
+            return {}
+        return data
+
+    def save_shadow_strategy_state(self, sleeve: str, state: dict) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO shadow_strategy_state(sleeve, state_json) VALUES(?, ?)
+            ON CONFLICT(sleeve) DO UPDATE SET state_json=excluded.state_json
+            """,
+            (sleeve, canonical(state)),
+        )
+        self.conn.commit()
+
+    def shadow_fills_for(self, sleeve: str) -> list[sqlite3.Row]:
+        return list(
+            self.conn.execute(
+                "SELECT * FROM shadow_fills WHERE sleeve=? ORDER BY id",
+                (sleeve,),
+            ).fetchall()
+        )
+
+    def shadow_activity_today(self, sleeve: str, day: str) -> tuple[int, Decimal]:
+        rows = self.conn.execute(
+            "SELECT notional FROM shadow_fills WHERE sleeve=? AND substr(ts, 1, 10)=?",
+            (sleeve, day),
+        ).fetchall()
+        total = Decimal(0)
+        for row in rows:
+            total += D(row["notional"])
+        return len(rows), q8(total)
+
+    def shadow_strategy_trades_today(self, day: str) -> int:
+        placeholders = ",".join("?" for _ in RISK_REDUCTION_REASONS)
+        row = self.conn.execute(
+            f"""
+            SELECT COUNT(*) AS n FROM shadow_fills
+            WHERE substr(ts, 1, 10)=? AND reason NOT IN ({placeholders})
+            """,
+            (day, *RISK_REDUCTION_REASONS),
+        ).fetchone()
+        return int(row["n"])
+
+    def shadow_symbols_ordered_on(self, sleeve: str, day: str) -> set[str]:
+        rows = self.conn.execute(
+            "SELECT DISTINCT symbol FROM shadow_fills WHERE sleeve=? AND substr(ts, 1, 10)=?",
+            (sleeve, day),
+        ).fetchall()
+        return {str(row["symbol"]) for row in rows}
+
+    def shadow_known_client_ids(self) -> set[str]:
+        rows = self.conn.execute("SELECT client_order_id FROM shadow_fills").fetchall()
+        return {str(row["client_order_id"]) for row in rows}
+
+    def commit_shadow_fill(self, fill: Fill) -> None:
+        """Apply one strategy fill to the no-overlay book. Does not touch the live sleeves."""
+        with self.transaction():
+            cash = self.shadow_cash(fill.sleeve)
+            new_cash = q8(cash + fill.cash_delta)
+            if new_cash < 0:
+                raise OrderRejected(["insufficient_cash"])
+            current = self.shadow_positions(fill.sleeve).get(fill.symbol, Decimal(0))
+            new_pos = q8(current + fill.qty_delta)
+            if new_pos < 0:
+                raise OrderRejected(["insufficient_position"])
+            self.conn.execute(
+                "UPDATE shadow_sleeves SET cash=? WHERE name=?",
+                (money_str(new_cash), fill.sleeve),
+            )
+            self.conn.execute(
+                """
+                INSERT INTO shadow_positions(sleeve, symbol, qty) VALUES(?, ?, ?)
+                ON CONFLICT(sleeve, symbol) DO UPDATE SET qty=excluded.qty
+                """,
+                (fill.sleeve, fill.symbol, money_str(new_pos)),
+            )
+            self.conn.execute(
+                """
+                INSERT INTO shadow_fills(
+                    sleeve, symbol, side, qty, qty_delta, mid, fill_price,
+                    cash_delta, cost, notional, ts, client_order_id, reason
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    fill.sleeve,
+                    fill.symbol,
+                    fill.side,
+                    money_str(fill.qty),
+                    money_str(fill.qty_delta),
+                    money_str(fill.mid),
+                    money_str(fill.fill_price),
+                    money_str(fill.cash_delta),
+                    money_str(fill.cost),
+                    money_str(fill.notional),
+                    iso(fill.ts),
+                    fill.client_order_id,
+                    fill.reason,
+                ),
+            )
+            payload = fill.event_payload()
+            payload["book"] = "no_overlay"
+            self.append_event("shadow_fill", payload, fill.ts)
+
+    def mark_shadow_equity(self, sleeve: str, equity: Decimal, now: datetime) -> Decimal:
+        row = self.shadow_sleeve_row(sleeve)
+        today = now.astimezone(timezone.utc).date().isoformat()
+        day_start = D(row["day_start_equity"])
+        if str(row["day_start_date"]) != today:
+            day_start = q8(equity)
+        self.conn.execute(
+            """
+            UPDATE shadow_sleeves
+            SET day_start_equity=?, day_start_date=?, last_equity=?
+            WHERE name=?
+            """,
+            (money_str(day_start), today, money_str(equity), sleeve),
+        )
+        self.conn.commit()
+        return day_start
+
+    def shadow_snapshot(self, sleeve: str, equity: Decimal, now: datetime) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO shadow_equity_snapshots(ts, sleeve, equity, cash)
+            VALUES(?, ?, ?, ?)
+            """,
+            (iso(now), sleeve, money_str(equity), self.shadow_sleeve_row(sleeve)["cash"]),
+        )
+        self.conn.commit()
+
+    def shadow_snapshots(self, sleeve: str) -> list[sqlite3.Row]:
+        return list(
+            self.conn.execute(
+                "SELECT * FROM shadow_equity_snapshots WHERE sleeve=? ORDER BY id",
+                (sleeve,),
+            ).fetchall()
+        )
+
+    def reconcile_shadow(self, sleeve: str) -> tuple[bool, str]:
+        cash = D(self.shadow_sleeve_row(sleeve)["starting_cash"])
+        positions: dict[str, Decimal] = {}
+        for row in self.shadow_fills_for(sleeve):
+            cash = q8(cash + D(row["cash_delta"]))
+            symbol = str(row["symbol"])
+            positions[symbol] = q8(positions.get(symbol, Decimal(0)) + D(row["qty_delta"]))
+        positions = {k: v for k, v in positions.items() if v != 0}
+        stored_cash = q8(self.shadow_cash(sleeve))
+        stored_positions = {k: q8(v) for k, v in self.shadow_positions(sleeve).items()}
+        if cash != stored_cash:
+            return False, f"shadow {sleeve} cash {stored_cash} != replay {cash}"
+        if positions != stored_positions:
+            return False, f"shadow {sleeve} positions {stored_positions} != replay {positions}"
         return True, "ok"
 
     def event_count(self) -> int:

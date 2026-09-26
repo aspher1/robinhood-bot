@@ -127,9 +127,16 @@ class RiskEngine:
         client_order_id: str,
         *,
         reduce_only: bool = False,
+        ignore_overlay: bool = False,
     ) -> RiskDecision:
         try:
-            return self._evaluate(intent, ctx, client_order_id, reduce_only=reduce_only)
+            return self._evaluate(
+                intent,
+                ctx,
+                client_order_id,
+                reduce_only=reduce_only,
+                ignore_overlay=ignore_overlay,
+            )
         except OrderRejected as exc:
             code = exc.reasons[0] if exc.reasons else "rejected"
             return deny(code, code, "deny", kill=exc.kill)
@@ -149,6 +156,7 @@ class RiskEngine:
         client_order_id: str,
         *,
         reduce_only: bool,
+        ignore_overlay: bool = False,
     ) -> RiskDecision:
         settings = self.settings
         if client_order_id in ctx.known_client_ids:
@@ -181,7 +189,8 @@ class RiskEngine:
         if spread is not None:
             return _decision(spread)
 
-        if kill_active(settings.state_dir) and not reduce_only:
+        # The no-overlay shadow book skips only these two drawdown controls.
+        if not ignore_overlay and kill_active(settings.state_dir) and not reduce_only:
             return deny("kill_switch", "kill_switch", "engaged")
 
         if reduce_only:
@@ -192,8 +201,9 @@ class RiskEngine:
 
         if intent.side == "buy":
             # Paper-only freeze. Sells above this check still go through.
+            # Weekly DCA buys are new entries and are blocked with every other buy.
             # The engine raises the freeze from combined peak equity.
-            if freeze_active(settings.state_dir):
+            if not ignore_overlay and freeze_active(settings.state_dir):
                 return deny(
                     "drawdown_freeze",
                     "drawdown_freeze_pct",

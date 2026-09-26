@@ -20,14 +20,14 @@ There is no live order path. `LiveBroker` raises `LiveTradingDisabled` on every 
 
 `state/KILL` stops new simulated risk. If the file is missing, unreadable, or not valid JSON, treat a present file as on. The engine never deletes it.
 
-`state/DRAWDOWN_FREEZE` blocks new paper buys. Sells still work. The engine never deletes that file either. A human clears it with `rhbot ack-drawdown`.
+`state/DRAWDOWN_FREEZE` blocks new paper buys, including weekly DCA. Sells still work. The engine never deletes that file. The AI operator clears it with `rhbot ack-drawdown --reason "..."`. That writes a `drawdown_ack` audit event with actor `operator` and the reason. It does not reset the drawdown peak. The freeze re-arms only after drawdown recovers above −10% and then falls below it again.
 
 Drawdown is measured on the combined portfolio peak. These limits are paper-only and must not be carried into any live phase:
 
-- 10% writes `state/DRAWDOWN_FREEZE` and does not sell.
-- 40% writes `state/KILL` with `ack_required` and sells the paper positions.
+- 10% writes `state/DRAWDOWN_FREEZE` and does not sell. The operator may acknowledge it.
+- 40% writes `state/KILL` with `ack_required` and sells the paper positions. This kill is human-only.
 
-Clearing that kill takes `rhbot resume --ack`. Automation may trip a kill and cannot clear it. A manual `rhbot kill` can be cleared with `rhbot resume` once health is otherwise fine. Resume still refuses while some other health check is critical. `ack-drawdown` does not clear a kill.
+Clearing that kill takes a human `rhbot resume --ack`. Automation may trip a kill and cannot clear it. The operator must not run `resume --ack` for a drawdown kill. A manual `rhbot kill` can be cleared with `rhbot resume` once health is otherwise fine. Resume still refuses while some other health check is critical. `ack-drawdown` does not clear a kill.
 
 ## Ownership
 

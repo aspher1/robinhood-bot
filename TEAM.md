@@ -32,7 +32,14 @@ Reviews limits. May tighten them in `config.yaml` (smaller position size, tighte
 
 May not loosen a limit, hold credentials, resume the bot while health is critical for a reason other than the kill switch, or "fix" a drawdown by raising the cap.
 
-Drawdown is measured on the combined portfolio peak. These limits are paper-only and must not be carried into a live phase. At 10% the engine writes `state/DRAWDOWN_FREEZE` and blocks new buys until a person runs `rhbot ack-drawdown`. Sells stay allowed and nothing is force-sold. At 40% it writes `state/KILL` and flattens the paper book. That is code, not a judgment call. Clearing that kill takes `rhbot resume --ack` from a person. Automation may trip the kill and cannot clear it. A 4% loss on the UTC day blocks new buys until the next UTC day.
+Drawdown is measured on the combined portfolio peak. These limits are paper-only and must not be carried into a live phase.
+
+Two different controls, two different actors:
+
+- **−10% freeze.** The engine writes `state/DRAWDOWN_FREEZE` and blocks new buys, including weekly DCA. Sells stay allowed and nothing is force-sold. The AI operator may acknowledge it with `rhbot ack-drawdown --reason "..."`. That acknowledgement is an audit event with actor `operator` and the reason. It does not reset the drawdown peak. Once acknowledged, the freeze re-arms only after drawdown recovers above −10% and then falls below it again.
+- **−40% hard kill.** The engine writes `state/KILL` and flattens the paper book. Automation may trip that kill and must never clear it. Clearing it is human-only: `rhbot resume --ack`. The operator does not run that command. `ack-drawdown` does not clear a kill, and `resume --ack` is not a freeze acknowledgement.
+
+A 4% loss on the UTC day blocks new buys until the next UTC day. The buy-and-hold benchmark in `rhbot report` is the no-overlay shadow book, so a kill does not rewrite the benchmark.
 
 ## Operations
 
@@ -43,8 +50,8 @@ Watches the process and is the only role that routinely restarts it.
 | Is it up, and did it do something recently? | `rhbot status`, `rhbot health` |
 | Stop new simulated orders | `rhbot kill --reason "..."` which creates `state/KILL` |
 | Allow orders again after health is clear | `rhbot resume` |
-| Acknowledge a 10% paper drawdown so new buys can resume | `rhbot ack-drawdown` |
-| Allow orders again after a 40% paper drawdown kill | `rhbot resume --ack` |
+| Acknowledge a 10% paper freeze (AI operator; does not reset the peak) | `rhbot ack-drawdown --reason "..."` |
+| Clear a 40% paper kill (human only; the operator must not run this) | `rhbot resume --ack` |
 | Preflight, including the kill path | `rhbot selftest` |
 | Sell the paper book | `rhbot flatten --paper` (kill first if it should stay sold) |
 | Process actually looping | `state/heartbeat.json` |
@@ -52,10 +59,10 @@ Watches the process and is the only role that routinely restarts it.
 
 Suggested rhythm: health every 15 minutes; if health is critical twice in a row, restart once; if it is still critical after that, kill and escalate to Coin Ceo Bot and Randy. Do not restart in a loop.
 
-May not edit strategy or risk code, read keys, or resume over a broken ledger.
+May not edit strategy or risk code, read keys, resume over a broken ledger, or clear a 40% drawdown kill. That kill is human-only. The operator may acknowledge a 10% freeze and may not treat that acknowledgement as permission to resume.
 
 ## Reporting
 
 Writes the P&L story. Uses `rhbot report --since 24h` (also `7d` and `30d`) and `rhbot audit verify`. Daily note to Randy is the 24h report in plain language. Weekly note adds the 7-day report, selftest (Operations runs it), and the audit check.
 
-May not change positions, edit code, or treat the paper ledger as a live brokerage statement. P&L is net of the configured per-side cost.
+May not change positions, edit code, or treat the paper ledger as a live brokerage statement. P&L is net of the configured per-side cost. The buy-and-hold figure in the report is the no-overlay shadow sleeve. The `no_overlay` block shows each sleeve without the 10% freeze and without the 40% kill, and `overlay_effect` is the live book minus that shadow.

@@ -73,7 +73,12 @@ def _parser() -> argparse.ArgumentParser:
     ack = sub.add_parser(
         "ack-drawdown",
         parents=[common],
-        help="Acknowledge a paper drawdown freeze so new buys can resume",
+        help="Operator acknowledgement of a paper drawdown freeze. Does not clear a kill.",
+    )
+    ack.add_argument(
+        "--reason",
+        required=True,
+        help="Why the operator is acknowledging this freeze. Recorded in the audit log.",
     )
     ack.set_defaults(func=cmd_ack_drawdown)
 
@@ -201,27 +206,43 @@ def cmd_resume(args: argparse.Namespace) -> int:
 
 
 def cmd_ack_drawdown(args: argparse.Namespace) -> int:
-    """Clear a paper buy-freeze. Does not touch the kill file."""
+    """Clear a paper buy-freeze. Does not touch the kill file or the drawdown peak.
+
+    The actor is the AI operator. A 40% kill still requires a human
+    ``rhbot resume --ack``. This command must not call ``rebase_peaks``.
+    """
+    reason = str(args.reason).strip()
+    if not reason:
+        _emit({"ok": False, "error": "ack-drawdown requires a reason"})
+        return 2
     settings = load_settings(args.config, args.state_dir)
     if not freeze_active(settings.state_dir):
         _emit({"ok": True, "drawdown_freeze": False, "detail": "already_clear"})
         return 0
     clear_freeze(settings.state_dir)
     peak = ""
+    actor = "operator"
     if (settings.state_dir / "bot.sqlite").exists():
         ledger = Ledger(settings)
         try:
             peak = ledger.get_meta("portfolio_peak") or ""
             if peak:
                 ledger.set_meta("drawdown_ack_peak", peak)
-            ledger.log_event("drawdown_ack", {"by": "operator", "peak": peak}, utcnow())
+            ledger.log_event(
+                "drawdown_ack",
+                {"actor": actor, "reason": reason, "peak": peak},
+                utcnow(),
+            )
         finally:
             ledger.close()
     _emit(
         {
             "ok": True,
             "drawdown_freeze": False,
+            "actor": actor,
+            "reason": reason,
             "ack_peak": peak,
+            "peak_unchanged": True,
             "kill_switch": kill_active(settings.state_dir),
         }
     )

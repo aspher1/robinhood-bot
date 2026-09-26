@@ -87,7 +87,29 @@ def test_ten_percent_combined_drawdown_freezes_buys_until_ack(tmp_path, now):
     assert bot.ledger.positions("buy_and_hold")["ETH-USD"] > 0
     assert (tmp_path / "DRAWDOWN_FREEZE").exists()
 
-    assert main(["ack-drawdown", "--state-dir", str(tmp_path)]) == 0
+    peak_before = bot.ledger.get_meta("portfolio_peak")
+    assert main(
+        ["ack-drawdown", "--reason", "reviewed the paper drawdown", "--state-dir", str(tmp_path)]
+    ) == 0
+    assert bot.ledger.get_meta("portfolio_peak") == peak_before
+    ack_rows = bot.ledger.conn.execute(
+        "SELECT payload FROM events WHERE kind='drawdown_ack'"
+    ).fetchall()
+    assert len(ack_rows) == 1
+    ack = __import__("json").loads(ack_rows[0]["payload"])
+    assert ack["actor"] == "operator"
+    assert ack["reason"] == "reviewed the paper drawdown"
+    assert ack["peak"] == peak_before
+    from rhbot.status import assess, build_report
+
+    status = assess(bot.settings)
+    assert status["drawdown_acks"][-1]["actor"] == "operator"
+    assert status["drawdown_acks"][-1]["reason"] == "reviewed the paper drawdown"
+    assert status["drawdown_acks"][-1]["peak"] == peak_before
+    report = build_report(bot.settings, "30d")
+    assert report["drawdown_acks"][-1]["actor"] == "operator"
+    assert report["drawdown_acks"][-1]["reason"] == "reviewed the paper drawdown"
+    assert report["no_overlay"]["benchmark_scored_without_overlay"] is True
     assert not (tmp_path / "DRAWDOWN_FREEZE").exists()
     assert not (tmp_path / "KILL").exists()
     still = sell_at + timedelta(hours=1)
@@ -144,6 +166,10 @@ def test_forty_percent_combined_drawdown_kills_and_requires_ack(tmp_path):
     assert "drawdown" in kill["reason"]
     assert bot.ledger.positions("buy_and_hold") == {}
     assert bot.ledger.positions("trend_daily") == {}
+    assert bot.ledger.shadow_positions("buy_and_hold")
+    real_bh = bot.mark("buy_and_hold", crashed)
+    shadow_bh = bot.shadow_mark("buy_and_hold", crashed)
+    assert shadow_bh > real_bh
     trips = bot.ledger.conn.execute(
         "SELECT payload FROM events WHERE kind='kill_trip'"
     ).fetchall()
@@ -166,7 +192,9 @@ def test_forty_percent_combined_drawdown_kills_and_requires_ack(tmp_path):
 
     assert main(["resume", "--state-dir", str(tmp_path)]) == 2
     assert (tmp_path / "KILL").exists()
-    assert main(["ack-drawdown", "--state-dir", str(tmp_path)]) == 0
+    assert main(
+        ["ack-drawdown", "--reason", "freeze is not the kill", "--state-dir", str(tmp_path)]
+    ) == 0
     assert (tmp_path / "KILL").exists()
     assert main(["resume", "--ack", "--state-dir", str(tmp_path)]) == 0
     assert not (tmp_path / "KILL").exists()
@@ -175,6 +203,57 @@ def test_forty_percent_combined_drawdown_kills_and_requires_ack(tmp_path):
     bot.run_once(now=wall, snapshot=crashed)
     assert read_kill(tmp_path) is None
     bot.ledger.close()
+
+
+def test_freeze_blocks_weekly_dca_and_shadow_book_still_buys(tmp_path, now):
+    """DCA is a new entry. The no-overlay book still takes it, and buy-and-hold is the benchmark."""
+    from rhbot.status import assess, build_report
+
+    bot = engine(tmp_path, sma_window=20)
+    bot.run_once(now=now, snapshot=snapshot(now))
+    held = dict(bot.ledger.positions("buy_and_hold"))
+    assert bot.ledger.shadow_positions("buy_and_hold") == held
+    nxt = now + timedelta(days=1)
+    view = snapshot(nxt, mid="60")
+    bot.run_once(now=nxt, snapshot=view)
+    assert read_kill(tmp_path) is None
+    assert (tmp_path / "DRAWDOWN_FREEZE").exists()
+    assert bot.ledger.positions("dca_weekly") == {}
+    assert bot.ledger.shadow_positions("dca_weekly")
+    denials = bot.ledger.conn.execute(
+        "SELECT payload FROM events WHERE kind='risk_denial'"
+    ).fetchall()
+    parsed = [__import__("json").loads(row["payload"]) for row in denials]
+    assert any(
+        item["sleeve"] == "dca_weekly" and item["reason"] == "drawdown_freeze" and item["side"] == "buy"
+        for item in parsed
+    )
+    assert bot.ledger.positions("buy_and_hold") == bot.ledger.shadow_positions("buy_and_hold")
+    report = build_report(bot.settings, "400d", now=nxt + timedelta(days=1))
+    assert report["no_overlay"]["benchmark_scored_without_overlay"] is True
+    assert report["no_overlay"]["benchmark"] == "buy_and_hold"
+    shadow_dca = report["no_overlay"]["sleeves"]["dca_weekly"]
+    assert shadow_dca["positions"]
+    assert Decimal(shadow_dca["overlay_effect"]["equity_delta"]) > 0
+    assert report["sleeves"]["dca_weekly"]["excess_return_vs_buy_and_hold_pct"] is not None
+    from rhbot.money import q8
+
+    trend_excess = Decimal(report["sleeves"]["trend_daily"]["excess_return_vs_buy_and_hold_pct"])
+    trend_vs_shadow = Decimal(report["sleeves"]["trend_daily"]["window"]["return_pct"]) - Decimal(
+        report["no_overlay"]["benchmark_return_pct"]
+    )
+    assert trend_excess == q8(trend_vs_shadow)
+    status = assess(bot.settings, now=nxt)
+    assert status["drawdown_acks"] == []
+    bot.ledger.close()
+
+
+def test_ack_drawdown_requires_a_reason(tmp_path):
+    from rhbot.cli import main
+
+    with __import__("pytest").raises(SystemExit) as caught:
+        main(["ack-drawdown", "--state-dir", str(tmp_path)])
+    assert caught.value.code == 2
 
 
 def test_flatten_works_while_killed_and_blocks_new_buys(tmp_path, now):
