@@ -739,13 +739,10 @@ class Ledger:
                 "SELECT COUNT(*) AS n FROM events WHERE kind=?", (kind,)
             ).fetchone()
             return int(row["n"])
-        rows = self.conn.execute(
-            "SELECT payload FROM events WHERE kind=?", (kind,)
-        ).fetchall()
         import json
 
         n = 0
-        for row in rows:
+        for row in self.conn.execute("SELECT payload FROM events WHERE kind=?", (kind,)):
             payload = json.loads(row["payload"])
             if payload.get("sleeve") == sleeve:
                 n += 1
@@ -1036,8 +1033,9 @@ class Ledger:
     def verify_chain(self) -> tuple[bool, str]:
         rows = self.conn.execute(
             "SELECT seq, payload, prev_hash, hash FROM events ORDER BY seq"
-        ).fetchall()
+        )
         prev = GENESIS
+        count = 0
         for row in rows:
             if str(row["prev_hash"]) != prev:
                 return False, f"chain break at seq {row['seq']}"
@@ -1045,7 +1043,8 @@ class Ledger:
             if digest != str(row["hash"]):
                 return False, f"hash mismatch at seq {row['seq']}"
             prev = str(row["hash"])
-        return True, f"{len(rows)} events"
+            count += 1
+        return True, f"{count} events"
 
     def integrity_ok(self) -> bool:
         row = self.conn.execute("PRAGMA integrity_check").fetchone()
