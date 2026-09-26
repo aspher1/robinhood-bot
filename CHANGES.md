@@ -42,7 +42,9 @@ F-022: a risk-reduction sell's client order id includes its reason (`drawdown_fl
 
 Already closed on this branch after `50fead7` (the audited head): F-022 (risk-reduction sells use their own client id and a leftover position fails closed), F-003 (2 trades/day per book), F-002 item 5 (`dca_weekly` buys one coin at $19.23, BTC then ETH), F-021 (shadow trade cap is per book).
 
-F-023: a −40% trip sets that book to KILLED and flattens it. It does not write `state/KILL`, so the other overlay book is not blocked by the file. Buy-and-hold is untouched. If the first flatten leaves quantity, the next cycle retries `drawdown_flatten` for that book only. Until the book is flat, health is critical `kill_flatten_incomplete` and `rhbot resume --ack --human-code` stays blocked. Peaks are not reset. After the book is flat, resume is still human-only: `rhbot resume --ack --human-code` matching `RHBOT_HUMAN_RESUME_FILE`. F-022 was already closed: the flatten client id includes `drawdown_flatten`.
+F-024: a −40% trip sets that book to KILLED and flattens it. It does not write `state/KILL`, so the other overlay book is not blocked by the file. Buy-and-hold is untouched. `rhbot resume --ack --human-code` matching `RHBOT_HUMAN_RESUME_FILE` is still required before that book can leave the kill. Peaks are not reset.
+
+F-023: if the first flatten leaves quantity, the next cycle retries `drawdown_flatten` for that book only. Until the book is flat, health is critical `kill_flatten_incomplete` and resume stays blocked. After the book is flat, resume is still human-only. F-022 was already closed: the flatten client id includes `drawdown_flatten`.
 
 Not done, optional: F-015 through F-019.
 

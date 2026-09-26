@@ -266,7 +266,7 @@ def test_f001_kill_flattens_one_book_and_resume_needs_human_code(tmp_path, monke
     bot.ledger.close()
 
 
-def test_f023_one_book_kill_does_not_block_the_other(tmp_path, monkeypatch):
+def test_f024_one_book_kill_does_not_block_the_other(tmp_path, monkeypatch):
     wall = datetime.now(UTC).replace(microsecond=0)
     opened = wall - timedelta(days=2)
     buy_at = wall - timedelta(days=1)
