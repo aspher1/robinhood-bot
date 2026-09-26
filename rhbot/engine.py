@@ -16,7 +16,14 @@ from rhbot.errors import DataError, OrderRejected
 from rhbot.ledger import Ledger, parse_ts
 from rhbot.models import RISK_REDUCTION_REASONS, Fill, MarketSnapshot, OrderIntent, Quote
 from rhbot.money import D, money_str, q8
-from rhbot.overlay import OVERLAY_BOOKS, SHADOW_NAMES, mark_to_bid_equity, signed_drawdown
+from rhbot.overlay import (
+    OVERLAY_BOOKS,
+    SHADOW_NAMES,
+    active_drawdown,
+    mark_to_bid_equity,
+    signed_drawdown,
+    trigger_reference,
+)
 from rhbot.pricing import plan_fill
 from rhbot.ops import (
     engage_freeze,
@@ -31,6 +38,7 @@ from rhbot.ops import (
 )
 from rhbot.risk import RiskContext, RiskEngine, kill_reason, peak_drawdown
 from rhbot.strategies import build_strategies
+from rhbot.strategies.trend import sleeve_cash_map
 
 
 # A later cycle the same UTC day may still pass these. Other denials stick.
@@ -278,6 +286,7 @@ class Engine:
         buy_pause = self._any_frozen()
         kill = read_kill(self.settings.state_dir)
         worst_dd = Decimal(0)
+        worst_trigger = None
         peak_equity = None
         book_resume = False
         for name in OVERLAY_BOOKS:
@@ -285,11 +294,15 @@ class Engine:
             if row is None:
                 continue
             dd = D(row["dd"])
+            trigger = active_drawdown(row)
             if peak_equity is None or dd < worst_dd:
                 worst_dd = dd
                 peak_equity = str(row["peak"])
+            if worst_trigger is None or trigger < worst_trigger:
+                worst_trigger = trigger
             if str(row["state"]) == "KILLED" and not str(row["kill_acked_peak"] or ""):
                 book_resume = True
+        rearm = worst_trigger is None or worst_trigger > -self.settings.freeze_drawdown_pct
         return {
             "kill_switch": kill is not None,
             "buy_pause": buy_pause,
@@ -297,7 +310,7 @@ class Engine:
             "peak_equity": peak_equity,
             "drawdown_pct": format(q8(worst_dd), "f"),
             "ack_required": (kill is not None and resume_needs_ack(kill)) or book_resume or buy_pause,
-            "rearm_eligible": (not buy_pause) and worst_dd > -self.settings.freeze_drawdown_pct,
+            "rearm_eligible": (not buy_pause) and rearm,
             "overlay": self._overlay_public(),
             "last_decision_at": self.ledger.get_meta("last_decision_at"),
             "last_quote_ok_at": self.ledger.get_meta("last_quote_ok_at"),
@@ -535,6 +548,7 @@ class Engine:
                 "dd": str(row["dd"]),
                 "peak": str(row["peak"]),
                 "equity": str(row["equity"]),
+                "restart_baseline": str(row["restart_baseline"] or ""),
             }
         return out
 
@@ -645,8 +659,10 @@ class Engine:
     def _enforce_overlays(self, market_now: datetime, snapshot: MarketSnapshot) -> None:
         """Option B on trend_daily and dca_weekly only. Never touches buy_and_hold.
 
-        DD = mark-to-bid equity / running peak − 1. An ack does not move the peak.
-        The engine never clears state/KILL.
+        Reported drawdown uses the all-time peak, which only rises. The 10%
+        pause and the 40% shutoff use that peak until a human restart records
+        a baseline. An ack does not move the peak or the baseline. The engine
+        never clears state/KILL and never restarts a killed book on its own.
         """
         for name in OVERLAY_BOOKS:
             strategy = next(item for item in self.strategies if item.name == name)
@@ -658,30 +674,45 @@ class Engine:
             peak = D(row["peak"])
             if peak <= 0 or equity > peak:
                 peak = equity
-            dd = signed_drawdown(equity, peak)
+            report_dd = signed_drawdown(equity, peak)
+            baseline = D(row["restart_baseline"] or "0")
+            high = D(row["restart_high"] or "0")
+            reference, high = trigger_reference(peak, equity, baseline, high)
+            trigger_dd = signed_drawdown(equity, reference)
             state = str(row["state"])
             fields = {
                 "peak": money_str(peak),
                 "equity": money_str(equity),
-                "dd": format(q8(dd), "f"),
+                "dd": format(q8(report_dd), "f"),
             }
+            if baseline > 0:
+                fields["restart_high"] = money_str(high)
             acked = str(row["kill_acked_peak"] or "")
-            if dd <= -self.settings.kill_drawdown_pct and acked != money_str(peak):
-                if state != "KILLED":
-                    self._kill_book(name, market_now, snapshot, equity, peak, dd)
-                else:
-                    self.ledger.save_overlay(name, fields)
-                    self._retry_kill_flatten(name, market_now, snapshot)
+            if trigger_dd <= -self.settings.kill_drawdown_pct and (state != "KILLED" or acked):
+                self._kill_book(
+                    name,
+                    market_now,
+                    snapshot,
+                    equity,
+                    peak,
+                    report_dd,
+                    reference,
+                    trigger_dd,
+                )
+                continue
+            if trigger_dd <= -self.settings.kill_drawdown_pct and state == "KILLED":
+                self.ledger.save_overlay(name, fields)
+                self._retry_kill_flatten(name, market_now, snapshot)
                 continue
             if state == "KILLED":
-                # Human resume records the peak. Until then the book stays
+                # Human resume records the baseline. Until then the book stays
                 # killed even if the mark recovers. One book's kill does not
                 # write the process-wide kill file. A leftover position is
                 # flattened again on the next cycle and blocks resume.
                 recovered = (
                     bool(acked)
                     and not kill_active(self.settings.state_dir)
-                    and dd > -self.settings.kill_drawdown_pct
+                    and trigger_dd > -self.settings.kill_drawdown_pct
                     and not self._open_position(name)
                 )
                 if not recovered:
@@ -698,17 +729,20 @@ class Engine:
                         "sleeve": name,
                         "equity": money_str(equity),
                         "peak": money_str(peak),
-                        "dd": format(q8(dd), "f"),
+                        "dd": format(q8(report_dd), "f"),
+                        "trigger_dd": format(q8(trigger_dd), "f"),
+                        "restart_baseline": money_str(baseline) if baseline > 0 else "",
                     },
                     market_now,
                 )
-            if state == "ARMED" and dd <= -self.settings.freeze_drawdown_pct:
+            if state == "ARMED" and trigger_dd <= -self.settings.freeze_drawdown_pct:
+                observed = format(q8(trigger_dd), "f")
                 fields.update(
                     {
                         "state": "FROZEN",
-                        "trip_dd": format(q8(dd), "f"),
+                        "trip_dd": observed,
                         "trip_equity": money_str(equity),
-                        "trip_peak": money_str(peak),
+                        "trip_peak": money_str(reference),
                         "trip_ts": iso(market_now),
                     }
                 )
@@ -722,17 +756,18 @@ class Engine:
                     reason="freeze",
                     limit_name="freeze_drawdown_pct",
                     limit_value=format(self.settings.freeze_drawdown_pct, "f"),
-                    observed=format(q8(dd), "f"),
+                    observed=observed,
                     client_order_id="",
                     detail="freeze",
                     extra={
                         "equity": money_str(equity),
-                        "peak": money_str(peak),
-                        "dd": format(q8(dd), "f"),
+                        "peak": money_str(reference),
+                        "ath_peak": money_str(peak),
+                        "dd": observed,
                     },
                 )
                 continue
-            if state == "ACKED" and dd > -self.settings.freeze_drawdown_pct:
+            if state == "ACKED" and trigger_dd > -self.settings.freeze_drawdown_pct:
                 fields["state"] = "ARMED"
                 self.ledger.save_overlay(name, fields)
                 self.ledger.log_event(
@@ -741,7 +776,8 @@ class Engine:
                         "sleeve": name,
                         "equity": money_str(equity),
                         "peak": money_str(peak),
-                        "dd": format(q8(dd), "f"),
+                        "dd": format(q8(report_dd), "f"),
+                        "trigger_dd": format(q8(trigger_dd), "f"),
                     },
                     market_now,
                 )
@@ -755,20 +791,23 @@ class Engine:
         snapshot: MarketSnapshot,
         equity: Decimal,
         peak: Decimal,
-        dd: Decimal,
+        report_dd: Decimal,
+        trigger_peak: Decimal,
+        trigger_dd: Decimal,
     ) -> None:
-        observed = format(q8(dd), "f")
+        observed = format(q8(trigger_dd), "f")
         self.ledger.save_overlay(
             name,
             {
                 "state": "KILLED",
                 "peak": money_str(peak),
                 "equity": money_str(equity),
-                "dd": observed,
+                "dd": format(q8(report_dd), "f"),
                 "trip_dd": observed,
                 "trip_equity": money_str(equity),
-                "trip_peak": money_str(peak),
+                "trip_peak": money_str(trigger_peak),
                 "trip_ts": iso(market_now),
+                "kill_acked_peak": "",
             },
         )
         reason = f"max_drawdown {observed} <= -{self.settings.kill_drawdown_pct}"
@@ -785,9 +824,35 @@ class Engine:
             client_order_id="",
             detail=reason,
             ack_required=True,
-            extra={"equity": money_str(equity), "peak": money_str(peak), "dd": observed},
+            extra={
+                "equity": money_str(equity),
+                "peak": money_str(trigger_peak),
+                "ath_peak": money_str(peak),
+                "dd": observed,
+            },
         )
         self._flatten_book(name, market_now, snapshot)
+
+    def _credit_flattened_sleeve(self, name: str, fill: Fill) -> None:
+        """Put a forced sale's cash back on that coin so a later restart can buy.
+
+        Trend tracks each coin's cash itself. A drawdown flatten sells through
+        the broker, not through the strategy commit, so without this the sleeve
+        would still show the spent cash and could not re-enter.
+        """
+        if name != "trend_daily" or fill.cash_delta == 0:
+            return
+        strategy = next(item for item in self.strategies if item.name == name)
+        state = self.ledger.strategy_state(name) or strategy.initial_state()
+        cash_map = sleeve_cash_map(state)
+        if fill.symbol not in cash_map:
+            return
+        cash_map[fill.symbol] = q8(cash_map[fill.symbol] + fill.cash_delta)
+        updated = dict(state)
+        updated["sleeve_cash"] = {
+            symbol: format(q8(amount), "f") for symbol, amount in cash_map.items()
+        }
+        self.ledger.save_strategy_state(name, updated)
 
     def _open_position(self, name: str) -> bool:
         return any(qty > 0 for qty in self.ledger.positions(name).values())
@@ -829,6 +894,8 @@ class Engine:
                 continue
             if fill.reason != intent.reason:
                 errors.append(f"{symbol}: reused {fill.reason} fill {fill.client_order_id}")
+                continue
+            self._credit_flattened_sleeve(name, fill)
         equity = self.mark(name, priced)
         self.ledger.mark_equity(name, equity, market_now)
         remaining = {

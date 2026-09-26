@@ -234,18 +234,45 @@ def cmd_resume(args: argparse.Namespace) -> int:
             }
         )
         return 2
+    baselines: dict[str, str] = {}
     if needs_ack and (settings.state_dir / "bot.sqlite").exists():
-        # Remember each killed book's peak without moving it. The same
-        # flattened mark does not kill again. A later drop through −40% of
-        # that original peak can.
+        # The all-time peak stays where it is. The restart baseline is this
+        # book's mark-to-bid equity now, and later 10% and 40% lines use
+        # max(baseline, the highest equity since this restart).
         ledger = Ledger(settings)
         try:
+            from rhbot.money import money_str
             from rhbot.overlay import OVERLAY_BOOKS
 
+            restarted_at = utcnow()
+            anchor = _last_cycle_ts(ledger) or iso(restarted_at)
             for name in OVERLAY_BOOKS:
                 row = ledger.overlay_row(name)
-                if row is not None and str(row["state"]) == "KILLED":
-                    ledger.save_overlay(name, {"kill_acked_peak": str(row["peak"])})
+                if row is None or str(row["state"]) != "KILLED":
+                    continue
+                equity = _book_equity_at_bid(ledger, name)
+                peak = str(row["peak"])
+                recorded = money_str(equity)
+                ledger.save_overlay(
+                    name,
+                    {
+                        "kill_acked_peak": peak,
+                        "restart_baseline": recorded,
+                        "restart_high": recorded,
+                    },
+                )
+                ledger.log_event(
+                    "restart_baseline",
+                    {
+                        "sleeve": name,
+                        "restart_baseline": recorded,
+                        "peak": peak,
+                        "ts": iso(restarted_at),
+                        "anchor_ts": anchor,
+                    },
+                    restarted_at,
+                )
+                baselines[name] = recorded
         finally:
             ledger.close()
     if global_on:
@@ -256,8 +283,78 @@ def cmd_resume(args: argparse.Namespace) -> int:
         "resume",
         {"by": actor, "ack": bool(args.ack), "peak_unchanged": True},
     )
-    _emit({"ok": True, "kill_switch": False, "ack": bool(args.ack)})
+    _emit(
+        {
+            "ok": True,
+            "kill_switch": False,
+            "ack": bool(args.ack),
+            "restart_baselines": baselines,
+        }
+    )
     return 0
+
+
+def _last_cycle_ts(ledger: Ledger) -> str:
+    row = ledger.conn.execute(
+        "SELECT ts FROM events WHERE kind='cycle' ORDER BY seq DESC LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return ""
+    return str(row["ts"])
+
+
+def _book_equity_at_bid(ledger: Ledger, sleeve: str):
+    """Mark-to-bid equity at the human restart. A flat book is its cash."""
+    from rhbot.money import D, q8
+    from rhbot.overlay import mark_to_bid_equity
+
+    cash = ledger.cash(sleeve)
+    positions = ledger.positions(sleeve)
+    if not positions:
+        return q8(cash)
+    quotes = _last_valid_quotes(ledger)
+    try:
+        return mark_to_bid_equity(cash, positions, quotes, ledger.settings.cost_per_side)
+    except RuntimeError:
+        row = ledger.overlay_row(sleeve)
+        if row is not None and row["equity"]:
+            return D(row["equity"])
+        return q8(cash)
+
+
+def _last_valid_quotes(ledger: Ledger) -> dict:
+    import json
+
+    from rhbot.ledger import parse_ts
+    from rhbot.models import Quote
+    from rhbot.money import D
+
+    raw = ledger.get_meta("last_valid_quotes")
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    quotes = {}
+    for symbol, item in payload.items():
+        if not isinstance(item, dict) or item.get("source") in ("kraken", "robinhood"):
+            continue
+        try:
+            quotes[str(symbol)] = Quote(
+                symbol=str(symbol),
+                ts=parse_ts(str(item["ts"])),
+                mid=D(item["mid"]),
+                bid=D(item["bid"]) if item.get("bid") else None,
+                ask=D(item["ask"]) if item.get("ask") else None,
+                source=str(item.get("source") or "coinbase"),
+                spread_included=bool(item.get("spread_included")),
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    return quotes
 
 
 def _human_code_ok(code: str | None) -> bool:

@@ -28,7 +28,7 @@ Randy decided the two items that were on hold. F-003 is per book, and the cap st
 
 Already in place from round 1, and still true: resume does not rebase `portfolio_peak` or any sleeve `peak_equity` (peaks only rise on a new high); freeze and kill are per book on mark-to-bid and skip buy-and-hold; SMA 200 and a 2% band with no flat-time block; DCA on days 1, 8, 15, 22 at $19.23; the trade cap is 2 per book; quote health uses the cycle's quote age; client order ids have no random suffix.
 
-Added: an open order older than one loop is critical `open_order_stale`, and reconcile names its `client_order_id` (F-020). After a human resume, the same flattened mark does not kill again. Once that book is back above −40% of the original peak, a later cross of that same peak kills again. It does not need another 40% off the flattened equity.
+Added: an open order older than one loop is critical `open_order_stale`, and reconcile names its `client_order_id` (F-020). After a human resume, the same flattened mark does not kill again. Later 10% and 40% lines use the restart baseline from I-R006, not another measurement against the original peak.
 
 ### Audit round 3
 
@@ -69,7 +69,7 @@ Randy approved marking every sleeve at the same mark-to-bid the 10% freeze and 4
 
 ### Risk review after replay and calendar hold
 
-These only tighten. Resume-after-kill peak behavior is unchanged.
+These only tighten. Resume-after-kill peak behavior is decided in I-R006 below: the all-time peak stays, and a human restart adds a separate baseline.
 
 - Every `state/KILL` clear requires `rhbot resume --ack --human-code`. The resume event says `human` only when that code matches `RHBOT_HUMAN_RESUME_FILE`.
 - A quote with no bid or ask is `missing_bid_ask`. A quote 30 seconds old or older is `stale_quote`.
@@ -87,6 +87,10 @@ A trend entry is no longer a fixed $500. Each coin's cash is tracked on its own,
 ### Quote source (Risk P1-3)
 
 Randy approved Coinbase public bid/ask as the v1 paper source for marks, fills, and the spread cap. `market_data` is `public` and `public_provider` is `coinbase`. The Robinhood-key-missing path that switched to public prices and reported degraded is gone. Kraken stays diagnostic and is not used for those prices. If the Coinbase quote is missing, 30 seconds old or older, or has no bid/ask, new orders are denied and health is critical (`quote_hard_stop`). Nothing else is substituted. A reduce_only kill or flatten sell may still use the last valid bid/ask.
+
+### I-R006 restart baseline
+
+Randy's decision on the sticky peak after a −40% kill. The all-time peak is not rebased and is not overwritten. `rhbot status` and `rhbot report` still show drawdown from that peak. A human `rhbot resume --ack --human-code` after the shutoff records that book's mark-to-bid equity as `restart_baseline` and appends a `restart_baseline` audit event with the timestamp and the old peak. Nothing restarts itself. After that restart, the 10% pause and the 40% shutoff use max(`restart_baseline`, the highest equity since the restart). A new all-time high above the old peak makes that reference the peak again. The 10% and 40% caps are unchanged. Acknowledging a pause does not move the peak or the baseline. Weekly DCA still waits out a pause, and the pause re-arms only after equity is back above the 10% line of the active baseline. The baseline is stored on the book and replay applies the same audit event, so replay and live agree. Without the human restart the book stays off. A drawdown flatten credits that coin's trend cash, because the sale does not go through the strategy's own commit; after the restart the book can size a new entry with the cash it actually holds.
 
 ### Left open
 

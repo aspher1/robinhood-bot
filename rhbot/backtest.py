@@ -41,11 +41,15 @@ def replay(
     bars_by_symbol: dict[str, list[Bar]],
     *,
     paper_day1: str | None = None,
+    restarts: list[dict] | None = None,
 ) -> Engine:
     """Run one cycle per day in a fresh temporary state dir.
 
     Candles before paper day 1 are indicator warmup only. The caller's dir
     is not written. ``paper_day1`` is the live meta value so DCA indexes match.
+    ``restarts`` are the live ``restart_baseline`` audit events. Each one is
+    applied on the first cycle after the cycle that was current when the
+    human restarted, so the 10% and 40% lines match the live book.
     """
     assert_replay_safe(settings)
     scratch = Path(tempfile.mkdtemp(prefix="rhbot-replay-"))
@@ -60,7 +64,9 @@ def replay(
     else:
         stamps = sorted({bar.ts for bars in bars_by_symbol.values() for bar in bars})
         times = [ensure_utc(ts) + timedelta(days=1) for ts in stamps]
+    pending = [dict(item) for item in (restarts or [])]
     for market_now in times:
+        _apply_restarts(engine, pending, market_now)
         quotes: dict[str, Quote] = {}
         window: dict[str, list[Bar]] = {}
         cutoff = market_now - timedelta(days=1)
@@ -114,6 +120,7 @@ def diff_live(settings: Settings, since: str) -> dict:
     try:
         bars = {symbol: live.load_candles_any(symbol) for symbol in settings.symbols}
         paper_day1 = live.get_meta("paper_day1")
+        restarts = _restart_events(live)
         live_decisions = _keyed(live, "decision")
         live_fills = _fill_keys(live)
         event_count = live.event_count()
@@ -123,7 +130,7 @@ def diff_live(settings: Settings, since: str) -> dict:
         return {"ok": False, "mismatches": ["no stored candles"], "mode": "replay"}
     # replay() refuses a directory that already has a ledger. Give it an empty one.
     isolated = settings.model_copy(update={"state_dir": Path(tempfile.mkdtemp(prefix="rhbot-diff-"))})
-    engine = replay(isolated, bars, paper_day1=paper_day1)
+    engine = replay(isolated, bars, paper_day1=paper_day1, restarts=restarts)
     try:
         replay_decisions = _keyed(engine.ledger, "decision")
         replay_fills = _fill_keys(engine.ledger)
@@ -152,6 +159,54 @@ def diff_live(settings: Settings, since: str) -> dict:
         "mode": mode,
         "live_events_before": event_count,
     }
+
+
+def _restart_events(ledger: Ledger) -> list[dict]:
+    """Human restart baselines, in the order they were appended."""
+    import json
+
+    rows = ledger.conn.execute(
+        "SELECT payload FROM events WHERE kind='restart_baseline' ORDER BY seq"
+    ).fetchall()
+    found = []
+    for row in rows:
+        payload = json.loads(row["payload"])
+        anchor = str(payload.get("anchor_ts") or payload.get("ts") or "")
+        if not anchor or not payload.get("sleeve"):
+            continue
+        found.append(
+            {
+                "sleeve": str(payload["sleeve"]),
+                "baseline": str(payload["restart_baseline"]),
+                "peak": str(payload["peak"]),
+                "anchor_ts": anchor,
+            }
+        )
+    return found
+
+
+def _apply_restarts(engine: Engine, restarts: list[dict], market_now) -> None:
+    """Record a human restart before the cycle that follows it."""
+    now = ensure_utc(market_now)
+    for item in restarts:
+        if item.get("_applied"):
+            continue
+        anchor = ensure_utc(parse_ts(str(item["anchor_ts"])))
+        if now <= anchor:
+            continue
+        sleeve = str(item["sleeve"])
+        row = engine.ledger.overlay_row(sleeve)
+        if row is None:
+            continue
+        engine.ledger.save_overlay(
+            sleeve,
+            {
+                "restart_baseline": str(item["baseline"]),
+                "restart_high": str(item["baseline"]),
+                "kill_acked_peak": str(item["peak"]),
+            },
+        )
+        item["_applied"] = True
 
 
 def _since_day(window: timedelta, *books: dict[str, str]) -> str | None:

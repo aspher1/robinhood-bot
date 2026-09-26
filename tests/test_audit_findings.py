@@ -244,19 +244,26 @@ def test_f001_kill_flattens_one_book_and_resume_needs_human_code(tmp_path, monke
     bot.run_once(now=wall, snapshot=snapshot(wall, mid="10"))
     assert read_kill(tmp_path) is None
     assert bot.ledger.overlay_row("trend_daily")["peak"] == peak
+    assert bot.ledger.overlay_row("trend_daily")["state"] == "ARMED"
     assert bot.ledger.get_meta("portfolio_peak") == portfolio_peak
     for name, stored in sleeve_peaks.items():
         assert bot.ledger.sleeve_row(name)["peak_equity"] == stored
-    # 70% of the original peak is above the kill line and above a second
-    # 40% drop from the flattened book. 59% is still a kill versus that peak.
-    recovered = wall + timedelta(days=1)
-    _set_cash(bot, "trend_daily", money_str(D(peak) * Decimal("0.70")))
-    bot.run_once(now=recovered, snapshot=snapshot(recovered, mid="10"))
+    # The same flattened mark rearms against the restart baseline. A further
+    # 11% off that baseline pauses, and a further 41% kills again. The stored
+    # drawdown is still the drop from the original peak, which stays put.
+    baseline = D(bot.ledger.overlay_row("trend_daily")["restart_baseline"])
+    assert baseline > 0
+    assert baseline < D(peak)
+    assert D(bot.ledger.overlay_row("trend_daily")["dd"]) <= Decimal("-0.40")
+    paused = wall + timedelta(days=1)
+    _set_cash(bot, "trend_daily", money_str(baseline * Decimal("0.89")))
+    bot.run_once(now=paused, snapshot=snapshot(paused, mid="10"))
     assert read_kill(tmp_path) is None
     assert bot.ledger.overlay_row("trend_daily")["state"] == "FROZEN"
     assert bot.ledger.overlay_row("trend_daily")["peak"] == peak
-    again = recovered + timedelta(days=1)
-    _set_cash(bot, "trend_daily", money_str(D(peak) * Decimal("0.59")))
+    assert D(bot.ledger.overlay_row("trend_daily")["dd"]) <= Decimal("-0.40")
+    again = paused + timedelta(days=1)
+    _set_cash(bot, "trend_daily", money_str(baseline * Decimal("0.59")))
     bot.run_once(now=again, snapshot=snapshot(again, mid="10"))
     assert read_kill(tmp_path) is None
     assert bot.ledger.overlay_row("trend_daily")["state"] == "KILLED"

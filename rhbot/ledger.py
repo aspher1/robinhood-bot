@@ -107,7 +107,9 @@ CREATE TABLE IF NOT EXISTS overlay_books (
     ack_ts TEXT,
     ack_by TEXT,
     ack_note TEXT,
-    kill_acked_peak TEXT
+    kill_acked_peak TEXT,
+    restart_baseline TEXT,
+    restart_high TEXT
 );
 CREATE TRIGGER IF NOT EXISTS events_no_update
 BEFORE UPDATE ON events
@@ -240,7 +242,12 @@ class Ledger:
         columns = {str(row[1]) for row in self.conn.execute("PRAGMA table_info(candles)")}
         if "fetched_at" not in columns:
             self.conn.execute("ALTER TABLE candles ADD COLUMN fetched_at TEXT")
-        self.set_meta("schema_version", "3")
+        overlay_cols = {str(row[1]) for row in self.conn.execute("PRAGMA table_info(overlay_books)")}
+        if "restart_baseline" not in overlay_cols:
+            self.conn.execute("ALTER TABLE overlay_books ADD COLUMN restart_baseline TEXT")
+        if "restart_high" not in overlay_cols:
+            self.conn.execute("ALTER TABLE overlay_books ADD COLUMN restart_high TEXT")
+        self.set_meta("schema_version", "4")
         self.set_meta("starting_cash", money_str(settings.starting_cash))
 
     def close(self) -> None:

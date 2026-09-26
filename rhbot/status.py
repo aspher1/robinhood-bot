@@ -12,6 +12,7 @@ from rhbot.config import Settings
 from rhbot.ledger import Ledger, parse_ts
 from rhbot.money import D, money_str, q8
 from rhbot.ops import iso, read_freeze, read_heartbeat, read_kill, resume_needs_ack, utcnow
+from rhbot.overlay import active_drawdown
 from rhbot.risk import daily_buy_block, kill_reason, peak_drawdown
 
 SLEEVES = ("buy_and_hold", "dca_weekly", "trend_daily")
@@ -346,9 +347,18 @@ def _overlay_view(ledger: Ledger, now: datetime) -> dict:
             "shadow_equity": shadow_equity,
             "overlay_impact": impact,
             "resume_pending": str(row["state"]) == "KILLED" and not str(row["kill_acked_peak"] or ""),
+            "restart_baseline": _row_text(row, "restart_baseline"),
+            "trigger_dd": format(q8(active_drawdown(row)), "f"),
         }
     del now
     return out
+
+
+def _row_text(row, key: str) -> str:
+    if key not in row.keys():
+        return ""
+    value = row[key]
+    return "" if value is None else str(value)
 
 
 def _worst_dd(overlay_view: dict) -> str:
@@ -368,7 +378,10 @@ def _worst_peak(overlay_view: dict) -> str | None:
 def _all_above_freeze(overlay_view: dict, settings: Settings) -> bool:
     if not overlay_view:
         return True
-    return all(D(item["dd"]) > -settings.freeze_drawdown_pct for item in overlay_view.values())
+    return all(
+        D(item.get("trigger_dd") or item["dd"]) > -settings.freeze_drawdown_pct
+        for item in overlay_view.values()
+    )
 
 
 def parse_since(text: str) -> timedelta:
