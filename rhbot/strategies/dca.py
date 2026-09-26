@@ -1,8 +1,8 @@
-"""Weekly DCA schedule. The dollar amount is waiting on Randy.
+"""Weekly DCA. One coin every 7 days from paper day 1, at the same UTC time.
 
-Buys would be every 7 days from paper day 1, at the same UTC time.
-The amount in the spec is below the $10 minimum, so this book stays disabled
-until that decision. The schedule index is still computed and persisted.
+Day 1 buys BTC, day 8 buys ETH, then they alternate. The size is $19.23,
+which is $1,000 / 52 rounded down to the cent, so each order clears the
+$10 minimum.
 """
 
 from __future__ import annotations
@@ -61,12 +61,17 @@ class DcaWeekly:
         updated["day1"] = day1_raw
         filled = {int(item) for item in (state.get("filled_indexes") or [])}
         skipped = {int(item) for item in (state.get("skipped_indexes") or [])}
-        if index in filled or index in skipped:
-            updated["seen_index"] = index
-            return [], updated, "already_scheduled"
-        # The amount is not approved. Do not emit an order.
         updated["seen_index"] = index
-        return [], updated, "dca_amount_pending_owner_decision"
+        if index in filled or index in skipped:
+            return [], updated, "already_scheduled"
+        symbols = self.settings.symbols
+        symbol = symbols[index % len(symbols)]
+        amount = self.settings.dca_notional
+        if amount < self.settings.min_order_notional:
+            return [], updated, "below_min"
+        return [
+            OrderIntent(symbol=symbol, side="buy", reason="dca_buy", quote_amount=amount)
+        ], updated, "dca_buy"
 
     def commit(self, state: dict, fills: list[Fill], positions: dict, now: datetime) -> dict:
         del positions

@@ -11,10 +11,10 @@ Only `BTC-USD` and `ETH-USD`. Three sleeves:
 | Sleeve | What it does |
 | --- | --- |
 | Buy and hold | Splits the cash between BTC and ETH once, then sits there. This is the benchmark. |
-| Weekly DCA | Buys $25 of BTC and $25 of ETH once a week. |
-| Daily trend | Once a day, holds a coin when its last closed daily price is at least 1% above the 20-day average. Otherwise it goes to cash. It waits 7 days before flipping again. |
+| Weekly DCA | Buys one coin every 7 days, BTC then ETH, at $19.23. |
+| Daily trend | Once a day, holds a coin when its last closed daily price is at least 2% above the 200-day average. Otherwise it goes to cash. It waits 7 days before selling, and it can buy again the next day. |
 
-The 20-day average and the 1% band were picked before any backtest. The 7-day wait is the risk floor. They are not the winners of a search. Change them only in a reviewed pull request, not because one week looked good.
+The 200-day average and the 2% band were picked before any backtest. The 7-day hold is the risk floor. They are not the winners of a search. Change them only in a reviewed pull request, not because one week looked good.
 
 ## Install
 

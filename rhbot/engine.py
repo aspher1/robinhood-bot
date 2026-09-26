@@ -14,7 +14,7 @@ from rhbot.data.public import PublicMarketData
 from rhbot.data.robinhood import RobinhoodMarketData
 from rhbot.errors import DataError, OrderRejected
 from rhbot.ledger import Ledger
-from rhbot.models import Fill, MarketSnapshot, OrderIntent
+from rhbot.models import RISK_REDUCTION_REASONS, Fill, MarketSnapshot, OrderIntent
 from rhbot.money import D, money_str, q8
 from rhbot.overlay import OVERLAY_BOOKS, SHADOW_NAMES, mark_to_bid_equity, signed_drawdown
 from rhbot.pricing import plan_fill
@@ -293,7 +293,9 @@ class Engine:
                 snapshot, state, positions, cash, equity, market_now
             )
         if strategy.name == "dca_weekly":
-            new_state, reason = self._dca_freeze_skip(new_state, reason, market_now)
+            new_state, orders, reason = self._dca_freeze_skip(
+                new_state, orders, reason, market_now
+            )
         self.ledger.log_event(
             "decision",
             {
@@ -305,16 +307,19 @@ class Engine:
         )
         filled: list[Fill] = []
         fresh: list[Fill] = []
+        planned_strategy = 0
         for intent in orders:
             if kill_active(self.settings.state_dir):
                 break
             client_order_id = self._client_id(strategy.name, intent, market_now)
+            ctx = self._context(strategy.name, snapshot, market_now)
+            ctx.trades_today += planned_strategy
             try:
                 planned = self.broker.plan(
                     strategy.name,
                     intent,
                     client_order_id,
-                    self._context(strategy.name, snapshot, market_now),
+                    ctx,
                     market_now,
                 )
             except OrderRejected:
@@ -322,6 +327,8 @@ class Engine:
             filled.append(planned)
             if self.ledger.get_fill(planned.client_order_id) is None:
                 fresh.append(planned)
+                if intent.reason not in RISK_REDUCTION_REASONS:
+                    planned_strategy += 1
         with self.ledger.transaction():
             for fill in fresh:
                 if self.ledger.get_fill(fill.client_order_id) is None:
@@ -428,7 +435,7 @@ class Engine:
             quotes=snapshot.quotes,
             day_start_equity=q8(row["day_start_equity"]),
             peak_equity=q8(row["last_equity"]),
-            trades_today=self.ledger.shadow_strategy_trades_today(day),
+            trades_today=self.ledger.shadow_strategy_trades_today(sleeve, day),
             turnover_today=turnover,
             known_client_ids=self.ledger.shadow_known_client_ids(),
             ordered_symbols_today=self.ledger.shadow_symbols_ordered_on(sleeve, day),
@@ -449,7 +456,7 @@ class Engine:
             quotes=snapshot.quotes,
             day_start_equity=q8(row["day_start_equity"]),
             peak_equity=q8(row["peak_equity"]),
-            trades_today=self.ledger.strategy_trades_today(day),
+            trades_today=self.ledger.book_strategy_trades_today(sleeve, day),
             turnover_today=turnover,
             known_client_ids=self.ledger.known_client_ids(),
             ordered_symbols_today=self.ledger.symbols_ordered_on(sleeve, day),
@@ -487,25 +494,29 @@ class Engine:
         if bars:
             self.ledger.upsert_candles(bars, fetched_at=market_now)
 
-    def _dca_freeze_skip(self, state: dict, reason: str, market_now: datetime) -> tuple[dict, str]:
+    def _dca_freeze_skip(
+        self,
+        state: dict,
+        orders: list[OrderIntent],
+        reason: str,
+        market_now: datetime,
+    ) -> tuple[dict, list[OrderIntent], str]:
         """A due DCA buy during a freeze is denied and is not caught up later."""
-        if reason != "dca_amount_pending_owner_decision":
-            return state, reason
-        if self._overlay_state("dca_weekly") != "FROZEN":
-            return state, reason
+        if self._overlay_state("dca_weekly") != "FROZEN" or not orders:
+            return state, orders, reason
         index = state.get("seen_index")
         skipped = [int(item) for item in (state.get("skipped_indexes") or [])]
         if index is None or int(index) in skipped:
-            return state, "freeze"
+            return state, [], "freeze"
         skipped.append(int(index))
         updated = {**state, "skipped_indexes": skipped}
-        for symbol in self.settings.symbols:
+        for intent in orders:
             self.ledger.record_risk_event(
                 "risk_denial",
                 market_now,
                 sleeve="dca_weekly",
-                symbol=symbol,
-                side="buy",
+                symbol=intent.symbol,
+                side=intent.side,
                 reason="freeze",
                 limit_name="freeze_drawdown_pct",
                 limit_value=format(self.settings.freeze_drawdown_pct, "f"),
@@ -513,7 +524,7 @@ class Engine:
                 client_order_id="",
                 detail="freeze",
             )
-        return updated, "freeze"
+        return updated, [], "freeze"
 
     def _enforce_overlays(self, market_now: datetime, snapshot: MarketSnapshot) -> None:
         """Option B on trend_daily and dca_weekly only. Never touches buy_and_hold.

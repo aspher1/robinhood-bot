@@ -26,7 +26,7 @@ sma_window: 200
 trend_band: "0.02"
 min_hold_days: 7
 trend_target_weight: "0.50"
-dca_notional: "25"
+dca_notional: "19.23"
 loop_seconds: 60
 market_data: public
 public_provider: coinbase

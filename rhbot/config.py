@@ -30,11 +30,9 @@ HARD_CAPS = {
     "max_position_pct": Decimal("0.50"),
     "max_total_exposure_pct": Decimal("1"),
     "max_daily_loss_pct": Decimal("0.04"),
-    # Paper only: freeze new buys at 10% off the combined peak. Do not carry
-    # this into a live phase.
+    # Paper only: freeze new buys at 10% off that book's mark-to-bid peak.
     "freeze_drawdown_pct": Decimal("0.10"),
-    # Paper only: hard kill and flatten at 40% off the combined peak. Do not
-    # carry this into a live phase.
+    # Paper only: hard kill and flatten that book at 40% off its peak.
     "kill_drawdown_pct": Decimal("0.40"),
     "max_trades_per_day": 2,
     "max_quote_age_seconds": 30,
@@ -75,7 +73,7 @@ class Settings(BaseModel):
     max_position_pct: Decimal = Decimal("0.50")
     max_total_exposure_pct: Decimal = Decimal("1")
     max_daily_loss_pct: Decimal = Decimal("0.04")
-    # Paper only. Combined-portfolio peak. Config may only tighten these.
+    # Paper only. Per-book mark-to-bid peak. Config may only tighten these.
     # They must not be copied into a live phase.
     freeze_drawdown_pct: Decimal = Decimal("0.10")
     kill_drawdown_pct: Decimal = Decimal("0.40")
@@ -89,7 +87,8 @@ class Settings(BaseModel):
     trend_band: Decimal = Decimal("0.02")
     min_hold_days: int = 7
     trend_target_weight: Decimal = Decimal("0.50")
-    dca_notional: Decimal = Decimal("25")
+    # $1,000 / 52 weeks, rounded down to the cent. One coin per period.
+    dca_notional: Decimal = Decimal("19.23")
     loop_seconds: int = 60
     market_data: str = "public"
     public_provider: str = "coinbase"
@@ -204,8 +203,8 @@ class Settings(BaseModel):
             problems.append("trend_target_weight must be positive and within max_position_pct")
         if self.dca_notional < self.min_order_notional:
             problems.append("dca_notional is below min_order_notional")
-        if self.dca_notional * len(self.symbols) > self.starting_cash:
-            problems.append("weekly DCA total exceeds starting cash")
+        if self.dca_notional > self.starting_cash:
+            problems.append("dca_notional exceeds starting cash")
         if not 10 <= self.loop_seconds <= 3600:
             problems.append("loop_seconds must be between 10 and 3600")
         if problems:

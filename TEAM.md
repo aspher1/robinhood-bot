@@ -18,7 +18,7 @@ Coordinates the five agents. Reads status and the daily report. Escalates a stuc
 
 ## Research
 
-Owns the strategy specs: what the daily trend filter, weekly DCA, and buy-and-hold benchmark are supposed to do, including the parameters that were chosen up front (20-day average, 1% band, $25 weekly buy). The minimum hold cannot be shorter than the 7-day risk floor.
+Owns the strategy specs: what the daily trend filter, weekly DCA, and buy-and-hold benchmark are supposed to do, including the parameters that were chosen up front (200-day average, 2% band, one $19.23 DCA buy per week alternating BTC then ETH). The minimum hold cannot be shorter than the 7-day risk floor.
 
 Uses `rhbot report` and this file's sibling `ARCHITECTURE.md`. May propose a parameter change as a reviewed pull request. May not edit strategy or risk code, and may not pick a new window because one backtest looked best.
 

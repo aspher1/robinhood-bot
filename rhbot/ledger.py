@@ -371,11 +371,7 @@ class Ledger:
         return len(rows), q8(total)
 
     def strategy_trades_today(self, day: str) -> int:
-        """Fills that count toward the global daily trade cap.
-
-        F-003 is waiting on Randy. The live path keeps this global count.
-        ``book_strategy_trades_today`` is the per-book count and is not wired in.
-        """
+        """All strategy fills today. The cap itself is per book."""
         placeholders = ",".join("?" for _ in RISK_REDUCTION_REASONS)
         row = self.conn.execute(
             f"""
@@ -387,7 +383,7 @@ class Ledger:
         return int(row["n"])
 
     def book_strategy_trades_today(self, sleeve: str, day: str) -> int:
-        """Per-book trade count. Not used by the engine until F-003 is decided."""
+        """Strategy fills for one book today. Risk-reduction sells are exempt."""
         placeholders = ",".join("?" for _ in RISK_REDUCTION_REASONS)
         row = self.conn.execute(
             f"""
@@ -853,14 +849,15 @@ class Ledger:
             total += D(row["notional"])
         return len(rows), q8(total)
 
-    def shadow_strategy_trades_today(self, day: str) -> int:
+    def shadow_strategy_trades_today(self, sleeve: str, day: str) -> int:
+        """Strategy fills for one shadow book today. Risk-reduction sells are exempt."""
         placeholders = ",".join("?" for _ in RISK_REDUCTION_REASONS)
         row = self.conn.execute(
             f"""
             SELECT COUNT(*) AS n FROM shadow_fills
-            WHERE substr(ts, 1, 10)=? AND reason NOT IN ({placeholders})
+            WHERE sleeve=? AND substr(ts, 1, 10)=? AND reason NOT IN ({placeholders})
             """,
-            (day, *RISK_REDUCTION_REASONS),
+            (sleeve, day, *RISK_REDUCTION_REASONS),
         ).fetchone()
         return int(row["n"])
 

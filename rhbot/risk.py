@@ -212,7 +212,7 @@ class RiskEngine:
         if intent.side == "buy":
             # Paper-only freeze. Sells above this check still go through.
             # Weekly DCA buys are new entries and are blocked with every other buy.
-            # The engine raises the freeze from combined peak equity.
+            # The engine raises the freeze from that book's mark-to-bid peak.
             if not ignore_overlay and ctx.overlay_state == "FROZEN":
                 return deny(
                     "freeze",

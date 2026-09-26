@@ -35,10 +35,10 @@ Each strategy is a pure function from bars, quotes, positions, and its own state
 | Sleeve | Behavior |
 | --- | --- |
 | `buy_and_hold` | On the first cycle, split cash across BTC and ETH and then hold. |
-| `dca_weekly` | Buy `dca_notional` (default $25) of each symbol once per ISO week. |
+| `dca_weekly` | Buy `dca_notional` (default $19.23) of one coin every 7 days from paper day 1, BTC then ETH. |
 | `trend_daily` | Once per UTC day, hold a symbol when its last closed daily close is above its N-day average by the no-trade band; otherwise go to cash. A minimum hold applies in both directions after the first entry. |
 
-N and the band were chosen before any backtest: 20 days and 1%. The minimum hold is the risk floor, 7 days. `rhbot/backtest.py` replays those same functions over bars you already have. It does not search parameters.
+N and the band were chosen before any backtest: 200 days and 2%. The minimum hold is the risk floor, 7 days. `rhbot/backtest.py` replays those same functions over bars you already have. It does not search parameters.
 
 ## Risk
 
@@ -53,18 +53,18 @@ N and the band were chosen before any backtest: 20 days and 1%. The minimum hold
 7. One order per symbol per sleeve per UTC day. A second strategy order on that symbol is denied.
 8. Drawdown freeze. While a strategy book is FROZEN, its new buys are denied. Sells still work. Buy-and-hold has no overlay.
 9. Daily loss. At 4% from the UTC day-start equity, new buys are denied until the next UTC day. Sells still work.
-10. Minimum notional ($10), cash on hand, per-trade cap (50% of equity), per-symbol cap, total exposure, daily turnover, and the global trade cap.
+10. Minimum notional ($10), cash on hand, per-trade cap (50% of equity), per-symbol cap, total exposure, daily turnover, and the per-book trade cap.
 
 Hard caps live in `HARD_CAPS` in `rhbot/config.py`. Config may only tighten them. The per-symbol cap is applied to the position's value at the mid, not to the cash spent, because the 1% cost would otherwise make a full-size position impossible.
 
-Default limits, which are also the ceilings: 50% of sleeve equity per coin, 100% total exposure, 50% per trade, $10 minimum, 2 strategy fills per day across every sleeve, 100% daily turnover, 7-day minimum hold, quotes older than 30 seconds rejected, spread wider than 2% per side skipped.
+Default limits, which are also the ceilings: 50% of sleeve equity per coin, 100% total exposure, 50% per trade, $10 minimum, 2 strategy fills per day per book (risk-reduction sells do not count), 100% daily turnover, 7-day minimum hold, quotes older than 30 seconds rejected, spread wider than 2% per side skipped.
 
 Drawdown is mark-to-bid equity divided by that book's running peak, minus one. It applies to trend and DCA only. These two thresholds are paper-only. They are looser than a live book should use, and they must not be carried into any live phase. Config may only tighten them.
 
-| Drawdown from the combined peak | What the engine does |
+| Drawdown from that book's peak | What the engine does |
 | --- | --- |
 | 10% (`freeze_drawdown_pct`) | Sets that book to FROZEN, logs `freeze_trip`, and blocks its new buys until `rhbot ack-drawdown --strategy <name> --by operator|randy --note "..."`. Exits stay allowed. Nothing is force-sold. |
-| 40% (`kill_drawdown_pct`) | Writes `state/KILL` with `ack_required`, logs a `kill_trip`, and flattens every paper sleeve. |
+| 40% (`kill_drawdown_pct`) | Writes `state/KILL` with `ack_required`, logs a `kill_trip`, and flattens that book. |
 
 There is no 5% or 7.5% exposure cut. A 4% loss versus the UTC day-start equity still blocks new buys in that sleeve until the next UTC day. It does not freeze, kill, or sell. The engine never clears `state/KILL`. Drawdown uses mark-to-bid equity against that book's own peak.
 

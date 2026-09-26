@@ -61,9 +61,12 @@ def test_f001_freeze_at_ten_percent_denies_entries_and_is_not_caught_up(tmp_path
     peak = bot.ledger.overlay_row("trend_daily")["peak"]
     assert bot.ledger.overlay_row("trend_daily")["state"] == "ARMED"
     assert bot.ledger.overlay_row("dca_weekly")["state"] == "ARMED"
+    trend_cash = money_str(bot.ledger.cash("trend_daily"))
+    dca_cash = money_str(bot.ledger.cash("dca_weekly"))
+    # Day 1 already bought BTC. The next period is the buy that must be skipped.
     _set_cash(bot, "trend_daily", "900")
-    _set_cash(bot, "dca_weekly", "900")
-    later = now + timedelta(days=1)
+    _set_cash(bot, "dca_weekly", "800")
+    later = now + timedelta(days=7)
     hot = snapshot(later, closes=["10", "10", "12"], last_open=later - timedelta(days=1))
     bot.run_once(now=later, snapshot=hot)
 
@@ -79,8 +82,8 @@ def test_f001_freeze_at_ten_percent_denies_entries_and_is_not_caught_up(tmp_path
     assert any(item["sleeve"] == "trend_daily" and item["reason"] == "freeze" and item["side"] == "buy" for item in denials)
     assert any(item["sleeve"] == "dca_weekly" and item["reason"] == "freeze" and item["side"] == "buy" for item in denials)
     assert bot.ledger.positions("trend_daily") == {}
-    assert bot.ledger.fills_for("dca_weekly") == []
-    assert bot.ledger.strategy_state("dca_weekly")["skipped_indexes"]
+    assert [row["symbol"] for row in bot.ledger.fills_for("dca_weekly")] == ["BTC-USD"]
+    assert 1 in bot.ledger.strategy_state("dca_weekly")["skipped_indexes"]
     assert bot.ledger.conn.execute("SELECT COUNT(*) AS n FROM fills WHERE side='sell'").fetchone()["n"] == 0
     status = assess(bot.settings, now=utcnow())
     assert status["buy_pause"] is True
@@ -89,8 +92,8 @@ def test_f001_freeze_at_ten_percent_denies_entries_and_is_not_caught_up(tmp_path
     assert status["overlay"]["trend_daily"]["last_trip"]["peak"] == peak
     assert Decimal(status["drawdown_pct"]) <= Decimal("-0.10")
 
-    _set_cash(bot, "trend_daily", "1000")
-    _set_cash(bot, "dca_weekly", "1000")
+    _set_cash(bot, "trend_daily", trend_cash)
+    _set_cash(bot, "dca_weekly", dca_cash)
     bot.ledger.close()
     assert _ack(tmp_path, "trend_daily", "operator") == 0
     assert _ack(tmp_path, "dca_weekly", "randy") == 0
@@ -113,7 +116,7 @@ def test_f001_freeze_at_ten_percent_denies_entries_and_is_not_caught_up(tmp_path
         "SELECT COUNT(*) AS n FROM fills WHERE reason='trend_entry'"
     ).fetchone()["n"] == 0
     bot.run_once(now=later, snapshot=hot)
-    assert bot.ledger.fills_for("dca_weekly") == []
+    assert [row["symbol"] for row in bot.ledger.fills_for("dca_weekly")] == ["BTC-USD"]
     assert bot.ledger.conn.execute(
         "SELECT COUNT(*) AS n FROM fills WHERE reason='trend_entry'"
     ).fetchone()["n"] == 0
@@ -381,6 +384,35 @@ def _reference_position(closes: list[Decimal], n: int = 200, band: Decimal = Dec
     return pos
 
 
+def test_f002_dca_buys_one_coin_per_period(tmp_path, now):
+    bot = engine(tmp_path, sma_window=200)
+    expected = ["BTC-USD", "ETH-USD", "BTC-USD", "ETH-USD"]
+    for step, symbol in enumerate(expected):
+        when = now + timedelta(days=7 * step)
+        bot.run_once(now=when, snapshot=snapshot(when))
+        bot.run_once(now=when, snapshot=snapshot(when))
+        fills = bot.ledger.fills_for("dca_weekly")
+        assert len(fills) == step + 1
+        assert fills[-1]["symbol"] == symbol
+        assert fills[-1]["reason"] == "dca_buy"
+    orders = [
+        json.loads(row["payload"])
+        for row in bot.ledger.conn.execute(
+            "SELECT payload FROM events WHERE kind='decision' ORDER BY seq"
+        )
+    ]
+    dca_orders = [
+        item["orders"][0]
+        for item in orders
+        if item.get("sleeve") == "dca_weekly" and item.get("orders")
+    ]
+    assert [item["symbol"] for item in dca_orders] == expected
+    assert [item["quote_amount"] for item in dca_orders] == ["19.23"] * 4
+    ids = [row["client_order_id"] for row in bot.ledger.fills_for("dca_weekly")]
+    assert len(ids) == len(set(ids)) == 4
+    bot.ledger.close()
+
+
 def test_f002_prefix_invariance(tmp_path):
     from rhbot.models import MarketSnapshot
     from rhbot.strategies.trend import TrendDaily
@@ -423,15 +455,41 @@ def test_f002_prefix_invariance(tmp_path):
     settings_bot.ledger.close()
 
 
-def test_f003_per_book_counter_is_not_wired(tmp_path, now):
-    text = Path("rhbot/engine.py").read_text(encoding="utf-8")
-    assert "book_strategy_trades_today" not in text
-    bot = engine(tmp_path, sma_window=200)
-    bot.run_once(now=now, snapshot=snapshot(now))
+def test_f003_trade_cap_is_per_book_and_skips_risk_reduction(tmp_path, now):
+    bot = engine(tmp_path, sma_window=3, trend_band=Decimal("0.01"))
+    view = snapshot(now, closes=["10", "10", "12"], last_open=now - timedelta(days=1))
+    bot.run_once(now=now, snapshot=view)
     day = now.date().isoformat()
-    assert bot.ledger.strategy_trades_today(day) == 2
     assert bot.ledger.book_strategy_trades_today("buy_and_hold", day) == 2
-    assert bot.ledger.book_strategy_trades_today("trend_daily", day) == 0
+    assert bot.ledger.book_strategy_trades_today("trend_daily", day) == 2
+    assert bot.ledger.book_strategy_trades_today("dca_weekly", day) == 1
+    from rhbot.risk import RiskEngine
+
+    ctx = bot._context("buy_and_hold", view, now)
+    # The book already used its two buys, so cash, turnover, and the coin cap
+    # would deny first. Clear those so the assertion is the trade cap itself.
+    ctx.ordered_symbols_today = set()
+    ctx.cash = Decimal("1000")
+    ctx.equity = Decimal("1000")
+    ctx.positions = {}
+    ctx.turnover_today = Decimal("0")
+    denied = RiskEngine(bot.settings).evaluate(
+        OrderIntent("BTC-USD", "buy", "third", quote_amount=Decimal("20")),
+        ctx,
+        "buy_and_hold:BTC-USD:buy:third",
+    )
+    assert denied.reasons == ["max_trades_per_day"]
+    held = bot.ledger.positions("buy_and_hold")["BTC-USD"]
+    flattened = bot.broker.submit(
+        "buy_and_hold",
+        OrderIntent("BTC-USD", "sell", "drawdown_flatten", base_quantity=held),
+        "buy_and_hold:BTC-USD:sell:flatten",
+        bot._context("buy_and_hold", view, now),
+        now,
+        reduce_only=True,
+    )
+    assert flattened.reason == "drawdown_flatten"
+    assert bot.ledger.book_strategy_trades_today("buy_and_hold", day) == 2
     bot.ledger.close()
 
 
