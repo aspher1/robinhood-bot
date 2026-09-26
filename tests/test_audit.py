@@ -2,6 +2,7 @@ import sqlite3
 
 import pytest
 
+from rhbot.status import audit_verify
 from tests.conftest import engine, snapshot
 
 
@@ -51,3 +52,23 @@ def test_large_audit_chain_and_per_book_counts(tmp_path, now):
     assert bot.ledger.count_events("decision", "dca_weekly") == 300
     assert bot.ledger.count_events("decision", "buy_and_hold") == 0
     bot.ledger.close()
+
+
+def test_audit_verify_does_not_change_database_or_metadata(tmp_path, now):
+    bot = engine(tmp_path)
+    bot.ledger.log_event("decision", {"sleeve": "trend_daily"}, now)
+    bot.ledger.set_meta("starting_cash", "sentinel")
+    db_path = bot.ledger.path
+    bot.ledger.close()
+
+    before_mtime = db_path.stat().st_mtime_ns
+    with sqlite3.connect(db_path) as conn:
+        before_meta = conn.execute("SELECT key, value FROM meta ORDER BY key").fetchall()
+
+    result = audit_verify(bot.settings)
+
+    assert result["ok"] is True
+    assert result["events"] == 1
+    assert db_path.stat().st_mtime_ns == before_mtime
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT key, value FROM meta ORDER BY key").fetchall() == before_meta
