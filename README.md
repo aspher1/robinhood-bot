@@ -46,6 +46,10 @@ rhbot run --state-dir state
 
 That loop wakes every 60 seconds, pulls public prices, lets each sleeve decide, runs the risk checks, and writes `state/heartbeat.json`. One JSON line per cycle goes to stdout. Stop it with Ctrl-C. A systemd unit you can adapt is in `deploy/rhbot.service`.
 
+Start paper with an empty `state/` directory. An existing ledger keeps its all-time peak, paper day 1, and fills.
+
+The live loop checks drawdown on every cycle. `rhbot audit replay` checks that same rule once a day, at the closed daily price. A missing Coinbase quote stops the whole cycle before any sleeve trades.
+
 Copy `config.example.yaml` to `config.yaml` if you want different limits. Decimals in that file must be quoted strings. You can lower a risk limit. You cannot raise it past the hard cap in code.
 
 State lives in the directory you pass (default `./state`):
@@ -66,7 +70,6 @@ rhbot health --state-dir state
 rhbot report --since 24h --state-dir state
 rhbot report --since 7d --md --state-dir state
 rhbot kill --reason "quotes look wrong" --state-dir state
-rhbot resume --state-dir state
 rhbot ack-drawdown --strategy trend_daily --by operator --note "reviewed the paper drawdown" --state-dir state
 rhbot resume --ack --human-code "$CODE" --state-dir state
 rhbot flatten --paper --state-dir state
@@ -74,6 +77,8 @@ rhbot selftest
 rhbot audit verify --state-dir state
 rhbot audit replay --since 7d --state-dir state
 ```
+
+`$CODE` is the secret in `RHBOT_HUMAN_RESUME_FILE`. Resume without `--ack` and that `--human-code` does not clear a kill.
 
 `status` and `health` answer "did it actually do something recently?": last successful cycle, the quote age from the last cycle, and error counts. A quote that was fresh during the cycle stays acceptable until the next loop window. The risk engine still rejects a quote older than 30 seconds at order time.
 
@@ -89,7 +94,7 @@ Who is allowed to run which command is in `TEAM.md`. How the pieces fit is in `A
 
 ## Quotes
 
-v1 paper uses Coinbase public bid/ask. Set `market_data: public` and `public_provider: coinbase`. If that quote is missing, 30 seconds old or older, or has no bid or ask, new orders are denied and health goes critical. The bot does not fall back to Robinhood or Kraken. A reduce_only kill or flatten sell can still use the last valid bid/ask.
+v1 paper uses Coinbase public bid/ask. Set `market_data: public` and `public_provider: coinbase`. A missing Coinbase quote fails the whole cycle closed: health goes critical (`quote_hard_stop`) and that cycle fills nothing. A quote 30 seconds old or older, or one with no bid or ask, denies new orders and sets the same hard stop. The bot does not fall back to Robinhood or Kraken. A reduce_only kill or flatten sell can still use the last valid bid/ask.
 
 Kraken parsers are diagnostic only. They do not price marks, fills, or the spread cap.
 

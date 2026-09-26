@@ -5,12 +5,16 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from rhbot.backtest import diff_live
+from rhbot.config import FROZEN_STARTING_CASH, FROZEN_SYMBOLS
 from rhbot.models import Bar, MarketSnapshot, OrderIntent, Quote
-from rhbot.money import D, money_str
+from rhbot.money import D, money_str, q8
 from rhbot.ops import iso, read_kill, utcnow
+from rhbot.overlay import mark_to_bid_equity
+from rhbot.pricing import plan_fill
 from rhbot.status import assess, build_report
+from rhbot.strategies.trend import largest_entry_quote, sleeve_cash_map
 
-from tests.conftest import engine, make_bars, make_settings, snapshot
+from tests.conftest import engine, make_bars, make_settings, padded_closes, snapshot
 
 UTC = timezone.utc
 
@@ -314,3 +318,133 @@ def test_replay_matches_live_after_the_human_restart(tmp_path, monkeypatch):
     assert report["ok"] is True, report["mismatches"][:12]
     assert report["mismatches"] == []
     assert report["mode"] == "replay"
+
+
+def _assert_sleeve_cash_matches_ledger(bot) -> dict[str, Decimal]:
+    """Each coin's trend cash, added up, is the trend book's ledger cash."""
+    mapped = sleeve_cash_map(bot.ledger.strategy_state("trend_daily"))
+    assert q8(sum(mapped.values(), Decimal(0))) == q8(bot.ledger.cash("trend_daily"))
+    half = q8(FROZEN_STARTING_CASH / Decimal(len(FROZEN_SYMBOLS)))
+    for symbol in FROZEN_SYMBOLS:
+        deltas = sum(
+            (D(row["cash_delta"]) for row in bot.ledger.fills_for("trend_daily") if row["symbol"] == symbol),
+            Decimal(0),
+        )
+        assert mapped[symbol] == q8(half + deltas)
+    return mapped
+
+
+def test_sleeve_cash_matches_ledger_after_normal_fills(tmp_path):
+    now = datetime(2026, 4, 1, 15, 0, tzinfo=UTC)
+    bot = engine(tmp_path)
+    bot.run_once(
+        now=now,
+        snapshot=snapshot(now, mid="100", closes=padded_closes("12"), last_open=now - timedelta(days=1)),
+    )
+    assert any(row["reason"] == "trend_entry" for row in bot.ledger.fills_for("trend_daily"))
+    _assert_sleeve_cash_matches_ledger(bot)
+    exit_at = now + timedelta(days=7)
+    bot.run_once(
+        now=exit_at,
+        snapshot=snapshot(
+            exit_at,
+            mid="100",
+            closes=padded_closes("8", base="12"),
+            last_open=exit_at - timedelta(days=1),
+        ),
+    )
+    assert any(row["reason"] == "trend_exit" for row in bot.ledger.fills_for("trend_daily"))
+    assert bot.ledger.positions("trend_daily") == {}
+    _assert_sleeve_cash_matches_ledger(bot)
+    bot.ledger.close()
+
+
+def _trend_entries_on(bot, day: str) -> list[dict]:
+    found = []
+    rows = bot.ledger.conn.execute(
+        "SELECT ts, payload FROM events WHERE kind='decision' ORDER BY seq"
+    ).fetchall()
+    for row in rows:
+        if str(row["ts"])[:10] != day:
+            continue
+        payload = json.loads(row["payload"])
+        if payload.get("sleeve") != "trend_daily":
+            continue
+        for order in payload.get("orders") or []:
+            if order.get("reason") == "trend_entry":
+                found.append(order)
+    return found
+
+
+def test_restart_reentry_is_sized_from_flatten_proceeds(tmp_path, monkeypatch):
+    opened = datetime(2026, 4, 1, 15, 0, tzinfo=UTC)
+    bot = engine(tmp_path)
+    bot.run_once(
+        now=opened,
+        snapshot=snapshot(opened, mid="100", closes=padded_closes("12"), last_open=opened - timedelta(days=1)),
+    )
+    assert {row["symbol"] for row in bot.ledger.fills_for("trend_daily") if row["reason"] == "trend_entry"} == {
+        "BTC-USD",
+        "ETH-USD",
+    }
+    after_entries = _assert_sleeve_cash_matches_ledger(bot)
+    assert all(amount < Decimal("500") for amount in after_entries.values())
+
+    crash = opened + timedelta(days=1)
+    bot.run_once(now=crash, snapshot=snapshot(crash, mid="40"))
+    assert bot.ledger.overlay_row("trend_daily")["state"] == "KILLED"
+    assert bot.ledger.positions("trend_daily") == {}
+    assert any(row["reason"] == "drawdown_flatten" for row in bot.ledger.fills_for("trend_daily"))
+    proceeds = _assert_sleeve_cash_matches_ledger(bot)
+    assert all(amount > bot.settings.min_order_notional for amount in proceeds.values())
+    assert all(amount < Decimal("500") for amount in proceeds.values())
+    bot.ledger.close()
+
+    assert _resume(tmp_path, monkeypatch) == 0
+    bot = engine(tmp_path)
+    assert sleeve_cash_map(bot.ledger.strategy_state("trend_daily")) == proceeds
+    reentry = crash + timedelta(days=1)
+    view = snapshot(reentry, mid="100", closes=padded_closes("12"), last_open=reentry - timedelta(days=1))
+    cash = q8(bot.ledger.cash("trend_daily"))
+    bot.run_once(now=reentry, snapshot=view)
+    assert bot.ledger.overlay_row("trend_daily")["state"] == "ARMED"
+    orders = _trend_entries_on(bot, reentry.date().isoformat())
+    assert [order["symbol"] for order in orders] == ["BTC-USD", "ETH-USD"]
+    positions: dict[str, Decimal] = {}
+    turnover = Decimal(0)
+    work_cash = cash
+    work_equity = cash
+    for order in orders:
+        symbol = order["symbol"]
+        amount = D(order["quote_amount"])
+        assert amount == largest_entry_quote(
+            symbol,
+            sleeve_cash=proceeds[symbol],
+            ledger_cash=work_cash,
+            equity=work_equity,
+            positions=positions,
+            quotes=view.quotes,
+            turnover_today=turnover,
+            turnover_base=cash,
+            settings=bot.settings,
+        )
+        assert amount <= proceeds[symbol]
+        assert amount < Decimal("500")
+        assert amount >= bot.settings.min_order_notional
+        qty, _price, cash_delta, _cost, notional = plan_fill(
+            OrderIntent(symbol, "buy", "trend_entry", quote_amount=amount),
+            view.quotes[symbol],
+            bot.settings.cost_per_side,
+        )
+        positions[symbol] = qty
+        work_cash = q8(work_cash + cash_delta)
+        turnover = q8(turnover + notional)
+        work_equity = mark_to_bid_equity(work_cash, positions, view.quotes, bot.settings.cost_per_side)
+    filled = [
+        row
+        for row in bot.ledger.fills_for("trend_daily")
+        if row["reason"] == "trend_entry" and str(row["ts"])[:10] == reentry.date().isoformat()
+    ]
+    assert [row["symbol"] for row in filled] == ["BTC-USD", "ETH-USD"]
+    _assert_sleeve_cash_matches_ledger(bot)
+    bot.ledger.close()

@@ -1144,6 +1144,86 @@ def test_f010_audit_replay_matches_then_flags_an_extra_fill(tmp_path):
     assert main(["audit", "replay", "--since", "30d", "--state-dir", str(tmp_path)]) == 2
 
 
+def test_audit_replay_since_excludes_mismatches_before_the_window(tmp_path):
+    """An extra fill older than --since is outside the diff. One inside it is not."""
+    import sqlite3
+
+    from rhbot.backtest import diff_live
+    from rhbot.cli import main
+    from tests.conftest import make_settings
+
+    start = datetime(2024, 3, 1, tzinfo=UTC)
+    closes = ["100"] * 16
+    last = start + timedelta(days=len(closes) - 1)
+    series = {
+        "BTC-USD": make_bars("BTC-USD", closes, last),
+        "ETH-USD": make_bars("ETH-USD", closes, last),
+    }
+    bot = engine(tmp_path)
+    first_day = None
+    last_day = None
+    for index in range(len(closes)):
+        market_now = series["BTC-USD"][index].ts + timedelta(days=1)
+        window = {symbol: bars[: index + 1] for symbol, bars in series.items()}
+        quotes = {
+            symbol: Quote(
+                symbol=symbol,
+                ts=market_now,
+                mid=window[symbol][-1].close,
+                bid=window[symbol][-1].close,
+                ask=window[symbol][-1].close,
+                source="test",
+            )
+            for symbol in window
+        }
+        bot.run_once(
+            now=market_now,
+            snapshot=MarketSnapshot(bars=window, quotes=quotes, source="test"),
+        )
+        if first_day is None:
+            first_day = market_now
+        last_day = market_now
+    bot.ledger.close()
+    assert first_day is not None and last_day is not None
+    assert (last_day.date() - first_day.date()).days > 7
+    assert diff_live(make_settings(tmp_path), "7d")["ok"] is True
+
+    raw = sqlite3.connect(tmp_path / "bot.sqlite")
+    raw.execute(
+        """
+        INSERT INTO fills(
+            sleeve, symbol, side, qty, qty_delta, mid, fill_price,
+            cash_delta, cost, notional, ts, client_order_id, reason
+        ) VALUES(
+            'trend_daily', 'BTC-USD', 'buy', '1', '1', '100', '101',
+            '-101', '1', '100', ?, 'injected-before-since', 'extra'
+        )
+        """,
+        (iso(first_day),),
+    )
+    raw.commit()
+    early = diff_live(make_settings(tmp_path), "7d")
+    assert early["ok"] is True, early["mismatches"]
+    assert early["mismatches"] == []
+    assert main(["audit", "replay", "--since", "7d", "--state-dir", str(tmp_path)]) == 0
+
+    raw.execute(
+        """
+        INSERT INTO fills(
+            sleeve, symbol, side, qty, qty_delta, mid, fill_price,
+            cash_delta, cost, notional, ts, client_order_id, reason
+        ) VALUES(
+            'trend_daily', 'ETH-USD', 'buy', '1', '1', '100', '101',
+            '-101', '1', '100', ?, 'injected-inside-since', 'extra'
+        )
+        """,
+        (iso(last_day),),
+    )
+    raw.commit()
+    raw.close()
+    assert main(["audit", "replay", "--since", "7d", "--state-dir", str(tmp_path)]) == 2
+
+
 def test_p1a_replay_starts_at_paper_day1_and_honors_since(tmp_path):
     """Warmup candles and later same-day cycles must not look like a mismatch."""
     from rhbot.backtest import diff_live
@@ -1269,6 +1349,31 @@ def test_p1b_seventh_day_exit_fills_and_day_six_does_not(tmp_path):
     )
     assert bot.ledger.positions("trend_daily") == {}
     assert any(row["reason"] == "trend_exit" for row in bot.ledger.fills_for("trend_daily"))
+    bot.ledger.close()
+
+
+def test_p1b_fresh_quote_exits_on_the_seventh_calendar_day(tmp_path):
+    """D 00:00:50 entry, fresh quote at D+7 00:00:20. No stale-quote retry."""
+    opened = datetime(2026, 4, 1, 0, 0, 50, tzinfo=UTC)
+    bot = engine(tmp_path)
+    bot.run_once(
+        now=opened,
+        snapshot=snapshot(opened, mid="12", closes=padded_closes("12"), last_open=opened - timedelta(days=1)),
+    )
+    assert bot.ledger.positions("trend_daily")
+    exit_at = (opened + timedelta(days=7)).replace(hour=0, minute=0, second=20)
+    fresh = snapshot(
+        exit_at,
+        mid="8",
+        closes=padded_closes("8", base="12"),
+        last_open=exit_at - timedelta(days=1),
+    )
+    assert fresh.quotes["BTC-USD"].ts == exit_at
+    bot.run_once(now=exit_at, snapshot=fresh)
+    assert bot.ledger.positions("trend_daily") == {}
+    exits = [row for row in bot.ledger.fills_for("trend_daily") if row["reason"] == "trend_exit"]
+    assert exits
+    assert all(str(row["ts"]) == iso(exit_at) for row in exits)
     bot.ledger.close()
 
 

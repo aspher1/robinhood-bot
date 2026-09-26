@@ -15,7 +15,9 @@ Coinbase public bid/ask (no key) --> engine cycle --> strategy intents
                                          hash-chained decision log
 ```
 
-The long-lived loop is `rhbot run`. It wakes every `loop_seconds` (default 60), writes `state/heartbeat.json`, and prints one JSON line. The heartbeat is not just "process alive": it carries the last successful cycle, the last decision, and the last fresh quote.
+The long-lived loop is `rhbot run`. It wakes every `loop_seconds` (default 60), writes `state/heartbeat.json`, and prints one JSON line. The heartbeat is not just "process alive": it carries the last successful cycle, the last decision, and the last fresh quote. Paper starts with a fresh `state/` directory. Reusing an old one keeps the old peak, paper day 1, and fills.
+
+The live loop checks drawdown every cycle. Replay checks it once a day, using the closed daily price as the bid and ask. A missing Coinbase quote raises before any sleeve trades, so that cycle fills nothing.
 
 ## Market data
 
@@ -23,7 +25,7 @@ The long-lived loop is `rhbot run`. It wakes every `loop_seconds` (default 60), 
 
 Fills pay `cost_per_side` (hard floor 1% on a buy and 1% on a sell). That stands in for a small-account spread. The bid and ask are the quote: if either side is missing, or either side is more than 2% from the mid, the order is denied. The spread is not added on top of the 1%.
 
-A missing Coinbase quote, a quote 30 seconds old or older, or a quote with no bid/ask denies new orders and sets health critical (`quote_hard_stop`). The bot does not switch to Robinhood, Kraken, or a last trade. A reduce_only kill or flatten sell may still use the last valid bid/ask. Robinhood best-bid/ask is not selected, including when the API key is missing.
+A missing Coinbase quote fails the whole cycle closed: the engine records `quote_hard_stop` and raises before any sleeve trades, so nothing in that cycle is filled. A quote 30 seconds old or older, or a quote with no bid/ask, denies new orders and sets the same hard stop. The bot does not switch to Robinhood, Kraken, or a last trade. A reduce_only kill or flatten sell may still use the last valid bid/ask. Robinhood best-bid/ask is not selected, including when the API key is missing.
 
 `LiveBroker` exists so the seam is obvious. Every method raises `LiveTradingDisabled`. It does not open a socket. The engine never constructs it. `mode: live` is rejected, and `RHBOT_LIVE`, `RHBOT_MODE=live`, `LIVE_TRADING`, and `ENABLE_LIVE_TRADING` are rejected too. None of those can place an order.
 
@@ -37,7 +39,7 @@ Each strategy is a pure function from bars, quotes, positions, and its own state
 | `dca_weekly` | Buy `dca_notional` (default $19.23) of one coin every 7 days from paper day 1, BTC then ETH. |
 | `trend_daily` | Once per UTC day, hold a symbol when its last closed daily close is above its N-day average by the no-trade band; otherwise go to cash. BTC and ETH keep separate cash. An entry is that coin's cash, capped by the existing 50% per trade, 50% per coin, and 100% total limits after the 1% cost. Under $10 is skipped. A minimum hold applies in both directions after the first entry. |
 
-N and the band were chosen before any backtest: 200 days and 2%. The minimum hold is the risk floor, 7 days. `rhbot/backtest.py` replays those same functions over bars you already have. It does not search parameters.
+N and the band were chosen before any backtest: 200 days and 2%. The minimum hold is the risk floor, 7 days. `rhbot/backtest.py` replays those same functions over bars you already have, one cycle per closed day. It does not search parameters. The live loop runs the drawdown check every cycle; replay runs it at that daily close.
 
 ## Risk
 
