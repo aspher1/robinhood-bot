@@ -49,7 +49,7 @@ Watches the process and is the only role that routinely restarts it.
 | --- | --- |
 | Is it up, and did it do something recently? | `rhbot status`, `rhbot health` |
 | Stop new simulated orders | `rhbot kill --reason "..."` which creates `state/KILL` |
-| Allow orders again after health is clear | `rhbot resume` |
+| Clear a manual `state/KILL` after health is clear (human only; the operator must not run this) | `rhbot resume --ack --human-code <code>` |
 | Acknowledge a 10% paper freeze (AI operator; does not move the peak) | `rhbot ack-drawdown --strategy trend_daily --by operator --note "..."` |
 | Clear a 40% paper kill (human only; the operator must not run this) | `rhbot resume --ack --human-code <code>` |
 | Preflight, including the kill path | `rhbot selftest` |
@@ -59,7 +59,7 @@ Watches the process and is the only role that routinely restarts it.
 
 Suggested rhythm: health every 15 minutes; if health is critical twice in a row, restart once; if it is still critical after that, kill and escalate to Coin Ceo Bot and Randy. Do not restart in a loop.
 
-May not edit strategy or risk code, read keys, resume over a broken ledger, or clear a 40% drawdown kill. That kill is human-only. The operator may acknowledge a 10% freeze and may not treat that acknowledgement as permission to resume.
+May not edit strategy or risk code, read keys, resume over a broken ledger, or clear a manual or 40% drawdown kill. Both clears are human-only. The operator may acknowledge a 10% freeze and may not treat that acknowledgement as permission to resume.
 
 ## Reporting
 

@@ -78,7 +78,7 @@ rhbot audit verify --state-dir state
 rhbot audit replay --since 7d --state-dir state
 ```
 
-`$CODE` is the secret in `RHBOT_HUMAN_RESUME_FILE`. Resume without `--ack` and that `--human-code` does not clear a kill.
+Before a kill needs clearing, Randy should create a private, nonempty text file outside the repository containing the human resume code. Set `RHBOT_HUMAN_RESUME_FILE` to that file's path in the environment of the `rhbot resume` command; `$CODE` in the example must match its contents. Keep the file and code out of git and bot automation. Only Randy should run resume. Clearing either a manual `state/KILL` or a 40% per-book kill requires `--ack` and `--human-code`. The command refuses to resume if another critical health problem remains.
 
 `status` and `health` answer "did it actually do something recently?": last successful cycle, the quote age from the last cycle, and error counts. A quote that was fresh during the cycle stays acceptable until the next loop window. The risk engine still rejects a quote older than 30 seconds at order time.
 
