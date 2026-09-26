@@ -196,6 +196,10 @@ CREATE TABLE IF NOT EXISTS shadow_equity_snapshots (
     equity TEXT NOT NULL,
     cash TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS fills_sleeve_day_idx
+ON fills(sleeve, substr(ts, 1, 10));
+CREATE INDEX IF NOT EXISTS shadow_fills_sleeve_day_idx
+ON shadow_fills(sleeve, substr(ts, 1, 10));
 CREATE TRIGGER IF NOT EXISTS shadow_fills_no_update
 BEFORE UPDATE ON shadow_fills
 BEGIN
