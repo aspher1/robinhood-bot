@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -74,9 +75,12 @@ def read_kill(state_dir: Path) -> dict | None:
 
 def atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
+    tmp = path.with_name(f"{path.name}.tmp.{uuid.uuid4().hex}")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def engage_kill(state_dir: Path, reason: str, by: str, *, ack_required: bool = False) -> dict:
