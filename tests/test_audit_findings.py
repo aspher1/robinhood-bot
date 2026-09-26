@@ -324,6 +324,99 @@ def test_f023_one_book_kill_does_not_block_the_other(tmp_path, monkeypatch):
     bot.ledger.close()
 
 
+def test_f023_retry_flatten_until_book_is_flat(tmp_path, monkeypatch):
+    wall = datetime.now(UTC).replace(microsecond=0)
+    opened = wall - timedelta(days=2)
+    buy_at = wall - timedelta(days=1)
+    bot = engine(tmp_path, sma_window=200)
+    bot.run_once(now=opened, snapshot=snapshot(opened))
+    held_bh = dict(bot.ledger.positions("buy_and_hold"))
+    bot.broker.submit(
+        "trend_daily",
+        OrderIntent("BTC-USD", "buy", "trend_entry", quote_amount=Decimal("500")),
+        f"trend_daily:BTC-USD:buy:{buy_at.date().isoformat()}",
+        bot._context("trend_daily", snapshot(buy_at), buy_at),
+        buy_at,
+    )
+    overlay_peak = bot.ledger.overlay_row("trend_daily")["peak"]
+    portfolio_peak = bot.ledger.get_meta("portfolio_peak")
+    sleeve_peaks = {
+        str(row["name"]): str(row["peak_equity"])
+        for row in bot.ledger.conn.execute("SELECT name, peak_equity FROM sleeves")
+    }
+    real_submit = bot.broker.submit
+    rejected = {"n": 0}
+
+    def flaky(sleeve, intent, client_order_id, context, now, reduce_only=False):
+        if intent.reason == "drawdown_flatten":
+            rejected["n"] += 1
+            if rejected["n"] == 1:
+                raise OrderRejected(["stale_quote"])
+        return real_submit(
+            sleeve,
+            intent,
+            client_order_id,
+            context,
+            now,
+            reduce_only=reduce_only,
+        )
+
+    monkeypatch.setattr(bot.broker, "submit", flaky)
+    crash = snapshot(wall, mid="10")
+    bot.run_once(now=wall, snapshot=crash)
+    assert rejected["n"] == 1
+    assert bot.ledger.overlay_row("trend_daily")["state"] == "KILLED"
+    assert bot.ledger.positions("trend_daily")
+    assert bot.ledger.positions("buy_and_hold") == held_bh
+    assert bot.ledger.overlay_row("trend_daily")["peak"] == overlay_peak
+    assert bot.ledger.get_meta("portfolio_peak") == portfolio_peak
+    for name, stored in sleeve_peaks.items():
+        assert bot.ledger.sleeve_row(name)["peak_equity"] == stored
+    assert "trend_daily" in (bot.ledger.get_meta("kill_flatten_incomplete") or "")
+    status = assess(bot.settings, now=utcnow())
+    assert status["health"] == "critical"
+    assert "kill_flatten_incomplete" in status["reasons"]
+    assert "trend_daily" in status["checks"]["kill_flatten"]["sleeves"]
+    bot.ledger.close()
+
+    from rhbot.cli import main
+
+    secret = tmp_path / "human-code"
+    secret.write_text("resume-ok\n", encoding="utf-8")
+    monkeypatch.setenv("RHBOT_HUMAN_RESUME_FILE", str(secret))
+    assert main(["resume", "--ack", "--human-code", "resume-ok", "--state-dir", str(tmp_path)]) == 2
+
+    bot = engine(tmp_path, sma_window=200)
+    assert not str(bot.ledger.overlay_row("trend_daily")["kill_acked_peak"] or "")
+    bot.run_once(now=wall, snapshot=crash)
+    assert bot.ledger.positions("trend_daily") == {}
+    assert bot.ledger.positions("buy_and_hold") == held_bh
+    assert bot.ledger.overlay_row("trend_daily")["state"] == "KILLED"
+    assert bot.ledger.overlay_row("trend_daily")["peak"] == overlay_peak
+    assert bot.ledger.get_meta("portfolio_peak") == portfolio_peak
+    for name, stored in sleeve_peaks.items():
+        assert bot.ledger.sleeve_row(name)["peak_equity"] == stored
+    sells = [
+        row
+        for row in bot.ledger.fills_for("trend_daily")
+        if row["side"] == "sell" and row["reason"] == "drawdown_flatten"
+    ]
+    assert len(sells) == 1
+    assert str(sells[0]["client_order_id"]).endswith(":drawdown_flatten")
+    assert bot.ledger.conn.execute(
+        "SELECT COUNT(*) AS n FROM fills WHERE sleeve='buy_and_hold' AND reason='drawdown_flatten'"
+    ).fetchone()["n"] == 0
+    assert not (bot.ledger.get_meta("kill_flatten_incomplete") or "")
+    cleared = assess(bot.settings, now=utcnow())
+    assert "kill_flatten_incomplete" not in cleared["reasons"]
+    bot.ledger.close()
+
+    assert main(["resume", "--state-dir", str(tmp_path)]) == 2
+    assert main(["resume", "--ack", "--state-dir", str(tmp_path)]) == 2
+    assert main(["resume", "--ack", "--human-code", "nope", "--state-dir", str(tmp_path)]) == 2
+    assert main(["resume", "--ack", "--human-code", "resume-ok", "--state-dir", str(tmp_path)]) == 0
+
+
 def test_f001_buy_and_hold_drawdown_does_not_touch_other_books(tmp_path, now):
     bot = engine(tmp_path, sma_window=200)
     bot.run_once(now=now, snapshot=snapshot(now))

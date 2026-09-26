@@ -199,6 +199,10 @@ def assess(settings: Settings, now: datetime | None = None) -> dict:
             killed = any(item["state"] == "KILLED" for item in overlay_view.values())
             if killed:
                 level = _bump("critical", "drawdown_breach", level, reasons)
+            incomplete = _incomplete_kill_flattens(ledger, overlay_view, positions)
+            checks["kill_flatten"] = {"ok": not incomplete, "sleeves": incomplete}
+            if incomplete:
+                level = _bump("critical", "kill_flatten_incomplete", level, reasons)
             acknowledged = not any(item["state"] == "FROZEN" for item in overlay_view.values())
             drawdown_acks = _ack_records(ledger, None)
         finally:
@@ -274,6 +278,23 @@ def assess(settings: Settings, now: datetime | None = None) -> dict:
         "reasons": reasons,
         "checks": checks,
     }
+
+
+def _incomplete_kill_flattens(ledger: Ledger, overlay_view: dict, positions: dict) -> list[str]:
+    """Killed overlay books that still hold quantity, or were flagged as such."""
+    flagged = {
+        item
+        for item in (ledger.get_meta("kill_flatten_incomplete") or "").split(",")
+        if item
+    }
+    names: list[str] = []
+    for name, item in overlay_view.items():
+        if item.get("state") != "KILLED":
+            continue
+        held = any(D(qty) > 0 for qty in positions.get(name, {}).values())
+        if held or name in flagged:
+            names.append(name)
+    return names
 
 
 def _overlay_view(ledger: Ledger, now: datetime) -> dict:

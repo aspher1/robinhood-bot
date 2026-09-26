@@ -568,18 +568,22 @@ class Engine:
                     self._kill_book(name, market_now, snapshot, equity, peak, dd)
                 else:
                     self.ledger.save_overlay(name, fields)
+                    self._retry_kill_flatten(name, market_now, snapshot)
                 continue
             if state == "KILLED":
                 # Human resume records the peak. Until then the book stays
                 # killed even if the mark recovers. One book's kill does not
-                # write the process-wide kill file.
+                # write the process-wide kill file. A leftover position is
+                # flattened again on the next cycle and blocks resume.
                 recovered = (
                     bool(acked)
                     and not kill_active(self.settings.state_dir)
                     and dd > -self.settings.kill_drawdown_pct
+                    and not self._open_position(name)
                 )
                 if not recovered:
                     self.ledger.save_overlay(name, fields)
+                    self._retry_kill_flatten(name, market_now, snapshot)
                     continue
                 fields["state"] = "ARMED"
                 fields["kill_acked_peak"] = ""
@@ -682,7 +686,27 @@ class Engine:
         )
         self._flatten_book(name, market_now, snapshot)
 
-    def _flatten_book(self, name: str, market_now: datetime, snapshot: MarketSnapshot) -> None:
+    def _open_position(self, name: str) -> bool:
+        return any(qty > 0 for qty in self.ledger.positions(name).values())
+
+    def _note_flatten_status(self, name: str, *, incomplete: bool) -> None:
+        raw = self.ledger.get_meta("kill_flatten_incomplete") or ""
+        names = [item for item in raw.split(",") if item]
+        if incomplete:
+            if name not in names:
+                names.append(name)
+        else:
+            names = [item for item in names if item != name]
+        self.ledger.set_meta("kill_flatten_incomplete", ",".join(names))
+
+    def _retry_kill_flatten(self, name: str, market_now: datetime, snapshot: MarketSnapshot) -> bool:
+        """Sell a killed overlay book again. Buy-and-hold is not an overlay book."""
+        if not self._open_position(name):
+            self._note_flatten_status(name, incomplete=False)
+            return True
+        return self._flatten_book(name, market_now, snapshot)
+
+    def _flatten_book(self, name: str, market_now: datetime, snapshot: MarketSnapshot) -> bool:
         errors: list[str] = []
         for symbol, qty in list(self.ledger.positions(name).items()):
             intent = OrderIntent(symbol, "sell", "drawdown_flatten", base_quantity=qty)
@@ -704,13 +728,16 @@ class Engine:
         equity = self.mark(name, snapshot)
         self.ledger.mark_equity(name, equity, market_now)
         left = sorted(symbol for symbol, qty in self.ledger.positions(name).items() if qty > 0)
-        if left or errors:
+        incomplete = bool(left or errors)
+        self._note_flatten_status(name, incomplete=incomplete)
+        if incomplete:
             detail = (
                 f"drawdown_flatten incomplete for {name}: "
                 f"{'; '.join(errors) if errors else 'positions remain'} left={left}"
             )
             self.ledger.set_meta("last_error", detail[:400])
-            raise RuntimeError(detail)
+            return False
+        return True
 
     def _require_quotes(self, snapshot: MarketSnapshot) -> None:
         missing = [symbol for symbol in self.settings.symbols if symbol not in snapshot.quotes]
