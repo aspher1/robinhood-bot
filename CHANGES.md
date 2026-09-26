@@ -34,6 +34,10 @@ Added: an open order older than one loop is critical `open_order_stale`, and rec
 
 F-021: `shadow_strategy_trades_today(sleeve, day)` counts one shadow book. The cap stays 2. On a day when buy-and-hold, DCA, and trend all signal, trend's shadow still buys both coins after DCA's shadow has traded. `overlay_effect` is zero when the overlay did not block anyone. A third order on that same shadow book is denied. Buy-and-hold stays the benchmark and has no shadow book.
 
+### Audit round 4
+
+F-022: a risk-reduction sell's client order id includes its reason (`drawdown_flatten`, `flatten`, or `exposure_cut`). Returning an earlier fill is allowed only when the reason matches. After a 40% kill, that book's positions must be empty or the cycle raises. A same-day `trend_exit` is not reused as the flatten.
+
 Not done, optional: F-015 through F-019.
 
 ### Left open

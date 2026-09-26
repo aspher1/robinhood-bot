@@ -887,6 +887,65 @@ def test_f021_shadow_trade_cap_is_per_sleeve(tmp_path, now):
     bot.ledger.close()
 
 
+def test_f022_kill_flatten_does_not_reuse_same_day_strategy_sell(tmp_path):
+    wall = datetime.now(UTC).replace(microsecond=0)
+    opened = wall - timedelta(days=9)
+    buy_at = wall - timedelta(days=8)
+    bot = engine(tmp_path, sma_window=200)
+    bot.run_once(now=opened, snapshot=snapshot(opened))
+    buy_view = snapshot(buy_at)
+    bought = bot.broker.submit(
+        "trend_daily",
+        OrderIntent("BTC-USD", "buy", "trend_entry", quote_amount=Decimal("500")),
+        f"trend_daily:BTC-USD:buy:{buy_at.date().isoformat()}",
+        bot._context("trend_daily", buy_view, buy_at),
+        buy_at,
+    )
+    held = bot.ledger.positions("trend_daily")["BTC-USD"]
+    assert held == bought.qty
+    partial = Decimal("0.10000000")
+    exit_intent = OrderIntent("BTC-USD", "sell", "trend_exit", base_quantity=partial)
+    exit_id = bot._client_id("trend_daily", exit_intent, wall)
+    sold = bot.broker.submit(
+        "trend_daily",
+        exit_intent,
+        exit_id,
+        bot._context("trend_daily", snapshot(wall), wall),
+        wall,
+    )
+    assert sold.reason == "trend_exit"
+    assert sold.client_order_id == exit_id
+    remaining = bot.ledger.positions("trend_daily")["BTC-USD"]
+    assert remaining == held - partial
+    flatten_intent = OrderIntent("BTC-USD", "sell", "drawdown_flatten", base_quantity=remaining)
+    with pytest.raises(OrderRejected) as caught:
+        bot.broker.submit(
+            "trend_daily",
+            flatten_intent,
+            exit_id,
+            bot._context("trend_daily", snapshot(wall), wall),
+            wall,
+            reduce_only=True,
+        )
+    assert caught.value.reasons == ["client_order_reason_mismatch"]
+    assert bot.ledger.positions("trend_daily")["BTC-USD"] == remaining
+    assert bot.ledger.get_fill(exit_id).reason == "trend_exit"
+    bot.run_once(now=wall, snapshot=snapshot(wall, mid="10"))
+    assert bot.ledger.positions("trend_daily") == {}
+    sells = [
+        row
+        for row in bot.ledger.fills_for("trend_daily")
+        if row["symbol"] == "BTC-USD" and row["side"] == "sell"
+    ]
+    assert {row["reason"] for row in sells} == {"trend_exit", "drawdown_flatten"}
+    flatten = next(row for row in sells if row["reason"] == "drawdown_flatten")
+    assert flatten["client_order_id"] != exit_id
+    assert flatten["client_order_id"].endswith(":drawdown_flatten")
+    assert D(flatten["qty"]) == remaining
+    assert bot.ledger.get_fill(exit_id).qty == partial
+    bot.ledger.close()
+
+
 def test_f020_stale_open_order_is_critical(tmp_path, now):
     bot = engine(tmp_path, sma_window=200)
     bot.run_once(now=now, snapshot=snapshot(now))

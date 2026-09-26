@@ -8,7 +8,7 @@ from datetime import datetime
 from rhbot.config import Settings
 from rhbot.errors import DataError, OrderRejected
 from rhbot.ledger import Ledger
-from rhbot.models import Fill, OrderIntent
+from rhbot.models import RISK_REDUCTION_REASONS, Fill, OrderIntent
 from rhbot.ops import kill_active
 from rhbot.pricing import plan_fill
 from rhbot.risk import RiskContext, RiskDecision, RiskEngine, deny
@@ -40,6 +40,8 @@ class PaperBroker:
         )
         stored = self.ledger.get_fill(fill.client_order_id)
         if stored is not None:
+            if _reason_conflict(stored.reason, intent.reason):
+                raise OrderRejected(["client_order_reason_mismatch"])
             return stored
         try:
             self.ledger.commit_fill(fill)
@@ -62,6 +64,15 @@ class PaperBroker:
         """Risk-check and build a fill. Does not write it."""
         existing = self.ledger.get_fill(client_order_id)
         if existing is not None:
+            if _reason_conflict(existing.reason, intent.reason):
+                blocked = deny(
+                    "client_order_reason_mismatch",
+                    "client_order_id",
+                    intent.reason,
+                    existing.reason,
+                )
+                self._record_denial(sleeve, intent, client_order_id, now, blocked)
+                raise OrderRejected(blocked.reasons)
             return existing
         if client_order_id in ctx.known_client_ids or client_order_id in self.ledger.known_client_ids():
             self._record_denial(
@@ -137,3 +148,10 @@ class PaperBroker:
             detail=detail,
         )
         self.ledger.bump("error_risk_reject")
+
+
+def _reason_conflict(stored_reason: str, intent_reason: str) -> bool:
+    """A strategy fill must not be returned as a risk-reduction fill, or the reverse."""
+    if stored_reason == intent_reason:
+        return False
+    return stored_reason in RISK_REDUCTION_REASONS or intent_reason in RISK_REDUCTION_REASONS

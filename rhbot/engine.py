@@ -680,11 +680,12 @@ class Engine:
         self._flatten_book(name, market_now, snapshot)
 
     def _flatten_book(self, name: str, market_now: datetime, snapshot: MarketSnapshot) -> None:
+        errors: list[str] = []
         for symbol, qty in list(self.ledger.positions(name).items()):
             intent = OrderIntent(symbol, "sell", "drawdown_flatten", base_quantity=qty)
             client_order_id = self._client_id(name, intent, market_now)
             try:
-                self.broker.submit(
+                fill = self.broker.submit(
                     name,
                     intent,
                     client_order_id,
@@ -692,10 +693,21 @@ class Engine:
                     market_now,
                     reduce_only=True,
                 )
-            except OrderRejected:
+            except OrderRejected as exc:
+                errors.append(f"{symbol}: {'; '.join(exc.reasons)}")
                 continue
+            if fill.reason != intent.reason:
+                errors.append(f"{symbol}: reused {fill.reason} fill {fill.client_order_id}")
         equity = self.mark(name, snapshot)
         self.ledger.mark_equity(name, equity, market_now)
+        left = sorted(symbol for symbol, qty in self.ledger.positions(name).items() if qty > 0)
+        if left or errors:
+            detail = (
+                f"drawdown_flatten incomplete for {name}: "
+                f"{'; '.join(errors) if errors else 'positions remain'} left={left}"
+            )
+            self.ledger.set_meta("last_error", detail[:400])
+            raise RuntimeError(detail)
 
     def _require_quotes(self, snapshot: MarketSnapshot) -> None:
         missing = [symbol for symbol in self.settings.symbols if symbol not in snapshot.quotes]
@@ -729,7 +741,11 @@ class Engine:
             key = str(schedule_index(market_now, parse_ts(raw))) if raw else ensure_utc(market_now).date().isoformat()
         else:
             key = ensure_utc(market_now).date().isoformat()
-        return f"{sleeve}:{intent.symbol}:{intent.side}:{key}"
+        order_id = f"{sleeve}:{intent.symbol}:{intent.side}:{key}"
+        # A same-day strategy sell must not satisfy a later risk-reduction sell.
+        if intent.reason in RISK_REDUCTION_REASONS:
+            return f"{order_id}:{intent.reason}"
+        return order_id
 
 
 def _intent_payload(intent: OrderIntent) -> dict:
