@@ -1,0 +1,6 @@
+# Risk reviews the hard caps, the risk engine, and every broker.
+# A change here needs that review. Config may only tighten the caps in rhbot/config.py.
+
+/rhbot/config.py @aspher1
+/rhbot/risk.py @aspher1
+/rhbot/brokers/ @aspher1

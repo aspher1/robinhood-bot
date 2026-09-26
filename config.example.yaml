@@ -1,6 +1,6 @@
 # Optional. Copy to config.yaml to override defaults.
 # Write decimals as strings. A bare 0.01 is a binary float and is rejected.
-# Every risk limit below is at the hard cap. You may lower them. You may not raise them.
+# Every risk limit below is at the hard cap. You may tighten them. You may not loosen them.
 
 mode: paper
 starting_cash: "1000"
@@ -10,17 +10,21 @@ symbols:
 cost_per_side: "0.01"
 max_position_pct: "0.50"
 max_total_exposure_pct: "1"
-max_daily_drawdown_pct: "0.05"
+max_daily_loss_pct: "0.04"
+dd_cut_half: "0.05"
+dd_cut_quarter: "0.075"
+exposure_cap_at_half: "0.50"
+exposure_cap_at_quarter: "0.25"
 max_drawdown_pct: "0.10"
-max_trades_per_day: 4
-max_quote_age_seconds: 120
+max_trades_per_day: 2
+max_quote_age_seconds: 30
 max_daily_turnover_pct: "1"
-max_spread_pct: "0.03"
-min_order_notional: "1"
-# Chosen before any backtest. Do not retune these because a week looked good.
+max_spread_per_side: "0.02"
+min_order_notional: "10"
+# Chosen before any backtest. The 7-day hold is the risk floor.
 sma_window: 20
 trend_band: "0.01"
-min_hold_days: 5
+min_hold_days: 7
 trend_target_weight: "0.50"
 dca_notional: "25"
 loop_seconds: 60

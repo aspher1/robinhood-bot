@@ -51,7 +51,7 @@ def test_selftest_is_offline_and_does_not_touch_state(tmp_path, capsys, monkeypa
 
 
 def test_report_after_a_cycle(tmp_path, capsys, now):
-    bot = engine(tmp_path, sma_window=3, min_hold_days=0)
+    bot = engine(tmp_path, sma_window=3)
     # Use wall-clock quotes so health sees fresh data, while the strategy
     # clock stays explicit for the fills.
     from datetime import datetime, timezone
@@ -116,7 +116,7 @@ def test_backtest_replay_uses_the_engine(tmp_path, now):
 
     last_open = now - timedelta(days=1)
     closes = ["10", "10", "10", "12", "12"]
-    settings = make_settings(tmp_path, sma_window=3, min_hold_days=0, trend_band=__import__("decimal").Decimal("0.01"))
+    settings = make_settings(tmp_path, sma_window=3, trend_band=__import__("decimal").Decimal("0.01"))
     bars = {
         "BTC-USD": make_bars("BTC-USD", closes, last_open),
         "ETH-USD": make_bars("ETH-USD", closes, last_open),

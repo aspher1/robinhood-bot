@@ -1,30 +1,69 @@
 from datetime import timedelta
 from decimal import Decimal
 
-from rhbot.models import Quote
 from rhbot.ops import read_kill
 
 from tests.conftest import engine, snapshot
 
 
-def test_drawdown_engages_the_kill_file(tmp_path, now):
-    bot = engine(tmp_path, sma_window=3, min_hold_days=0)
+def _exposure(bot, sleeve: str, view, mid: str) -> tuple[Decimal, Decimal]:
+    positions = bot.ledger.positions(sleeve)
+    exposure = sum((qty * Decimal(mid) for qty in positions.values()), Decimal(0))
+    return exposure, bot.mark(sleeve, view)
+
+
+def test_five_percent_drawdown_cuts_exposure_to_half(tmp_path, now):
+    bot = engine(tmp_path, sma_window=3)
     bot.run_once(now=now, snapshot=snapshot(now))
-    assert not (tmp_path / "KILL").exists()
-    later = now + timedelta(days=2)
-    crashed = snapshot(later, mid="40")
-    bot.run_once(now=later, snapshot=crashed)
-    kill = read_kill(tmp_path)
-    assert kill is not None
-    assert kill["by"] == "risk"
-    assert "drawdown" in kill["reason"]
-    # The kill stops new risk. Buy-and-hold must not have sold itself.
-    assert bot.ledger.positions("buy_and_hold")["BTC-USD"] > 0
+    later = now + timedelta(hours=2)
+    view = snapshot(later, mid="94")
+    bot.run_once(now=later, snapshot=view)
+    assert read_kill(tmp_path) is None
+    exposure, equity = _exposure(bot, "buy_and_hold", view, "94")
+    assert exposure > 0
+    assert exposure <= equity * Decimal("0.50") + Decimal("0.50")
     bot.ledger.close()
 
 
+def test_seven_point_five_percent_drawdown_cuts_exposure_to_quarter(tmp_path, now):
+    bot = engine(tmp_path, sma_window=3)
+    bot.run_once(now=now, snapshot=snapshot(now))
+    later = now + timedelta(hours=2)
+    view = snapshot(later, mid="92")
+    bot.run_once(now=later, snapshot=view)
+    assert read_kill(tmp_path) is None
+    exposure, equity = _exposure(bot, "buy_and_hold", view, "92")
+    assert exposure > 0
+    assert exposure <= equity * Decimal("0.25") + Decimal("0.50")
+    bot.ledger.close()
+
+
+def test_ten_percent_drawdown_kills_flattens_and_requires_ack(tmp_path, now):
+    from datetime import datetime, timezone
+
+    from rhbot.cli import main
+
+    wall = datetime.now(timezone.utc)
+    bot = engine(tmp_path, sma_window=3)
+    bot.run_once(now=wall, snapshot=snapshot(wall))
+    crashed = snapshot(wall, mid="80")
+    bot.run_once(now=wall, snapshot=crashed)
+    kill = read_kill(tmp_path)
+    assert kill is not None
+    assert kill["by"] == "risk"
+    assert kill["ack_required"] is True
+    assert "drawdown" in kill["reason"]
+    assert bot.ledger.positions("buy_and_hold") == {}
+    bot.ledger.close()
+
+    assert main(["resume", "--state-dir", str(tmp_path)]) == 2
+    assert (tmp_path / "KILL").exists()
+    assert main(["resume", "--ack", "--state-dir", str(tmp_path)]) == 0
+    assert not (tmp_path / "KILL").exists()
+
+
 def test_flatten_works_while_killed_and_blocks_new_buys(tmp_path, now):
-    bot = engine(tmp_path, sma_window=3, min_hold_days=0)
+    bot = engine(tmp_path, sma_window=3)
     view = snapshot(now)
     bot.run_once(now=now, snapshot=view)
     from rhbot.ops import engage_kill

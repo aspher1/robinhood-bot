@@ -12,7 +12,7 @@ from rhbot.config import Settings
 from rhbot.ledger import Ledger, parse_ts
 from rhbot.money import D, money_str, q8
 from rhbot.ops import iso, read_heartbeat, read_kill, utcnow
-from rhbot.risk import drawdown_breach
+from rhbot.risk import daily_buy_block, kill_reason
 
 SLEEVES = ("buy_and_hold", "dca_weekly", "trend_daily")
 RANK = {"ok": 0, "idle_ok": 1, "degraded": 2, "critical": 3}
@@ -118,9 +118,12 @@ def assess(settings: Settings, now: datetime | None = None) -> dict:
                 last_eq = D(row["last_equity"])
                 dd = Decimal(0) if peak <= 0 else (peak - last_eq) / peak
                 drawdowns[sleeve] = money_str(dd)
-                breach = drawdown_breach(last_eq, peak, D(row["day_start_equity"]), settings)
+                breach = kill_reason(last_eq, peak, settings)
                 if breach:
                     level = _bump("critical", "drawdown_breach", level, reasons)
+                blocked = daily_buy_block(last_eq, D(row["day_start_equity"]), settings)
+                if blocked:
+                    level = _bump("degraded", "daily_loss", level, reasons)
             checks["reconciliation"] = {"ok": recon_ok, "detail": recon_detail}
             if not recon_ok:
                 level = _bump("critical", "reconciliation", level, reasons)

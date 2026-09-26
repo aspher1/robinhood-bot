@@ -22,11 +22,11 @@ The long-lived loop is `rhbot run`. It wakes every `loop_seconds` (default 60), 
 
 `PublicMarketData` is the default. It needs no API key. Coinbase public ticker and daily candles are the default source; Kraken public OHLC and ticker are the alternate (`public_provider`). Daily bars are cached in SQLite. The signal uses only candles that have already closed, so the current partial day is not treated as a close.
 
-Fills against these mids pay `cost_per_side` (default 1% on a buy and 1% on a sell). That stands in for Robinhood's small-account spread. A quoted bid and ask from the public exchange is only a sanity check. It is not added on top of the 1%.
+Fills against these mids pay `cost_per_side` (hard floor 1% on a buy and 1% on a sell). That stands in for Robinhood's small-account spread. A quoted bid and ask is a sanity check: if either side is more than 2% from the mid, the order is skipped. The spread is not added on top of the 1%. An inclusive Robinhood quote that is already wider than 1% per side is filled at that bid or ask. A tighter inclusive quote is widened to the 1% floor.
 
 `RobinhoodMarketData` is optional and off unless `market_data: robinhood` and both `RH_API_KEY` and `RH_PRIVATE_KEY_BASE64` are set in the environment. It signs GET requests for `/api/v1/crypto/marketdata/best_bid_ask/` only, with a 100-request-per-minute budget and a clock-skew check against the 30-second signing window. Buys then fill at `ask_inclusive_of_buy_spread` and sells at `bid_inclusive_of_sell_spread`, and the extra 1% is not applied again. Candles still come from the public source, because the Robinhood API does not publish OHLC. If you ask for Robinhood quotes but set neither variable, the bot stays on public prices and records `public_fallback`. If you set only one variable, it refuses to start.
 
-`LiveBroker` exists so the seam is obvious. Every method raises `LiveTradingDisabled`. It does not open a socket.
+`LiveBroker` exists so the seam is obvious. Every method raises `LiveTradingDisabled`. It does not open a socket. The engine never constructs it. `mode: live` is rejected, and `RHBOT_LIVE`, `RHBOT_MODE=live`, `LIVE_TRADING`, and `ENABLE_LIVE_TRADING` are rejected too. None of those can place an order.
 
 ## Strategies
 
@@ -38,26 +38,36 @@ Each strategy is a pure function from bars, quotes, positions, and its own state
 | `dca_weekly` | Buy `dca_notional` (default $25) of each symbol once per ISO week. |
 | `trend_daily` | Once per UTC day, hold a symbol when its last closed daily close is above its N-day average by the no-trade band; otherwise go to cash. A minimum hold applies in both directions after the first entry. |
 
-N, the band, and the minimum hold are constants chosen before any backtest: 20 days, 1%, 5 days. `rhbot/backtest.py` replays those same functions over bars you already have. It does not search parameters.
+N and the band were chosen before any backtest: 20 days and 1%. The minimum hold is the risk floor, 7 days. `rhbot/backtest.py` replays those same functions over bars you already have. It does not search parameters.
 
 ## Risk
 
 `rhbot/risk.py` runs inside every paper fill, including a direct broker call. On any unexpected error it denies the order. The checks, in order:
 
-1. Duplicate client id.
-2. Symbol allowlist (BTC-USD, ETH-USD only).
+1. Duplicate client id. Submitting the same id again returns the original fill.
+2. Symbol allowlist (BTC-USD, ETH-USD only). Spot, long only. No margin, leverage, or shorting.
 3. Long-only size (a sell cannot exceed the position).
-4. Quote present, not from the future, and not older than `max_quote_age_seconds`.
-5. Spread sanity when bid and ask are present.
-6. Kill file. A present file blocks new risk. `rhbot flatten --paper` may still sell.
-7. Daily drawdown and max drawdown. A breach denies the order and asks the engine to write `state/KILL`.
-8. Minimum notional, cash on hand, per-symbol cap, total exposure, daily turnover, and trades per day.
+4. Quote present, not from the future, and not older than 30 seconds.
+5. Spread, when bid and ask are present. Skip the order if either side is more than 2% from the mid.
+6. Kill file. A present file blocks new risk. `rhbot flatten --paper` and the drawdown cuts may still sell.
+7. Drawdown from peak. At 10% the order is denied and the engine kills and flattens.
+8. One order per symbol per sleeve per UTC day. A second strategy order on that symbol is denied.
+9. Daily loss. At 4% from the UTC day-start equity, new buys are denied until the next UTC day. Sells still work.
+10. Minimum notional ($10), cash on hand, per-trade cap (50% of equity), per-symbol cap, the drawdown exposure cap, daily turnover, and the global trade cap.
 
 Hard caps live in `HARD_CAPS` in `rhbot/config.py`. Config may only tighten them. The per-symbol cap is applied to the position's value at the mid, not to the cash spent, because the 1% cost would otherwise make a full-size position impossible.
 
-Default limits: 50% of sleeve equity per coin, 100% total exposure, 5% daily drawdown, 10% max drawdown, 4 fills per sleeve per day, quotes older than 120 seconds rejected (the ceiling is 180).
+Default limits, which are also the ceilings: 50% of sleeve equity per coin, 100% total exposure, 50% per trade, $10 minimum, 2 strategy fills per day across every sleeve, 100% daily turnover, 7-day minimum hold, quotes older than 30 seconds rejected, spread wider than 2% per side skipped.
 
-Crossing a drawdown limit stops new simulated buys and sells from the strategies. It does not auto-sell. Flatten is a separate operator command and still refuses a stale quote.
+Drawdown from peak, measured on each sleeve:
+
+| Drawdown | What the engine does |
+| --- | --- |
+| 5% | Sells the book down until exposure is 50% of equity. |
+| 7.5% | Sells the book down until exposure is 25% of equity. |
+| 10% | Writes `state/KILL` with `ack_required`, and flattens every paper sleeve. |
+
+A 4% loss versus the UTC day-start equity blocks new buys in that sleeve until the next UTC day. It does not kill and it does not sell. The engine never clears `state/KILL`. After the 10% kill, `rhbot resume --ack` is the only way to clear it. That command rebases each sleeve's peak to its current equity. It does not add cash. Other critical health problems still block resume.
 
 ## Ledger and audit
 

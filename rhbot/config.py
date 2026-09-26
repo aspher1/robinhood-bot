@@ -14,18 +14,48 @@ from rhbot.money import D
 
 ALLOWED_SYMBOLS = ("BTC-USD", "ETH-USD")
 
+# Spot only. These are not settings. No config key or environment variable turns them off.
+PRODUCT = "spot"
+LEVERAGE = Decimal("1")
+ALLOW_MARGIN = False
+ALLOW_SHORT = False
+
 # Config may set a limit equal to these, or stricter. It may not go past them.
+# "Stricter" means a smaller risk budget, a higher cost, a larger minimum order,
+# or a longer minimum hold.
 HARD_CAPS = {
     "max_position_pct": Decimal("0.50"),
     "max_total_exposure_pct": Decimal("1"),
-    "max_daily_drawdown_pct": Decimal("0.05"),
+    "max_daily_loss_pct": Decimal("0.04"),
+    "dd_cut_half": Decimal("0.05"),
+    "dd_cut_quarter": Decimal("0.075"),
+    "exposure_cap_at_half": Decimal("0.50"),
+    "exposure_cap_at_quarter": Decimal("0.25"),
     "max_drawdown_pct": Decimal("0.10"),
-    "max_trades_per_day": 4,
-    "max_quote_age_seconds": 180,
+    "max_trades_per_day": 2,
+    "max_quote_age_seconds": 30,
     "max_daily_turnover_pct": Decimal("1"),
-    "max_spread_pct": Decimal("0.05"),
-    "min_order_notional": Decimal("0.01"),
+    "max_spread_per_side": Decimal("0.02"),
+    "min_order_notional": Decimal("10"),
+    "min_cost_per_side": Decimal("0.01"),
+    "min_hold_days": 7,
 }
+
+# Values that try to turn trading on. Anything else in these variables is ignored.
+_LIVE_ENV = {
+    "RHBOT_LIVE": {"1", "true", "yes", "on", "live"},
+    "RHBOT_MODE": {"live"},
+    "LIVE_TRADING": {"1", "true", "yes", "on", "live"},
+    "ENABLE_LIVE_TRADING": {"1", "true", "yes", "on", "live"},
+}
+
+
+def reject_live_env() -> None:
+    """No environment variable can select a live broker."""
+    for key, blocked in _LIVE_ENV.items():
+        raw = os.environ.get(key, "").strip().lower()
+        if raw in blocked:
+            raise ConfigError(f"{key} cannot enable live trading; this process is paper-only")
 
 
 class Settings(BaseModel):
@@ -40,17 +70,21 @@ class Settings(BaseModel):
     cost_per_side: Decimal = Decimal("0.01")
     max_position_pct: Decimal = Decimal("0.50")
     max_total_exposure_pct: Decimal = Decimal("1")
-    max_daily_drawdown_pct: Decimal = Decimal("0.05")
+    max_daily_loss_pct: Decimal = Decimal("0.04")
+    dd_cut_half: Decimal = Decimal("0.05")
+    dd_cut_quarter: Decimal = Decimal("0.075")
+    exposure_cap_at_half: Decimal = Decimal("0.50")
+    exposure_cap_at_quarter: Decimal = Decimal("0.25")
     max_drawdown_pct: Decimal = Decimal("0.10")
-    max_trades_per_day: int = 4
-    max_quote_age_seconds: int = 120
+    max_trades_per_day: int = 2
+    max_quote_age_seconds: int = 30
     max_daily_turnover_pct: Decimal = Decimal("1")
-    max_spread_pct: Decimal = Decimal("0.03")
-    min_order_notional: Decimal = Decimal("1")
-    # Chosen before any backtest. Not optimized. See ARCHITECTURE.md.
+    max_spread_per_side: Decimal = Decimal("0.02")
+    min_order_notional: Decimal = Decimal("10")
+    # Chosen before any backtest. The hold is the risk floor. See ARCHITECTURE.md.
     sma_window: int = 20
     trend_band: Decimal = Decimal("0.01")
-    min_hold_days: int = 5
+    min_hold_days: int = 7
     trend_target_weight: Decimal = Decimal("0.50")
     dca_notional: Decimal = Decimal("25")
     loop_seconds: int = 60
@@ -62,10 +96,14 @@ class Settings(BaseModel):
         "cost_per_side",
         "max_position_pct",
         "max_total_exposure_pct",
-        "max_daily_drawdown_pct",
+        "max_daily_loss_pct",
+        "dd_cut_half",
+        "dd_cut_quarter",
+        "exposure_cap_at_half",
+        "exposure_cap_at_quarter",
         "max_drawdown_pct",
         "max_daily_turnover_pct",
-        "max_spread_pct",
+        "max_spread_per_side",
         "min_order_notional",
         "trend_band",
         "trend_target_weight",
@@ -118,10 +156,14 @@ class Settings(BaseModel):
         decimal_caps = (
             "max_position_pct",
             "max_total_exposure_pct",
-            "max_daily_drawdown_pct",
+            "max_daily_loss_pct",
+            "dd_cut_half",
+            "dd_cut_quarter",
+            "exposure_cap_at_half",
+            "exposure_cap_at_quarter",
             "max_drawdown_pct",
             "max_daily_turnover_pct",
-            "max_spread_pct",
+            "max_spread_per_side",
         )
         for name in decimal_caps:
             got = getattr(self, name)
@@ -134,14 +176,18 @@ class Settings(BaseModel):
                 )
         if not 1 <= self.max_quote_age_seconds <= int(HARD_CAPS["max_quote_age_seconds"]):
             problems.append(
-                "max_quote_age_seconds must be 1..180; config may only tighten the hard cap"
+                "max_quote_age_seconds must be 1..30; config may only tighten the hard cap"
             )
         if not 0 <= self.max_trades_per_day <= int(HARD_CAPS["max_trades_per_day"]):
             problems.append(
-                "max_trades_per_day must be 0..4; config may only tighten the hard cap"
+                "max_trades_per_day must be 0..2; config may only tighten the hard cap"
             )
         if self.min_order_notional < HARD_CAPS["min_order_notional"]:
-            problems.append("min_order_notional cannot be below 0.01")
+            problems.append("min_order_notional cannot be below 10")
+        if not self.dd_cut_half < self.dd_cut_quarter < self.max_drawdown_pct:
+            problems.append("drawdown tiers must stay ordered: 5% cut < 7.5% cut < 10% kill")
+        if self.exposure_cap_at_quarter > self.exposure_cap_at_half:
+            problems.append("the 7.5% exposure cap cannot be looser than the 5% cap")
         if not self.symbols:
             problems.append("symbols cannot be empty")
         unknown = [s for s in self.symbols if s not in ALLOWED_SYMBOLS]
@@ -151,14 +197,14 @@ class Settings(BaseModel):
             problems.append("symbols contains a duplicate")
         if self.starting_cash <= 0:
             problems.append("starting_cash must be positive")
-        if not Decimal("0") <= self.cost_per_side <= Decimal("0.05"):
-            problems.append("cost_per_side must be between 0 and 0.05")
+        if not HARD_CAPS["min_cost_per_side"] <= self.cost_per_side <= Decimal("0.05"):
+            problems.append("cost_per_side must be at least 0.01 and at most 0.05")
         if not 2 <= self.sma_window <= 400:
             problems.append("sma_window must be between 2 and 400")
         if not Decimal("0") <= self.trend_band <= Decimal("0.20"):
             problems.append("trend_band must be between 0 and 0.20")
-        if not 0 <= self.min_hold_days <= 90:
-            problems.append("min_hold_days must be between 0 and 90")
+        if not int(HARD_CAPS["min_hold_days"]) <= self.min_hold_days <= 90:
+            problems.append("min_hold_days must be at least 7 and at most 90")
         if self.trend_target_weight <= 0 or self.trend_target_weight > self.max_position_pct:
             problems.append("trend_target_weight must be positive and within max_position_pct")
         if self.dca_notional < self.min_order_notional:
@@ -191,6 +237,7 @@ def resolve_config_path(explicit: str | None) -> Path | None:
 
 
 def load_settings(config: str | None = None, state_dir: str | None = None) -> Settings:
+    reject_live_env()
     path = resolve_config_path(config)
     data: dict = {}
     if path is not None:

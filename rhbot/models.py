@@ -6,6 +6,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
+# Forced de-risking. These fills do not consume the daily strategy trade budget.
+RISK_REDUCTION_REASONS = ("flatten", "exposure_cut", "drawdown_flatten")
+
 
 @dataclass(frozen=True)
 class Bar:
@@ -27,8 +30,8 @@ class Quote:
     source: str
     bid: Decimal | None = None
     ask: Decimal | None = None
-    # When True, bid/ask already include the venue spread. The paper fill
-    # uses them as-is and does not add cost_per_side again.
+    # When True, bid/ask already include the venue spread. The fill still
+    # costs at least cost_per_side (the 1% floor) if the venue spread is tighter.
     spread_included: bool = False
 
 

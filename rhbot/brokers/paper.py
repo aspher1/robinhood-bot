@@ -30,6 +30,12 @@ class PaperBroker:
         *,
         reduce_only: bool = False,
     ) -> Fill:
+        # Same client id returns the original fill and does not trade again.
+        existing = self.ledger.get_fill(client_order_id)
+        if existing is not None:
+            return existing
+        if client_order_id in ctx.known_client_ids or client_order_id in self.ledger.known_client_ids():
+            raise OrderRejected(["duplicate_client_order_id"])
         decision = self.risk.evaluate(
             intent, ctx, client_order_id, reduce_only=reduce_only
         )

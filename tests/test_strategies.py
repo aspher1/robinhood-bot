@@ -65,7 +65,7 @@ def test_dca_buys_once_per_iso_week(tmp_path, now):
 
 
 def test_trend_enters_above_band_and_holds_inside_it(tmp_path, now):
-    settings = make_settings(tmp_path, sma_window=3, min_hold_days=0, trend_band=Decimal("0.01"))
+    settings = make_settings(tmp_path, sma_window=3, trend_band=Decimal("0.01"))
     strategy = TrendDaily(settings)
     last_open = now - timedelta(days=1)
     flat = snapshot(now, closes=["10", "10", "10"], last_open=last_open)
@@ -89,7 +89,7 @@ def test_trend_enters_above_band_and_holds_inside_it(tmp_path, now):
 
 
 def test_trend_min_hold_blocks_exit(tmp_path, now):
-    settings = make_settings(tmp_path, sma_window=3, min_hold_days=5, trend_band=Decimal("0.01"))
+    settings = make_settings(tmp_path, sma_window=3, trend_band=Decimal("0.01"))
     strategy = TrendDaily(settings)
     last_open = now - timedelta(days=1)
     hot = snapshot(now, closes=["10", "10", "12"], last_open=last_open)
@@ -109,7 +109,7 @@ def test_trend_min_hold_blocks_exit(tmp_path, now):
     blocked, _, reason = strategy.decide(crash, state, positions, Decimal("0"), Decimal("1000"), crash_day)
     assert blocked == []
     assert "min_hold" in reason
-    free_day = now + timedelta(days=5)
+    free_day = now + timedelta(days=7)
     free = snapshot(
         free_day,
         mid="8",
@@ -123,29 +123,29 @@ def test_trend_min_hold_blocks_exit(tmp_path, now):
 
 
 def test_each_sleeve_through_the_engine(tmp_path, now):
-    bot = engine(tmp_path, sma_window=3, min_hold_days=0, trend_band=Decimal("0.01"))
+    bot = engine(tmp_path, sma_window=3, trend_band=Decimal("0.01"))
     last_open = now - timedelta(days=1)
     view = snapshot(now, closes=["10", "10", "12"], last_open=last_open)
     bot.run_once(now=now, snapshot=view)
+    # Two trades a day, shared by every sleeve. Buy-and-hold uses the first day.
     assert bot.ledger.positions("buy_and_hold")["BTC-USD"] > 0
-    assert bot.ledger.positions("dca_weekly")["ETH-USD"] > 0
-    assert bot.ledger.positions("trend_daily")["BTC-USD"] > 0
-    before = {
-        name: len(bot.ledger.fills_for(name))
-        for name in ("buy_and_hold", "dca_weekly", "trend_daily")
-    }
+    assert bot.ledger.positions("dca_weekly") == {}
+    assert bot.ledger.positions("trend_daily") == {}
+    assert len(bot.ledger.fills_for("buy_and_hold")) == 2
     bot.run_once(now=now, snapshot=view)
-    after = {
-        name: len(bot.ledger.fills_for(name))
-        for name in ("buy_and_hold", "dca_weekly", "trend_daily")
-    }
-    assert before == after
-    nxt = now + timedelta(days=7)
-    nxt_open = nxt - timedelta(days=1)
-    nxt_view = snapshot(nxt, closes=["10", "12", "13"], last_open=nxt_open)
-    bot.run_once(now=nxt, snapshot=nxt_view)
-    assert len(bot.ledger.fills_for("dca_weekly")) == before["dca_weekly"] + 2
-    assert len(bot.ledger.fills_for("buy_and_hold")) == before["buy_and_hold"]
+    assert len(bot.ledger.fills_for("buy_and_hold")) == 2
+
+    day1 = now + timedelta(days=1)
+    view1 = snapshot(day1, closes=["10", "10", "12"], last_open=day1 - timedelta(days=1))
+    bot.run_once(now=day1, snapshot=view1)
+    assert len(bot.ledger.fills_for("dca_weekly")) == 2
+    assert bot.ledger.fills_for("trend_daily") == []
+
+    day2 = now + timedelta(days=2)
+    view2 = snapshot(day2, closes=["10", "10", "12"], last_open=day2 - timedelta(days=1))
+    bot.run_once(now=day2, snapshot=view2)
+    assert len(bot.ledger.fills_for("trend_daily")) == 2
+    assert len(bot.ledger.fills_for("buy_and_hold")) == 2
     for name in ("buy_and_hold", "dca_weekly", "trend_daily"):
         ok, detail = bot.ledger.reconcile(name)
         assert ok, detail

@@ -12,9 +12,9 @@ Only `BTC-USD` and `ETH-USD`. Three sleeves:
 | --- | --- |
 | Buy and hold | Splits the cash between BTC and ETH once, then sits there. This is the benchmark. |
 | Weekly DCA | Buys $25 of BTC and $25 of ETH once a week. |
-| Daily trend | Once a day, holds a coin when its last closed daily price is at least 1% above the 20-day average. Otherwise it goes to cash. It waits 5 days before flipping again. |
+| Daily trend | Once a day, holds a coin when its last closed daily price is at least 1% above the 20-day average. Otherwise it goes to cash. It waits 7 days before flipping again. |
 
-The 20-day average, the 1% band, and the 5-day wait were picked before any backtest. They are not the winners of a search. Change them only in a reviewed pull request, not because one week looked good.
+The 20-day average and the 1% band were picked before any backtest. The 7-day wait is the risk floor. They are not the winners of a search. Change them only in a reviewed pull request, not because one week looked good.
 
 ## Install
 
@@ -67,6 +67,7 @@ rhbot report --since 24h --state-dir state
 rhbot report --since 7d --md --state-dir state
 rhbot kill --reason "quotes look wrong" --state-dir state
 rhbot resume --state-dir state
+rhbot resume --ack --state-dir state
 rhbot flatten --paper --state-dir state
 rhbot selftest
 rhbot audit verify --state-dir state
@@ -76,7 +77,7 @@ rhbot audit verify --state-dir state
 
 `report` is P&L after costs for each sleeve, next to buy-and-hold.
 
-`resume` will not clear the kill file if something else is critically wrong (a broken ledger, for example).
+`resume` will not clear the kill file if something else is critically wrong (a broken ledger, for example). A 10% drawdown kill also requires `--ack`. The bot never clears that kill by itself.
 
 `flatten --paper` sells what the sleeves hold. The strategies will try to buy back on a later cycle unless the kill file is still in place. To stop the book: kill, then flatten.
 
@@ -93,7 +94,7 @@ export RH_API_KEY='rh-api-...'
 export RH_PRIVATE_KEY_BASE64='base64 of the 32-byte Ed25519 seed'
 ```
 
-Then set `market_data: robinhood` in `config.yaml`. The bot will GET best bid/ask, sign the request, and stay under 100 calls a minute. Buys fill at the ask that already includes the spread, and sells at the bid. The extra 1% is not added again. Daily candles still come from the public source, because Robinhood does not publish them. If those variables are unset, the bot keeps using public prices.
+Then set `market_data: robinhood` in `config.yaml`. The bot will GET best bid/ask, sign the request, and stay under 100 calls a minute. Buys fill at the ask and sells at the bid, and the price is widened if that spread is tighter than the 1% floor. Daily candles still come from the public source, because Robinhood does not publish them. If those variables are unset, the bot keeps using public prices.
 
 The quote client cannot place an order. A key that was created with trade permission still cannot trade through this program. Create it read-only anyway.
 

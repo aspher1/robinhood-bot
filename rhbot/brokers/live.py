@@ -12,7 +12,11 @@ _MESSAGE = (
 
 
 class LiveBroker:
-    """Every method raises. This class does not open a network connection."""
+    """Every method raises. This class does not open a network connection.
+
+    There is no constructor flag, config key, or environment variable that
+    makes these methods send an order. The engine never instantiates this class.
+    """
 
     def submit(self, *args: object, **kwargs: object) -> None:
         raise LiveTradingDisabled(_MESSAGE)

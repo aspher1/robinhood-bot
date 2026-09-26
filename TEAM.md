@@ -18,13 +18,13 @@ Coordinates the five agents. Reads status and the daily report. Escalates a stuc
 
 ## Research
 
-Owns the strategy specs: what the daily trend filter, weekly DCA, and buy-and-hold benchmark are supposed to do, including the parameters that were chosen up front (20-day average, 1% band, 5-day minimum hold, $25 weekly buy).
+Owns the strategy specs: what the daily trend filter, weekly DCA, and buy-and-hold benchmark are supposed to do, including the parameters that were chosen up front (20-day average, 1% band, $25 weekly buy). The minimum hold cannot be shorter than the 7-day risk floor.
 
 Uses `rhbot report` and this file's sibling `ARCHITECTURE.md`. May propose a parameter change as a reviewed pull request. May not edit strategy or risk code, and may not pick a new window because one backtest looked best.
 
 ## Engineering
 
-Reviews pull requests and writes change requests. May change code only through review. A change to `rhbot/risk.py`, hard caps, or `rhbot/strategies/` needs Risk's review as well as the team lead. May not self-approve those changes, may not enable a live broker, and may not weaken the test that rejects order endpoints.
+Reviews pull requests and writes change requests. May change code only through review. A change to `rhbot/risk.py`, the hard caps in `rhbot/config.py`, or `rhbot/brokers/` needs Risk's review. Those paths are listed in `.github/CODEOWNERS`. May not self-approve those changes, may not enable a live broker, and may not weaken the test that rejects order endpoints.
 
 ## Risk
 
@@ -32,7 +32,7 @@ Reviews limits. May tighten them in `config.yaml` (smaller position size, tighte
 
 May not loosen a limit, hold credentials, resume the bot while health is critical for a reason other than the kill switch, or "fix" a drawdown by raising the cap.
 
-The risk engine itself may write `state/KILL` when daily or max drawdown is hit. That is code, not a judgment call.
+The risk engine writes `state/KILL` and flattens the paper book at a 10% drawdown from peak. That is code, not a judgment call. Clearing it takes `rhbot resume --ack` from a person. At 5% it cuts exposure to 50%, and at 7.5% to 25%. A 4% loss on the UTC day blocks new buys until the next UTC day.
 
 ## Operations
 
@@ -43,6 +43,7 @@ Watches the process and is the only role that routinely restarts it.
 | Is it up, and did it do something recently? | `rhbot status`, `rhbot health` |
 | Stop new simulated orders | `rhbot kill --reason "..."` which creates `state/KILL` |
 | Allow orders again after health is clear | `rhbot resume` |
+| Allow orders again after a 10% drawdown kill | `rhbot resume --ack` |
 | Preflight, including the kill path | `rhbot selftest` |
 | Sell the paper book | `rhbot flatten --paper` (kill first if it should stay sold) |
 | Process actually looping | `state/heartbeat.json` |

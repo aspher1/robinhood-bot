@@ -84,17 +84,32 @@ def test_kill_file_blocks_before_fill(tmp_path, now):
     assert decision.reasons == ["kill_switch"]
 
 
-def test_drawdown_trips_kill(tmp_path, now):
+def test_daily_loss_blocks_buys_until_the_loss_is_gone(tmp_path, now):
     settings = _settings(tmp_path)
     risk = RiskEngine(settings)
-    daily = risk.evaluate(
+    blocked = risk.evaluate(
         _buy(),
-        _ctx(settings, now, equity=Decimal("940"), cash=Decimal("940")),
+        _ctx(settings, now, equity=Decimal("960"), cash=Decimal("960")),
         "id-daily",
     )
-    assert daily.kill
-    assert any(reason.startswith("daily_drawdown") for reason in daily.reasons)
+    assert not blocked.kill
+    assert any(reason.startswith("daily_loss") for reason in blocked.reasons)
+    allowed = risk.evaluate(
+        _buy(),
+        _ctx(settings, now, equity=Decimal("970"), cash=Decimal("970")),
+        "id-ok",
+    )
+    assert allowed.allowed
 
+
+def test_drawdown_tiers_and_kill(tmp_path, now):
+    from rhbot.risk import exposure_limit_pct
+
+    settings = _settings(tmp_path)
+    assert exposure_limit_pct(settings, Decimal("960"), Decimal("1000")) == Decimal("1")
+    assert exposure_limit_pct(settings, Decimal("940"), Decimal("1000")) == Decimal("0.50")
+    assert exposure_limit_pct(settings, Decimal("920"), Decimal("1000")) == Decimal("0.25")
+    risk = RiskEngine(settings)
     deep = risk.evaluate(
         _buy(),
         _ctx(settings, now, equity=Decimal("890"), cash=Decimal("890")),
@@ -143,7 +158,19 @@ def test_config_may_only_tighten(tmp_path):
     with pytest.raises(ValueError):
         Settings(state_dir=tmp_path, max_drawdown_pct=Decimal("0.20"))
     with pytest.raises(ValueError):
-        Settings(state_dir=tmp_path, max_trades_per_day=8)
+        Settings(state_dir=tmp_path, max_trades_per_day=3)
+    with pytest.raises(ValueError):
+        Settings(state_dir=tmp_path, max_quote_age_seconds=31)
+    with pytest.raises(ValueError):
+        Settings(state_dir=tmp_path, cost_per_side=Decimal("0.005"))
+    with pytest.raises(ValueError):
+        Settings(state_dir=tmp_path, min_order_notional=Decimal("1"))
+    with pytest.raises(ValueError):
+        Settings(state_dir=tmp_path, min_hold_days=6)
+    with pytest.raises(ValueError):
+        Settings(state_dir=tmp_path, max_spread_per_side=Decimal("0.03"))
+    with pytest.raises(ValueError):
+        Settings(state_dir=tmp_path, max_daily_loss_pct=Decimal("0.05"))
     with pytest.raises(ValueError):
         Settings(state_dir=tmp_path, mode="live")
     with pytest.raises(ValueError):
@@ -152,9 +179,12 @@ def test_config_may_only_tighten(tmp_path):
         state_dir=tmp_path,
         max_position_pct=Decimal("0.25"),
         trend_target_weight=Decimal("0.25"),
-        max_quote_age_seconds=30,
+        max_quote_age_seconds=20,
+        min_hold_days=8,
+        cost_per_side=Decimal("0.02"),
     )
     assert tightened.max_position_pct == Decimal("0.25")
+    assert tightened.min_hold_days == 8
 
 
 def test_yaml_float_is_rejected(tmp_path):
@@ -176,8 +206,48 @@ def test_example_config_loads(tmp_path):
     assert loaded.symbols == ("BTC-USD", "ETH-USD")
 
 
+def test_spread_over_two_percent_per_side_is_skipped(tmp_path, now):
+    settings = _settings(tmp_path)
+    risk = RiskEngine(settings)
+    wide = make_quote("BTC-USD", "100", now, bid=Decimal("97"), ask=Decimal("103"))
+    other = make_quote("ETH-USD", "100", now)
+    decision = risk.evaluate(
+        _buy(),
+        _ctx(settings, now, quotes={"BTC-USD": wide, "ETH-USD": other}),
+        "id-wide",
+    )
+    assert decision.reasons == ["spread_too_wide"]
+    tight = make_quote("BTC-USD", "100", now, bid=Decimal("99"), ask=Decimal("101"))
+    ok = risk.evaluate(
+        _buy("20"),
+        _ctx(settings, now, quotes={"BTC-USD": tight, "ETH-USD": other}),
+        "id-tight",
+    )
+    assert ok.allowed
+
+
+def test_quote_older_than_thirty_seconds_is_stale(tmp_path, now):
+    settings = _settings(tmp_path)
+    risk = RiskEngine(settings)
+    aged = make_quote("BTC-USD", "100", now - timedelta(seconds=31))
+    fresh = make_quote("ETH-USD", "100", now)
+    decision = risk.evaluate(
+        _buy(),
+        _ctx(settings, now, quotes={"BTC-USD": aged, "ETH-USD": fresh}),
+        "id-31",
+    )
+    assert decision.reasons == ["stale_quote"]
+
+
+def test_order_below_ten_dollars_is_rejected(tmp_path, now):
+    settings = _settings(tmp_path)
+    risk = RiskEngine(settings)
+    decision = risk.evaluate(_buy("9"), _ctx(settings, now), "id-small")
+    assert decision.reasons == ["below_min_notional"]
+
+
 def test_engine_stale_data_rejects_without_killing(tmp_path, now):
-    bot = engine(tmp_path, sma_window=3, min_hold_days=0)
+    bot = engine(tmp_path, sma_window=3)
     view = snapshot_at(now - timedelta(minutes=10), now)
     bot.run_once(now=now, snapshot=view)
     assert bot.ledger.fills_for("buy_and_hold") == []

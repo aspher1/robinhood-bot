@@ -6,7 +6,7 @@ from tests.conftest import engine, snapshot
 
 
 def test_hash_chain_verifies_and_detects_tampering(tmp_path, now):
-    bot = engine(tmp_path, sma_window=3, min_hold_days=0)
+    bot = engine(tmp_path, sma_window=3)
     bot.run_once(now=now, snapshot=snapshot(now))
     ok, detail = bot.ledger.verify_chain()
     assert ok, detail

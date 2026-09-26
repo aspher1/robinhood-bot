@@ -1,8 +1,8 @@
 """Fill prices for the paper book.
 
-Public mids are marked up by ``cost_per_side`` (default 1% per side).
-Quotes that already include a venue spread are filled at that bid or ask
-and are not marked up a second time.
+Every fill costs at least ``cost_per_side`` (hard floor 1% per side).
+Public mids are marked up by that rate. A venue bid or ask that is already
+wider is used as-is. A tighter inclusive quote is widened to the floor.
 """
 
 from __future__ import annotations
@@ -19,18 +19,22 @@ def execution_price(quote: Quote, side: str, cost_per_side: Decimal) -> Decimal:
         raise DataError(f"unknown side {side}")
     if quote.mid <= 0:
         raise DataError("mid must be positive")
+    cost = D(cost_per_side)
+    if cost < Decimal("0.01"):
+        raise DataError("cost_per_side must be at least 0.01")
+    factor = (Decimal(1) + cost) if side == "buy" else (Decimal(1) - cost)
+    if factor <= 0:
+        raise DataError("cost_per_side leaves a non-positive sell price")
+    floored = q_price(quote.mid * factor)
     if quote.spread_included:
         raw = quote.ask if side == "buy" else quote.bid
         if raw is None or raw <= 0:
             raise DataError("spread-included quote is missing a bid or ask")
-        return q_price(raw)
-    cost = D(cost_per_side)
-    if cost < 0:
-        raise DataError("cost_per_side cannot be negative")
-    factor = (Decimal(1) + cost) if side == "buy" else (Decimal(1) - cost)
-    if factor <= 0:
-        raise DataError("cost_per_side leaves a non-positive sell price")
-    return q_price(quote.mid * factor)
+        # A wider venue spread is a real cost. A tighter one is raised to the floor.
+        if side == "buy":
+            return q_price(max(raw, floored))
+        return q_price(min(raw, floored))
+    return floored
 
 
 def plan_fill(

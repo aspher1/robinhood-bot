@@ -10,7 +10,15 @@ from rhbot import __version__
 from rhbot.config import load_settings
 from rhbot.engine import Engine
 from rhbot.ledger import Ledger
-from rhbot.ops import clear_kill, engage_kill, kill_active, read_heartbeat, utcnow
+from rhbot.ops import (
+    clear_kill,
+    engage_kill,
+    kill_active,
+    read_heartbeat,
+    read_kill,
+    resume_needs_ack,
+    utcnow,
+)
 from rhbot.status import (
     assess,
     audit_verify,
@@ -53,6 +61,11 @@ def _parser() -> argparse.ArgumentParser:
     kill.set_defaults(func=cmd_kill)
 
     resume = sub.add_parser("resume", parents=[common], help="Clear the kill file when health allows it")
+    resume.add_argument(
+        "--ack",
+        action="store_true",
+        help="Required after a drawdown kill. Acknowledges the loss and rebases the peak.",
+    )
     resume.set_defaults(func=cmd_resume)
 
     flatten = sub.add_parser("flatten", parents=[common], help="Sell paper positions")
@@ -136,8 +149,25 @@ def cmd_resume(args: argparse.Namespace) -> int:
     if not kill_active(settings.state_dir):
         _emit({"ok": True, "kill_switch": False, "detail": "already_clear"})
         return 0
+    payload = read_kill(settings.state_dir)
+    needs_ack = resume_needs_ack(payload)
+    if needs_ack and not args.ack:
+        _emit(
+            {
+                "ok": False,
+                "error": "this kill requires rhbot resume --ack",
+                "ack_required": True,
+            }
+        )
+        return 2
     body = assess(settings)
     blockers = [reason for reason in body["reasons"] if reason != "kill_switch"]
+    if needs_ack:
+        # The drawdown, and the daily loss that comes with it, are what --ack accepts.
+        # The buy block still lasts until the next UTC day. Other critical checks do not.
+        blockers = [
+            reason for reason in blockers if reason not in ("drawdown_breach", "daily_loss")
+        ]
     if body["health"] == "critical" and blockers:
         _emit(
             {
@@ -147,9 +177,15 @@ def cmd_resume(args: argparse.Namespace) -> int:
             }
         )
         return 2
+    if needs_ack and (settings.state_dir / "bot.sqlite").exists():
+        ledger = Ledger(settings)
+        try:
+            ledger.rebase_peaks()
+        finally:
+            ledger.close()
     clear_kill(settings.state_dir)
-    _log_if_db(settings, "resume", {"by": "operator"})
-    _emit({"ok": True, "kill_switch": False})
+    _log_if_db(settings, "resume", {"by": "operator", "ack": bool(args.ack)})
+    _emit({"ok": True, "kill_switch": False, "ack": bool(args.ack)})
     return 0
 
 

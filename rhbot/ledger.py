@@ -11,7 +11,7 @@ from pathlib import Path
 
 from rhbot.config import Settings
 from rhbot.errors import OrderRejected
-from rhbot.models import Bar, Fill
+from rhbot.models import RISK_REDUCTION_REASONS, Bar, Fill
 from rhbot.money import D, canonical, money_str, q8
 from rhbot.ops import iso
 
@@ -274,6 +274,53 @@ class Ledger:
         for row in rows:
             total += D(row["notional"])
         return len(rows), q8(total)
+
+    def strategy_trades_today(self, day: str) -> int:
+        """Fills that count toward the global daily trade cap."""
+        placeholders = ",".join("?" for _ in RISK_REDUCTION_REASONS)
+        row = self.conn.execute(
+            f"""
+            SELECT COUNT(*) AS n FROM fills
+            WHERE substr(ts, 1, 10)=? AND reason NOT IN ({placeholders})
+            """,
+            (day, *RISK_REDUCTION_REASONS),
+        ).fetchone()
+        return int(row["n"])
+
+    def symbols_ordered_on(self, sleeve: str, day: str) -> set[str]:
+        rows = self.conn.execute(
+            "SELECT DISTINCT symbol FROM fills WHERE sleeve=? AND substr(ts, 1, 10)=?",
+            (sleeve, day),
+        ).fetchall()
+        return {str(row["symbol"]) for row in rows}
+
+    def get_fill(self, client_order_id: str) -> Fill | None:
+        row = self.conn.execute(
+            "SELECT * FROM fills WHERE client_order_id=?",
+            (client_order_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return Fill(
+            sleeve=str(row["sleeve"]),
+            symbol=str(row["symbol"]),
+            side=str(row["side"]),
+            qty=D(row["qty"]),
+            qty_delta=D(row["qty_delta"]),
+            mid=D(row["mid"]),
+            fill_price=D(row["fill_price"]),
+            cash_delta=D(row["cash_delta"]),
+            cost=D(row["cost"]),
+            notional=D(row["notional"]),
+            ts=parse_ts(str(row["ts"])),
+            client_order_id=str(row["client_order_id"]),
+            reason=str(row["reason"]),
+        )
+
+    def rebase_peaks(self) -> None:
+        """Set each sleeve's peak to its last marked equity. Used only by an acked resume."""
+        self.conn.execute("UPDATE sleeves SET peak_equity = last_equity")
+        self.conn.commit()
 
     def head_hash(self) -> str:
         row = self.conn.execute(

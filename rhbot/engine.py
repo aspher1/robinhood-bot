@@ -7,17 +7,24 @@ import signal
 import time
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 
 from rhbot.brokers.paper import PaperBroker
-from rhbot.config import Settings
+from rhbot.config import Settings, reject_live_env
 from rhbot.data.public import PublicMarketData
 from rhbot.data.robinhood import RobinhoodMarketData
 from rhbot.errors import OrderRejected
 from rhbot.ledger import Ledger
 from rhbot.models import MarketSnapshot, OrderIntent
-from rhbot.money import money_str, q8
+from rhbot.money import D, money_str, q8
 from rhbot.ops import engage_kill, iso, kill_active, sd_notify, utcnow, write_heartbeat
-from rhbot.risk import RiskContext, RiskEngine, drawdown_breach
+from rhbot.risk import (
+    RiskContext,
+    RiskEngine,
+    exposure_limit_pct,
+    kill_reason,
+    target_sell_notional,
+)
 from rhbot.strategies import build_strategies
 
 
@@ -29,6 +36,11 @@ def ensure_utc(ts: datetime) -> datetime:
 
 class Engine:
     def __init__(self, settings: Settings):
+        reject_live_env()
+        if settings.mode != "paper":
+            from rhbot.errors import ConfigError
+
+            raise ConfigError("mode must be paper")
         self.settings = settings
         self.ledger = Ledger(settings)
         self.risk = RiskEngine(settings)
@@ -97,6 +109,7 @@ class Engine:
         self._note_quotes(snapshot, market_now, wall)
         if kill_active(self.settings.state_dir):
             self.ledger.cancel_open_orders(market_now, "kill_switch")
+        self._enforce_loss_policy(market_now, snapshot)
         equities: dict[str, str] = {}
         for strategy in self.strategies:
             equity = self._run_sleeve(strategy, market_now, snapshot)
@@ -115,7 +128,13 @@ class Engine:
             "quote_source": snapshot.source,
         }
 
-    def flatten(self, now: datetime | None = None, snapshot: MarketSnapshot | None = None) -> dict:
+    def flatten(
+        self,
+        now: datetime | None = None,
+        snapshot: MarketSnapshot | None = None,
+        *,
+        reason: str = "flatten",
+    ) -> dict:
         market_now = ensure_utc(now or utcnow())
         if snapshot is None:
             snapshot = self.load_market()
@@ -127,7 +146,7 @@ class Engine:
             self.ledger.ensure_sleeve(strategy.name, market_now, strategy.initial_state())
             sleeve_fills = []
             for symbol, qty in list(self.ledger.positions(strategy.name).items()):
-                intent = OrderIntent(symbol, "sell", "flatten", base_quantity=qty)
+                intent = OrderIntent(symbol, "sell", reason, base_quantity=qty)
                 client_order_id = self._client_id(strategy.name, intent, market_now)
                 try:
                     fill = self.broker.submit(
@@ -224,17 +243,7 @@ class Engine:
     def _run_sleeve(self, strategy, market_now: datetime, snapshot: MarketSnapshot):
         self.ledger.ensure_sleeve(strategy.name, market_now, strategy.initial_state())
         equity = self.mark(strategy.name, snapshot)
-        day_start, peak = self.ledger.mark_equity(strategy.name, equity, market_now)
-        if not kill_active(self.settings.state_dir):
-            breach = drawdown_breach(equity, peak, day_start, self.settings)
-            if breach:
-                engage_kill(self.settings.state_dir, breach, "risk")
-                self.ledger.log_event(
-                    "kill",
-                    {"reason": breach, "by": "risk", "sleeve": strategy.name},
-                    market_now,
-                )
-                self.ledger.cancel_open_orders(market_now, "drawdown")
+        self.ledger.mark_equity(strategy.name, equity, market_now)
         state = self.ledger.strategy_state(strategy.name) or strategy.initial_state()
         positions = self.ledger.positions(strategy.name)
         cash = self.ledger.cash(strategy.name)
@@ -281,12 +290,7 @@ class Engine:
                     market_now,
                 )
                 if exc.kill:
-                    engage_kill(self.settings.state_dir, exc.reasons[0], "risk")
-                    self.ledger.log_event(
-                        "kill",
-                        {"reason": exc.reasons[0], "by": "risk", "sleeve": strategy.name},
-                        market_now,
-                    )
+                    self._trip_drawdown(exc.reasons[0], market_now, snapshot, strategy.name)
                 continue
             filled.append(fill)
         positions = self.ledger.positions(strategy.name)
@@ -301,7 +305,7 @@ class Engine:
     def _context(self, sleeve: str, snapshot: MarketSnapshot, market_now: datetime) -> RiskContext:
         row = self.ledger.sleeve_row(sleeve)
         day = market_now.date().isoformat()
-        trades, turnover = self.ledger.activity_today(sleeve, day)
+        _fills, turnover = self.ledger.activity_today(sleeve, day)
         return RiskContext(
             now=market_now,
             sleeve=sleeve,
@@ -311,10 +315,119 @@ class Engine:
             quotes=snapshot.quotes,
             day_start_equity=q8(row["day_start_equity"]),
             peak_equity=q8(row["peak_equity"]),
-            trades_today=trades,
+            trades_today=self.ledger.strategy_trades_today(day),
             turnover_today=turnover,
             known_client_ids=self.ledger.known_client_ids(),
+            ordered_symbols_today=self.ledger.symbols_ordered_on(sleeve, day),
         )
+
+    def _enforce_loss_policy(self, market_now: datetime, snapshot: MarketSnapshot) -> None:
+        """10% drawdown kills and flattens. 5% and 7.5% sell the book down."""
+        for strategy in self.strategies:
+            self.ledger.ensure_sleeve(strategy.name, market_now, strategy.initial_state())
+            equity = self.mark(strategy.name, snapshot)
+            _day_start, peak = self.ledger.mark_equity(strategy.name, equity, market_now)
+            reason = kill_reason(equity, peak, self.settings)
+            if reason:
+                self._trip_drawdown(reason, market_now, snapshot, strategy.name)
+                return
+        if kill_active(self.settings.state_dir):
+            return
+        for strategy in self.strategies:
+            equity = self.mark(strategy.name, snapshot)
+            peak = D(self.ledger.sleeve_row(strategy.name)["peak_equity"])
+            cap = exposure_limit_pct(self.settings, equity, peak)
+            if cap < self.settings.max_total_exposure_pct:
+                self._sell_down(strategy.name, snapshot, market_now, cap)
+
+    def _trip_drawdown(
+        self,
+        reason: str,
+        market_now: datetime,
+        snapshot: MarketSnapshot,
+        sleeve: str,
+    ) -> None:
+        already = kill_active(self.settings.state_dir)
+        engage_kill(self.settings.state_dir, reason, "risk", ack_required=True)
+        if not already:
+            self.ledger.log_event(
+                "kill",
+                {"reason": reason, "by": "risk", "sleeve": sleeve, "ack_required": True},
+                market_now,
+            )
+            self.ledger.cancel_open_orders(market_now, "drawdown")
+        held = any(self.ledger.positions(strategy.name) for strategy in self.strategies)
+        if held:
+            self.flatten(now=market_now, snapshot=snapshot, reason="drawdown_flatten")
+
+    def _sell_down(
+        self,
+        sleeve: str,
+        snapshot: MarketSnapshot,
+        market_now: datetime,
+        cap_pct,
+    ) -> None:
+        positions = self.ledger.positions(sleeve)
+        if not positions:
+            return
+        mids = {}
+        total = Decimal(0)
+        for symbol, qty in positions.items():
+            quote = snapshot.quotes.get(symbol)
+            if quote is None or quote.mid <= 0:
+                return
+            mids[symbol] = quote.mid
+            total += qty * quote.mid
+        equity = self.ledger.cash(sleeve) + total
+        sell_notional = target_sell_notional(
+            total, equity, cap_pct, self.settings.cost_per_side
+        )
+        if sell_notional <= 0 or total <= 0:
+            return
+        sold = False
+        for symbol, qty in list(positions.items()):
+            value = qty * mids[symbol]
+            portion = sell_notional * (value / total)
+            sell_qty = q8(portion / mids[symbol])
+            if sell_qty <= 0:
+                continue
+            if sell_qty > qty:
+                sell_qty = qty
+            if (
+                q8(sell_qty * mids[symbol]) < self.settings.min_order_notional
+                and sell_qty < qty
+            ):
+                continue
+            intent = OrderIntent(symbol, "sell", "exposure_cut", base_quantity=sell_qty)
+            try:
+                self.broker.submit(
+                    sleeve,
+                    intent,
+                    self._client_id(sleeve, intent, market_now),
+                    self._context(sleeve, snapshot, market_now),
+                    market_now,
+                    reduce_only=True,
+                )
+            except OrderRejected as exc:
+                self.ledger.bump("error_risk_reject")
+                self.ledger.log_event(
+                    "risk_reject",
+                    {
+                        "sleeve": sleeve,
+                        "symbol": symbol,
+                        "side": "sell",
+                        "reasons": exc.reasons,
+                    },
+                    market_now,
+                )
+                continue
+            sold = True
+        if sold:
+            self.ledger.log_event(
+                "exposure_cut",
+                {"sleeve": sleeve, "cap_pct": format(cap_pct, "f")},
+                market_now,
+            )
 
     def _require_quotes(self, snapshot: MarketSnapshot) -> None:
         missing = [symbol for symbol in self.settings.symbols if symbol not in snapshot.quotes]

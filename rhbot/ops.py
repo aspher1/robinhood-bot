@@ -74,15 +74,39 @@ def atomic_write(path: Path, text: str) -> None:
     tmp.replace(path)
 
 
-def engage_kill(state_dir: Path, reason: str, by: str) -> dict:
-    """Create the kill file if it is not already there. The first reason wins."""
-    existing = read_kill(state_dir)
+def engage_kill(state_dir: Path, reason: str, by: str, *, ack_required: bool = False) -> dict:
+    """Create the kill file if it is not already there. The first reason wins.
+
+    A drawdown kill passes ``ack_required``. If a kill file is already present,
+    that flag is upgraded to true. The file is never cleared here.
+    """
     path = kill_path(state_dir)
-    if path.exists() and existing and existing.get("reason"):
+    if path.exists():
+        existing = read_kill(state_dir) or {}
+        if existing.get("by") == "unknown" or not existing.get("reason"):
+            return existing
+        if ack_required and not existing.get("ack_required"):
+            existing["ack_required"] = True
+            existing["drawdown_reason"] = reason
+            atomic_write(path, json.dumps(existing, sort_keys=True))
         return existing
-    payload = {"reason": reason, "by": by, "at": iso(utcnow())}
+    payload = {
+        "ack_required": bool(ack_required),
+        "at": iso(utcnow()),
+        "by": by,
+        "reason": reason,
+    }
     atomic_write(path, json.dumps(payload, sort_keys=True))
     return payload
+
+
+def resume_needs_ack(payload: dict | None) -> bool:
+    """A drawdown kill, or a kill file we cannot read, needs ``rhbot resume --ack``."""
+    if not payload:
+        return True
+    if payload.get("by") == "unknown":
+        return True
+    return bool(payload.get("ack_required"))
 
 
 def clear_kill(state_dir: Path) -> bool:
