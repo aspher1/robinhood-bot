@@ -202,9 +202,8 @@ def test_f001_kill_flattens_one_book_and_resume_needs_human_code(tmp_path, monke
     bot.run_once(now=buy_at, snapshot=buy_view)
     peak = bot.ledger.overlay_row("trend_daily")["peak"]
     bot.run_once(now=wall, snapshot=snapshot(wall, mid="10"))
-    kill = read_kill(tmp_path)
-    assert kill is not None and kill["ack_required"] is True
-    assert (tmp_path / "KILL").exists()
+    assert read_kill(tmp_path) is None
+    assert not (tmp_path / "KILL").exists()
     assert bot.ledger.overlay_row("trend_daily")["state"] == "KILLED"
     assert bot.ledger.positions("trend_daily") == {}
     assert bot.ledger.positions("buy_and_hold") == held_bh
@@ -233,7 +232,7 @@ def test_f001_kill_flattens_one_book_and_resume_needs_human_code(tmp_path, monke
     secret.write_text("resume-ok\n", encoding="utf-8")
     monkeypatch.setenv("RHBOT_HUMAN_RESUME_FILE", str(secret))
     assert main(["resume", "--ack", "--human-code", "nope", "--state-dir", str(tmp_path)]) == 2
-    assert (tmp_path / "KILL").exists()
+    assert not (tmp_path / "KILL").exists()
     assert main(["resume", "--ack", "--human-code", "resume-ok", "--state-dir", str(tmp_path)]) == 0
     assert not (tmp_path / "KILL").exists()
 
@@ -259,11 +258,69 @@ def test_f001_kill_flattens_one_book_and_resume_needs_human_code(tmp_path, monke
     again = recovered + timedelta(days=1)
     _set_cash(bot, "trend_daily", money_str(D(peak) * Decimal("0.59")))
     bot.run_once(now=again, snapshot=snapshot(again, mid="10"))
-    assert read_kill(tmp_path) is not None
+    assert read_kill(tmp_path) is None
     assert bot.ledger.overlay_row("trend_daily")["state"] == "KILLED"
     assert bot.ledger.overlay_row("trend_daily")["peak"] == peak
     assert bot.ledger.get_meta("portfolio_peak") == portfolio_peak
     assert bot.ledger.sleeve_row("trend_daily")["peak_equity"] == sleeve_peaks["trend_daily"]
+    bot.ledger.close()
+
+
+def test_f023_one_book_kill_does_not_block_the_other(tmp_path, monkeypatch):
+    wall = datetime.now(UTC).replace(microsecond=0)
+    opened = wall - timedelta(days=2)
+    buy_at = wall - timedelta(days=1)
+    bot = engine(tmp_path, sma_window=200)
+    bot.run_once(now=opened, snapshot=snapshot(opened))
+    held_bh = dict(bot.ledger.positions("buy_and_hold"))
+    bot.broker.submit(
+        "trend_daily",
+        OrderIntent("BTC-USD", "buy", "trend_entry", quote_amount=Decimal("500")),
+        f"trend_daily:BTC-USD:buy:{buy_at.date().isoformat()}",
+        bot._context("trend_daily", snapshot(buy_at), buy_at),
+        buy_at,
+    )
+    view = snapshot(wall, mid="10")
+    bot.run_once(now=wall, snapshot=view)
+    assert bot.ledger.overlay_row("trend_daily")["state"] == "KILLED"
+    assert bot.ledger.positions("trend_daily") == {}
+    assert bot.ledger.positions("buy_and_hold") == held_bh
+    assert bot.ledger.overlay_row("dca_weekly")["state"] != "KILLED"
+    assert read_kill(tmp_path) is None
+    with pytest.raises(OrderRejected) as caught:
+        bot.broker.submit(
+            "trend_daily",
+            OrderIntent("ETH-USD", "buy", "after_kill", quote_amount=Decimal("20")),
+            "trend_daily:ETH-USD:buy:after-kill",
+            bot._context("trend_daily", view, wall),
+            wall,
+        )
+    assert caught.value.reasons == ["killed"]
+    bought = bot.broker.submit(
+        "dca_weekly",
+        OrderIntent("ETH-USD", "buy", "dca_buy", quote_amount=Decimal("19.23")),
+        "dca_weekly:ETH-USD:buy:while-trend-killed",
+        bot._context("dca_weekly", view, wall),
+        wall,
+    )
+    assert bought.reason == "dca_buy"
+    assert "ETH-USD" in bot.ledger.positions("dca_weekly")
+    bot.ledger.close()
+
+    from rhbot.cli import main
+
+    assert main(["resume", "--state-dir", str(tmp_path)]) == 2
+    assert main(["resume", "--ack", "--state-dir", str(tmp_path)]) == 2
+    secret = tmp_path / "human-code"
+    secret.write_text("resume-ok\n", encoding="utf-8")
+    monkeypatch.setenv("RHBOT_HUMAN_RESUME_FILE", str(secret))
+    assert main(["resume", "--ack", "--human-code", "nope", "--state-dir", str(tmp_path)]) == 2
+    assert main(["resume", "--ack", "--human-code", "resume-ok", "--state-dir", str(tmp_path)]) == 0
+    bot = engine(tmp_path, sma_window=200)
+    assert bot.ledger.overlay_row("trend_daily")["state"] == "KILLED"
+    assert bot.ledger.overlay_row("trend_daily")["kill_acked_peak"]
+    assert bot.ledger.overlay_row("dca_weekly")["state"] != "KILLED"
+    assert bot.ledger.positions("buy_and_hold") == held_bh
     bot.ledger.close()
 
 

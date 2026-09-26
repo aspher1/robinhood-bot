@@ -64,14 +64,14 @@ Drawdown is mark-to-bid equity divided by that book's running peak, minus one. I
 | Drawdown from that book's peak | What the engine does |
 | --- | --- |
 | 10% (`freeze_drawdown_pct`) | Sets that book to FROZEN, logs `freeze_trip`, and blocks its new buys until `rhbot ack-drawdown --strategy <name> --by operator|randy --note "..."`. Exits stay allowed. Nothing is force-sold. |
-| 40% (`kill_drawdown_pct`) | Writes `state/KILL` with `ack_required`, logs a `kill_trip`, and flattens that book. Resume does not move the peak. The same flattened mark does not kill again. After drawdown recovers above −40%, the next cross of that original peak does. |
+| 40% (`kill_drawdown_pct`) | Sets that book to KILLED, logs a `kill_trip`, and flattens that book only. It does not write the process-wide `state/KILL`, so the other book is not blocked. Human resume is still required for the killed book. Resume does not move the peak. The same flattened mark does not kill again. After drawdown recovers above −40%, the next cross of that original peak does. |
 
 There is no 5% or 7.5% exposure cut. A 4% loss versus the UTC day-start equity still blocks new buys in that sleeve until the next UTC day. It does not freeze, kill, or sell. The engine never clears `state/KILL`. Drawdown uses mark-to-bid equity against that book's own peak.
 
 The two acknowledgements are not interchangeable:
 
 - The AI operator may acknowledge a **10% freeze** with `rhbot ack-drawdown --strategy <name> --by operator|randy --note "..."`. The audit event is `freeze_ack`. `rhbot status` and `rhbot report` include the book's state, drawdown, peak, last trip, last ack, and ack delay. The command does not move the peak. After it, buys are allowed while drawdown is still at or below −10%. The book returns to ARMED only after drawdown recovers above −10%. The next crossing freezes again.
-- A **40% kill** is human-only. Automation may trip it and must never clear it. The only clear path is `rhbot resume --ack --human-code <code>`, and the code must match `RHBOT_HUMAN_RESUME_FILE`. That acknowledgement does not move the book's peak. Resume records the current peak on the killed book so the same episode does not flatten again. It does not add cash. The operator must not run it. `ack-drawdown` does not clear `state/KILL`.
+- A **40% kill** is human-only and stays on that book. Automation may trip it and must never clear it. It does not create the process-wide `state/KILL` file, so the other overlay book can still trade. The only clear path is `rhbot resume --ack --human-code <code>`, and the code must match `RHBOT_HUMAN_RESUME_FILE`. That acknowledgement does not move the book's peak. Resume records the current peak on the killed book so the same episode does not flatten again. It does not add cash. The operator must not run it. `ack-drawdown` does not clear a kill. A manual `rhbot kill` still writes `state/KILL` and blocks every book.
 
 Other critical health problems still block resume.
 

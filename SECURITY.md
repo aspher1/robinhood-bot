@@ -25,7 +25,7 @@ A FROZEN strategy book blocks that book's new buys, including a due DCA buy. Sel
 Drawdown is mark-to-bid equity divided by that book's running peak, minus one. These limits are paper-only and must not be carried into any live phase. The hard caps are `freeze_drawdown_pct` (0.10) and `kill_drawdown_pct` (0.40). Config may only tighten them, and the freeze must stay below the kill.
 
 - −10% sets that book to FROZEN and does not sell. The operator may acknowledge it. That acknowledgement does not move the peak.
-- −40% writes `state/KILL` with `ack_required` and flattens that book. This kill is human-only.
+- −40% sets that book to KILLED and flattens it. It does not write the process-wide `state/KILL`, so the other book is not blocked. This kill is human-only: `rhbot resume --ack --human-code`. A manual `rhbot kill` still writes `state/KILL` and blocks every book.
 
 Clearing that kill takes `rhbot resume --ack --human-code <code>`. The code must match the secret in `RHBOT_HUMAN_RESUME_FILE`. Without it the command exits 2. Resume does not move the peak. Automation may trip a kill and cannot clear it. The operator must not run that resume for a drawdown kill. A manual `rhbot kill` can be cleared with `rhbot resume` once health is otherwise fine. Resume still refuses while some other health check is critical. `ack-drawdown` does not clear a kill. Alerts stay in the status and heartbeat JSON. There is no email, SMS, or webhook.
 

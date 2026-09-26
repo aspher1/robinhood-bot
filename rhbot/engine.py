@@ -20,7 +20,6 @@ from rhbot.overlay import OVERLAY_BOOKS, SHADOW_NAMES, mark_to_bid_equity, signe
 from rhbot.pricing import plan_fill
 from rhbot.ops import (
     engage_freeze,
-    engage_kill,
     freeze_active,
     iso,
     kill_active,
@@ -255,6 +254,7 @@ class Engine:
         kill = read_kill(self.settings.state_dir)
         worst_dd = Decimal(0)
         peak_equity = None
+        book_resume = False
         for name in OVERLAY_BOOKS:
             row = self.ledger.overlay_row(name)
             if row is None:
@@ -263,13 +263,15 @@ class Engine:
             if peak_equity is None or dd < worst_dd:
                 worst_dd = dd
                 peak_equity = str(row["peak"])
+            if str(row["state"]) == "KILLED" and not str(row["kill_acked_peak"] or ""):
+                book_resume = True
         return {
             "kill_switch": kill is not None,
             "buy_pause": buy_pause,
             "drawdown_freeze": buy_pause,
             "peak_equity": peak_equity,
             "drawdown_pct": format(q8(worst_dd), "f"),
-            "ack_required": (kill is not None and resume_needs_ack(kill)) or buy_pause,
+            "ack_required": (kill is not None and resume_needs_ack(kill)) or book_resume or buy_pause,
             "rearm_eligible": (not buy_pause) and worst_dd > -self.settings.freeze_drawdown_pct,
             "overlay": self._overlay_public(),
             "last_decision_at": self.ledger.get_meta("last_decision_at"),
@@ -568,10 +570,12 @@ class Engine:
                     self.ledger.save_overlay(name, fields)
                 continue
             if state == "KILLED":
-                # The flattened mark does not kill again. Once drawdown is back
-                # above −40% of the original peak, a later cross can.
+                # Human resume records the peak. Until then the book stays
+                # killed even if the mark recovers. One book's kill does not
+                # write the process-wide kill file.
                 recovered = (
-                    not kill_active(self.settings.state_dir)
+                    bool(acked)
+                    and not kill_active(self.settings.state_dir)
                     and dd > -self.settings.kill_drawdown_pct
                 )
                 if not recovered:
@@ -661,7 +665,6 @@ class Engine:
             },
         )
         reason = f"max_drawdown {observed} <= -{self.settings.kill_drawdown_pct}"
-        engage_kill(self.settings.state_dir, reason, "risk", ack_required=True)
         self.ledger.record_risk_event(
             "kill_trip",
             market_now,

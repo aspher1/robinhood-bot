@@ -168,13 +168,35 @@ def cmd_kill(args: argparse.Namespace) -> int:
     return 0
 
 
+def _books_awaiting_human_resume(settings) -> list[str]:
+    """Overlay books flattened by their own −40% kill and not yet human-acked."""
+    if not (settings.state_dir / "bot.sqlite").exists():
+        return []
+    from rhbot.overlay import OVERLAY_BOOKS
+
+    ledger = Ledger(settings)
+    try:
+        waiting = []
+        for name in OVERLAY_BOOKS:
+            row = ledger.overlay_row(name)
+            if row is None:
+                continue
+            if str(row["state"]) == "KILLED" and not str(row["kill_acked_peak"] or ""):
+                waiting.append(name)
+        return waiting
+    finally:
+        ledger.close()
+
+
 def cmd_resume(args: argparse.Namespace) -> int:
     settings = load_settings(args.config, args.state_dir)
-    if not kill_active(settings.state_dir):
+    global_on = kill_active(settings.state_dir)
+    waiting = _books_awaiting_human_resume(settings)
+    if not global_on and not waiting:
         _emit({"ok": True, "kill_switch": False, "detail": "already_clear"})
         return 0
-    payload = read_kill(settings.state_dir)
-    needs_ack = resume_needs_ack(payload)
+    payload = read_kill(settings.state_dir) if global_on else None
+    needs_ack = bool(waiting) or (global_on and resume_needs_ack(payload))
     if needs_ack and not args.ack:
         _emit(
             {
@@ -226,7 +248,8 @@ def cmd_resume(args: argparse.Namespace) -> int:
                     ledger.save_overlay(name, {"kill_acked_peak": str(row["peak"])})
         finally:
             ledger.close()
-    clear_kill(settings.state_dir)
+    if global_on:
+        clear_kill(settings.state_dir)
     actor = "human" if args.ack else "operator"
     _log_if_db(
         settings,

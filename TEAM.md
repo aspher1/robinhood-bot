@@ -37,7 +37,7 @@ Drawdown is mark-to-bid equity against that book's own peak, for trend and DCA o
 Two different controls, two different actors:
 
 - **−10% freeze.** The engine sets that book to FROZEN and blocks its new buys, including a due DCA buy. Sells stay allowed and nothing is force-sold. The AI operator may acknowledge it with `rhbot ack-drawdown --strategy <name> --by operator|randy --note "..."`. That acknowledgement is an audit event. It does not move the peak. Buys are allowed again while drawdown is still at or below −10%. The book re-arms only after drawdown recovers above −10%.
-- **−40% hard kill.** The engine writes `state/KILL` and flattens that book. Automation may trip that kill and must never clear it. Clearing it is human-only: `rhbot resume --ack --human-code <code>`, matching `RHBOT_HUMAN_RESUME_FILE`. That acknowledgement does not move the peak. The operator does not run that command. `ack-drawdown` does not clear a kill.
+- **−40% hard kill.** The engine sets that book to KILLED and flattens it. The other book is not blocked. Automation may trip that kill and must never clear it. Clearing it is human-only: `rhbot resume --ack --human-code <code>`, matching `RHBOT_HUMAN_RESUME_FILE`. That acknowledgement does not move the peak. The operator does not run that command. `ack-drawdown` does not clear a kill. A manual `rhbot kill` still stops every book.
 
 A 4% loss on the UTC day blocks new buys until the next UTC day. Buy-and-hold has no overlay, so a freeze or kill does not flatten it.
 

@@ -243,7 +243,9 @@ def assess(settings: Settings, now: datetime | None = None) -> dict:
         "buy_pause": freeze_alert,
         "peak_equity": _worst_peak(overlay_view),
         "drawdown_pct": _worst_dd(overlay_view),
-        "ack_required": (kill is not None and resume_needs_ack(kill)) or freeze_alert,
+        "ack_required": (kill is not None and resume_needs_ack(kill))
+        or any(bool(item.get("resume_pending")) for item in overlay_view.values())
+        or freeze_alert,
         "rearm_eligible": not freeze_alert and _all_above_freeze(overlay_view, settings),
         "overlay": overlay_view,
         "kill_reason": None if kill is None else kill.get("reason"),
@@ -316,6 +318,7 @@ def _overlay_view(ledger: Ledger, now: datetime) -> dict:
             "shadow": shadow_name,
             "shadow_equity": shadow_equity,
             "overlay_impact": impact,
+            "resume_pending": str(row["state"]) == "KILLED" and not str(row["kill_acked_peak"] or ""),
         }
     del now
     return out

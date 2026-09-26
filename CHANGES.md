@@ -38,6 +38,12 @@ F-021: `shadow_strategy_trades_today(sleeve, day)` counts one shadow book. The c
 
 F-022: a risk-reduction sell's client order id includes its reason (`drawdown_flatten`, `flatten`, or `exposure_cut`). Returning an earlier fill is allowed only when the reason matches. After a 40% kill, that book's positions must be empty or the cycle raises. A same-day `trend_exit` is not reused as the flatten.
 
+### Audit iteration 5
+
+Already closed on this branch after `50fead7` (the audited head): F-022 (risk-reduction sells use their own client id and a leftover position fails closed), F-003 (2 trades/day per book), F-002 item 5 (`dca_weekly` buys one coin at $19.23, BTC then ETH), F-021 (shadow trade cap is per book).
+
+F-023: a −40% trip sets that book to KILLED and flattens it. It does not write `state/KILL`, so the other overlay book is not blocked by the file. Buy-and-hold is untouched. `rhbot resume --ack --human-code` is still required before that book can leave the kill.
+
 Not done, optional: F-015 through F-019.
 
 ### Left open
