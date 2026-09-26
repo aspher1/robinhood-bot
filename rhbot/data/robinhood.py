@@ -1,22 +1,13 @@
-"""Optional read-only Robinhood quote adapter.
+"""Read-only Robinhood quote parser. Not a v1 paper quote source.
 
-Not used unless ``market_data`` is ``robinhood`` and both environment
-variables are set:
+v1 paper marks, fills, and the spread cap use Coinbase public bid/ask.
+This module is not selected by the engine. A missing key does not fall
+back, and a present key does not replace Coinbase. Nothing here stores
+``RH_API_KEY`` or ``RH_PRIVATE_KEY_BASE64``.
 
-- ``RH_API_KEY``
-- ``RH_PRIVATE_KEY_BASE64`` (base64 of the 32-byte Ed25519 seed)
-
-The variables are read from the environment only. Nothing in this repo
-stores them. Leave them unset and the bot uses public prices.
-
-This client signs GET requests for best bid/ask only, at most 100 times
-per minute. A key that was created with trade permission still cannot
-trade through this code: non-GET methods are refused, and any other path
-is refused. Create the key as read-only anyway.
-
-When a quote is used, buys fill at ``ask_inclusive_of_buy_spread`` and
-sells at ``bid_inclusive_of_sell_spread``. The configurable 1% cost is
-not added again.
+The client still only signs GET requests for best bid/ask, at most 100
+times per minute. Non-GET methods and any other path are refused. The
+paper engine does not call it.
 """
 
 from __future__ import annotations

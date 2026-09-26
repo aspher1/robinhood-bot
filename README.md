@@ -2,7 +2,7 @@
 
 A paper-only bot for BTC and ETH. It pretends to trade so you can see whether a slow rule beats just holding, after a realistic cost. It cannot place, change, or cancel a real Robinhood order. There is no code path that does that.
 
-You do not need an API key. Prices come from Coinbase's public market data (Kraken is the other built-in source). Every simulated buy and sell pays 1% by default, which is about what a small Robinhood crypto account pays per side. Each strategy has its own $1,000 paper account, so they can be compared on the same footing.
+You do not need an API key. Marks, fills, and the spread cap use Coinbase's public bid/ask. Kraken is diagnostic only. Every simulated buy and sell pays 1% by default, which is about what a small Robinhood crypto account pays per side. Each strategy has its own $1,000 paper account, so they can be compared on the same footing.
 
 ## What it trades
 
@@ -87,20 +87,11 @@ rhbot audit replay --since 7d --state-dir state
 
 Who is allowed to run which command is in `TEAM.md`. How the pieces fit is in `ARCHITECTURE.md`.
 
-## Optional Robinhood quotes
+## Quotes
 
-Leave this off for v1. Public prices plus the 1% cost are enough.
+v1 paper uses Coinbase public bid/ask. Set `market_data: public` and `public_provider: coinbase`. If that quote is missing, 30 seconds old or older, or has no bid or ask, new orders are denied and health goes critical. The bot does not fall back to Robinhood or Kraken. A reduce_only kill or flatten sell can still use the last valid bid/ask.
 
-If you later want Robinhood's own bid and ask, create a **read-only** key in Robinhood (web classic, crypto API settings) and export it only in the environment, never in the repo:
-
-```bash
-export RH_API_KEY='rh-api-...'
-export RH_PRIVATE_KEY_BASE64='base64 of the 32-byte Ed25519 seed'
-```
-
-Then set `market_data: robinhood` in `config.yaml`. The bot will GET best bid/ask, sign the request, and stay under 100 calls a minute. Buys fill at the ask and sells at the bid, and the price is widened if that spread is tighter than the 1% floor. Daily candles still come from the public source, because Robinhood does not publish them. If those variables are unset, the bot keeps using public prices.
-
-The quote client cannot place an order. A key that was created with trade permission still cannot trade through this program. Create it read-only anyway.
+Kraken parsers are diagnostic only. They do not price marks, fills, or the spread cap.
 
 ## Tests
 

@@ -5,16 +5,16 @@ from __future__ import annotations
 import json
 import signal
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 
 from rhbot.brokers.paper import PaperBroker
 from rhbot.config import Settings, frozen_params_hash, reject_live_env
 from rhbot.data.public import PublicMarketData
-from rhbot.data.robinhood import RobinhoodMarketData
 from rhbot.errors import DataError, OrderRejected
-from rhbot.ledger import Ledger
-from rhbot.models import RISK_REDUCTION_REASONS, Fill, MarketSnapshot, OrderIntent
+from rhbot.ledger import Ledger, parse_ts
+from rhbot.models import RISK_REDUCTION_REASONS, Fill, MarketSnapshot, OrderIntent, Quote
 from rhbot.money import D, money_str, q8
 from rhbot.overlay import OVERLAY_BOOKS, SHADOW_NAMES, mark_to_bid_equity, signed_drawdown
 from rhbot.pricing import plan_fill
@@ -75,19 +75,11 @@ class Engine:
         self.risk = RiskEngine(settings)
         self.broker = PaperBroker(settings, self.ledger, self.risk)
         self.strategies = build_strategies(settings)
-        self.public = PublicMarketData(settings.public_provider)
-        self.quotes = self._select_quotes()
-
-    def _select_quotes(self):
-        if self.settings.market_data == "robinhood":
-            robinhood = RobinhoodMarketData.from_env()
-            if robinhood is not None:
-                self.ledger.set_meta("quote_source", "robinhood")
-                return robinhood
-            self.ledger.set_meta("quote_source", "public_fallback")
-            return self.public
-        self.ledger.set_meta("quote_source", self.settings.public_provider)
-        return self.public
+        # v1 paper marks, fills, and the spread cap use Coinbase public bid/ask.
+        # Kraken stays diagnostic. There is no Robinhood fallback.
+        self.public = PublicMarketData("coinbase")
+        self.quotes = self.public
+        self.ledger.set_meta("quote_source", "coinbase")
 
     def run_once(self, now: datetime | None = None, snapshot: MarketSnapshot | None = None) -> dict:
         market_now = ensure_utc(now or utcnow())
@@ -111,7 +103,7 @@ class Engine:
             write_heartbeat(self.settings.state_dir, self.heartbeat_body())
 
     def load_market(self) -> MarketSnapshot:
-        provider = self.settings.public_provider
+        provider = "coinbase"
         bars: dict = {}
         try:
             for symbol in self.settings.symbols:
@@ -134,8 +126,9 @@ class Engine:
         return MarketSnapshot(bars=bars, quotes=quotes, source=getattr(self.quotes, "name", provider))
 
     def cycle(self, market_now: datetime, wall: datetime, snapshot: MarketSnapshot) -> dict:
-        self._require_quotes(snapshot)
+        snapshot = self._drop_unapproved_sources(snapshot)
         self._note_quotes(snapshot, market_now, wall)
+        self._require_quotes(snapshot)
         self._store_closed_bars(snapshot, market_now)
         self._stamp_frozen_params(market_now)
         if kill_active(self.settings.state_dir):
@@ -178,8 +171,9 @@ class Engine:
         market_now = ensure_utc(now or utcnow())
         if snapshot is None:
             snapshot = self.load_market()
-        self._require_quotes(snapshot)
+        snapshot = self._drop_unapproved_sources(snapshot)
         self._note_quotes(snapshot, market_now, utcnow())
+        priced = self._quotes_for_reduce_only(snapshot, market_now)
         fills_out = []
         errors = []
         for strategy in self.strategies:
@@ -194,7 +188,7 @@ class Engine:
                         strategy.name,
                         intent,
                         client_order_id,
-                        self._context(strategy.name, snapshot, market_now),
+                        self._context(strategy.name, priced, market_now),
                         market_now,
                         reduce_only=True,
                     )
@@ -216,7 +210,7 @@ class Engine:
             self.ledger.save_strategy_state(
                 strategy.name, strategy.commit(state, sleeve_fills, positions, market_now)
             )
-            equity = self.mark(strategy.name, snapshot)
+            equity = self.mark(strategy.name, priced)
             self.ledger.mark_equity(strategy.name, equity, market_now)
             self.ledger.snapshot(strategy.name, equity, market_now)
         self.ledger.log_event(
@@ -817,6 +811,7 @@ class Engine:
 
     def _flatten_book(self, name: str, market_now: datetime, snapshot: MarketSnapshot) -> bool:
         errors: list[str] = []
+        priced = self._quotes_for_reduce_only(snapshot, market_now)
         for symbol, qty in list(self.ledger.positions(name).items()):
             intent = OrderIntent(symbol, "sell", "drawdown_flatten", base_quantity=qty)
             client_order_id = self._client_id(name, intent, market_now)
@@ -825,7 +820,7 @@ class Engine:
                     name,
                     intent,
                     client_order_id,
-                    self._context(name, snapshot, market_now),
+                    self._context(name, priced, market_now),
                     market_now,
                     reduce_only=True,
                 )
@@ -834,7 +829,7 @@ class Engine:
                 continue
             if fill.reason != intent.reason:
                 errors.append(f"{symbol}: reused {fill.reason} fill {fill.client_order_id}")
-        equity = self.mark(name, snapshot)
+        equity = self.mark(name, priced)
         self.ledger.mark_equity(name, equity, market_now)
         remaining = {
             symbol: qty
@@ -862,26 +857,133 @@ class Engine:
             return False
         return True
 
+    def _drop_unapproved_sources(self, snapshot: MarketSnapshot) -> MarketSnapshot:
+        """Kraken and Robinhood are not v1 paper quote sources."""
+        quotes = {
+            symbol: quote
+            for symbol, quote in snapshot.quotes.items()
+            if quote.source not in ("kraken", "robinhood")
+        }
+        if len(quotes) == len(snapshot.quotes):
+            return snapshot
+        return MarketSnapshot(bars=snapshot.bars, quotes=quotes, source="coinbase")
+
+    def _quote_problem(self, quote: Quote | None, now: datetime) -> str | None:
+        if quote is None or quote.source in ("kraken", "robinhood"):
+            return "missing_quote"
+        if not quote.ts_trusted or quote.ts.tzinfo is None or now.tzinfo is None:
+            return "stale_quote"
+        age = (now - quote.ts).total_seconds()
+        if age < -5 or age >= self.settings.max_quote_age_seconds:
+            return "stale_quote"
+        if quote.bid is None or quote.ask is None:
+            return "missing_bid_ask"
+        return None
+
+    def _first_quote_problem(self, snapshot: MarketSnapshot, now: datetime) -> str | None:
+        problem = None
+        for symbol in self.settings.symbols:
+            hit = self._quote_problem(snapshot.quotes.get(symbol), now)
+            if hit is not None and problem is None:
+                problem = hit
+        return problem
+
+    def _remember_valid_quotes(self, snapshot: MarketSnapshot, now: datetime) -> None:
+        stored = self._load_last_valid_quotes()
+        changed = False
+        for symbol, quote in snapshot.quotes.items():
+            if quote.allow_stale or quote.source in ("kraken", "robinhood"):
+                continue
+            if self._quote_problem(quote, now) is not None:
+                continue
+            stored[symbol] = quote
+            changed = True
+        if changed:
+            self._save_last_valid_quotes(stored)
+
+    def _save_last_valid_quotes(self, quotes: dict[str, Quote]) -> None:
+        payload = {
+            symbol: {
+                "ts": iso(quote.ts),
+                "mid": format(quote.mid, "f"),
+                "bid": format(quote.bid, "f"),
+                "ask": format(quote.ask, "f"),
+                "source": quote.source,
+                "spread_included": bool(quote.spread_included),
+            }
+            for symbol, quote in sorted(quotes.items())
+        }
+        self.ledger.set_meta("last_valid_quotes", json.dumps(payload, sort_keys=True))
+
+    def _load_last_valid_quotes(self) -> dict[str, Quote]:
+        raw = self.ledger.get_meta("last_valid_quotes")
+        if not raw:
+            return {}
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        out: dict[str, Quote] = {}
+        for symbol, row in payload.items():
+            if not isinstance(row, dict) or row.get("source") in ("kraken", "robinhood"):
+                continue
+            try:
+                out[str(symbol)] = Quote(
+                    symbol=str(symbol),
+                    ts=parse_ts(str(row["ts"])),
+                    mid=D(row["mid"]),
+                    bid=D(row["bid"]),
+                    ask=D(row["ask"]),
+                    source=str(row.get("source") or "coinbase"),
+                    spread_included=bool(row.get("spread_included")),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        return out
+
+    def _quotes_for_reduce_only(self, snapshot: MarketSnapshot, now: datetime) -> MarketSnapshot:
+        """Price a kill or flatten sell with the last valid bid/ask when the live quote cannot."""
+        stored = self._load_last_valid_quotes()
+        quotes = dict(snapshot.quotes)
+        changed = False
+        for symbol in set(self.settings.symbols) | set(stored):
+            if self._quote_problem(quotes.get(symbol), now) is None:
+                continue
+            saved = stored.get(symbol)
+            if saved is None:
+                continue
+            quotes[symbol] = replace(saved, allow_stale=True)
+            changed = True
+        if not changed:
+            return snapshot
+        return MarketSnapshot(bars=snapshot.bars, quotes=quotes, source=snapshot.source)
+
     def _require_quotes(self, snapshot: MarketSnapshot) -> None:
         missing = [symbol for symbol in self.settings.symbols if symbol not in snapshot.quotes]
         if missing:
+            self.ledger.set_meta("quote_hard_stop", "missing_quote")
             raise RuntimeError(f"missing quotes for {missing}")
 
     def _note_quotes(self, snapshot: MarketSnapshot, market_now: datetime, wall: datetime) -> None:
-        oldest = min(snapshot.quotes[symbol].ts for symbol in self.settings.symbols)
-        self.ledger.set_meta("last_quote_ts", iso(oldest))
-        fresh = True
+        self._remember_valid_quotes(snapshot, market_now)
+        problem = self._first_quote_problem(snapshot, market_now)
+        self.ledger.set_meta("quote_hard_stop", problem or "")
+        present = [snapshot.quotes[symbol] for symbol in self.settings.symbols if symbol in snapshot.quotes]
         ages: list[float] = []
-        for symbol in self.settings.symbols:
-            age = (market_now - snapshot.quotes[symbol].ts).total_seconds()
-            ages.append(age)
-            if age >= self.settings.max_quote_age_seconds or age < -5:
-                fresh = False
-        self.ledger.set_meta("last_quote_age_at_cycle_s", str(int(max(ages) if ages else 0)))
-        if fresh:
+        if present:
+            oldest = min(quote.ts for quote in present)
+            self.ledger.set_meta("last_quote_ts", iso(oldest))
+            for quote in present:
+                ages.append((market_now - quote.ts).total_seconds())
+            self.ledger.set_meta("last_quote_age_at_cycle_s", str(int(max(ages))))
+        elif problem is not None:
+            self.ledger.set_meta(
+                "last_quote_age_at_cycle_s", str(self.settings.max_quote_age_seconds)
+            )
+        if problem is None:
             self.ledger.set_meta("last_quote_ok_at", iso(wall))
-            if snapshot.source == "robinhood":
-                self.ledger.set_meta("last_auth_ok_at", iso(wall))
 
     def _client_id(self, sleeve: str, intent: OrderIntent, market_now: datetime) -> str:
         """sleeve:symbol:side:decision_key. The key is the UTC bar date, or the DCA index."""

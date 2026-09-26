@@ -161,14 +161,18 @@ def assess(settings: Settings, now: datetime | None = None) -> dict:
                 and ok_age is not None
                 and 0 <= ok_age <= quote_window
             )
+            hard_stop = ledger.get_meta("quote_hard_stop") or ""
             checks["quotes"] = {
-                "ok": quotes_ok,
+                "ok": quotes_ok and not hard_stop and quote_source in (None, "", "coinbase"),
                 "age_seconds": cycle_age,
                 "last_quote_ok_age_seconds": ok_age,
                 "source": quote_source,
+                "hard_stop": hard_stop or None,
             }
             if ledger.event_count() and not quotes_ok:
                 level = _bump("critical", "stale_market_data", level, reasons)
+            if hard_stop or quote_source not in (None, "", "coinbase"):
+                level = _bump("critical", "quote_hard_stop", level, reasons)
             action_age = _age_seconds(last_successful, now)
             checks["recent_action"] = {"ok": action_age is not None and action_age <= limit, "age_seconds": action_age}
             if heartbeat and action_age is None:
@@ -187,8 +191,6 @@ def assess(settings: Settings, now: datetime | None = None) -> dict:
             checks["open_orders"] = {"ok": not stale_ids, "client_order_ids": stale_ids}
             if stale_ids:
                 level = _bump("critical", "open_order_stale", level, reasons)
-            if quote_source == "public_fallback":
-                level = _bump("degraded", "robinhood_quotes_unavailable", level, reasons)
             combined = Decimal(0)
             for value in equity.values():
                 combined += D(value)

@@ -5,9 +5,9 @@ This bot is paper-only. It does not place, amend, or cancel real orders.
 ## Secrets
 
 - Do not commit API keys, private keys, or `.env` files.
-- A read-only Robinhood quote key, if you create one later, lives only in environment variables: `RH_API_KEY` and `RH_PRIVATE_KEY_BASE64`.
-- The process never reads those values from the repository.
-- Create that key with read-only actions. This code still cannot send an order with it: the quote client signs GET requests for best bid/ask only, and any other path or method is refused.
+- v1 paper does not use a Robinhood quote key. Marks, fills, and the spread cap are Coinbase public bid/ask. A missing key is not a fallback onto another feed.
+- If a read-only key exists, it lives only in environment variables: `RH_API_KEY` and `RH_PRIVATE_KEY_BASE64`. The process never reads those values from the repository, and the paper engine does not select that client.
+- The quote client, if constructed, signs GET requests for best bid/ask only. Any other path or method is refused.
 - Operators and AI agents do not read, print, or copy those variables.
 
 ## Live trading

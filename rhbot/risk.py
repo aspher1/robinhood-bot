@@ -189,7 +189,7 @@ class RiskEngine:
                 return deny("buy_amount", "quote_amount", "positive")
 
         quote = ctx.quotes.get(intent.symbol)
-        fresh = self._fresh(quote, ctx.now)
+        fresh = self._fresh(quote, ctx.now, reduce_only=reduce_only)
         if fresh is not None:
             return _decision(fresh)
         assert quote is not None
@@ -312,7 +312,13 @@ class RiskEngine:
             )
         return RiskDecision(True, [])
 
-    def _fresh(self, quote: Quote | None, now: datetime) -> LimitHit | None:
+    def _fresh(
+        self,
+        quote: Quote | None,
+        now: datetime,
+        *,
+        reduce_only: bool = False,
+    ) -> LimitHit | None:
         if quote is None:
             return LimitHit("missing_quote", "quote", "required", "missing")
         if not quote.ts_trusted:
@@ -323,12 +329,14 @@ class RiskEngine:
         if age < -5:
             return LimitHit("quote_from_the_future", "max_quote_age_seconds", "0", str(int(age)))
         if age >= self.settings.max_quote_age_seconds:
-            return LimitHit(
-                "stale_quote",
-                "max_quote_age_seconds",
-                str(self.settings.max_quote_age_seconds),
-                str(int(age)),
-            )
+            # A reduce_only sell may keep the last quote that was valid when stored.
+            if not (reduce_only and quote.allow_stale):
+                return LimitHit(
+                    "stale_quote",
+                    "max_quote_age_seconds",
+                    str(self.settings.max_quote_age_seconds),
+                    str(int(age)),
+                )
         return None
 
     def _spread(self, quote: Quote) -> LimitHit | None:

@@ -36,6 +36,8 @@ class Quote:
     spread_included: bool = False
     # False when the timestamp is not from the market (for example an HTTP Date header).
     ts_trusted: bool = True
+    # Engine-only. A reduce_only sell may price off the last valid bid/ask after it ages out.
+    allow_stale: bool = False
 
 
 @dataclass(frozen=True)

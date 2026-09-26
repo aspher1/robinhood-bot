@@ -1,9 +1,9 @@
 """Free public BTC/ETH prices. No API key.
 
-Coinbase is the default because its ticker includes a trade time, so the
-risk engine can reject stale data. Kraken is the alternate. Fills on these
-mids pay ``cost_per_side`` (default 1% per side). The venue's own bid/ask,
-when present, is only a sanity check. It is not added on top of the 1%.
+v1 paper marks, fills, and the spread cap use Coinbase public bid/ask.
+Kraken parsers stay here for diagnostics. The engine does not price orders
+from them. Fills pay ``cost_per_side`` (default 1% per side). The bid/ask
+is the quote; it is not added again on top of the 1% floor.
 """
 
 from __future__ import annotations
@@ -227,6 +227,7 @@ class PublicMarketData:
                     raise DataError(f"coinbase ticker http {status}")
                 quotes[symbol] = parse_coinbase_ticker(symbol, body)
             else:
+                # Diagnostic ticker. Not a v1 paper mark, fill, or spread source.
                 pair = KRAKEN_PAIRS[symbol]
                 url = f"https://api.kraken.com/0/public/Ticker?pair={pair}"
                 status, body, headers = self._get(url)

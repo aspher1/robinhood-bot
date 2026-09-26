@@ -3,9 +3,8 @@
 Paper-only BTC and ETH. Three independent sleeves share one process and one database. They do not share cash. Each starts at the configured bankroll, default $1,000.
 
 ```
-public prices (no key) ----\
-                            +--> engine cycle --> strategy intents
-optional RH bid/ask -------/                         |
+Coinbase public bid/ask (no key) --> engine cycle --> strategy intents
+                                                     |
                                                      v
                                               risk engine (code)
                                                      |
@@ -20,11 +19,11 @@ The long-lived loop is `rhbot run`. It wakes every `loop_seconds` (default 60), 
 
 ## Market data
 
-`PublicMarketData` is the default. It needs no API key. Coinbase public ticker and daily candles are the default source; Kraken public OHLC and ticker are the alternate (`public_provider`). Daily bars are cached in SQLite. The signal uses only candles that have already closed, so the current partial day is not treated as a close.
+`PublicMarketData` needs no API key. v1 paper uses Coinbase public bid/ask for marks, fills, and the spread cap (`market_data: public`, `public_provider: coinbase`). Daily bars are cached in SQLite. The signal uses only candles that have already closed, so the current partial day is not treated as a close. Kraken OHLC and ticker parsers remain for diagnostics. The engine does not price orders from them.
 
-Fills against these mids pay `cost_per_side` (hard floor 1% on a buy and 1% on a sell). That stands in for Robinhood's small-account spread. A quoted bid and ask is a sanity check: if either side is more than 2% from the mid, the order is skipped. The spread is not added on top of the 1%. An inclusive Robinhood quote that is already wider than 1% per side is filled at that bid or ask. A tighter inclusive quote is widened to the 1% floor.
+Fills pay `cost_per_side` (hard floor 1% on a buy and 1% on a sell). That stands in for a small-account spread. The bid and ask are the quote: if either side is missing, or either side is more than 2% from the mid, the order is denied. The spread is not added on top of the 1%.
 
-`RobinhoodMarketData` is optional and off unless `market_data: robinhood` and both `RH_API_KEY` and `RH_PRIVATE_KEY_BASE64` are set in the environment. It signs GET requests for `/api/v1/crypto/marketdata/best_bid_ask/` only, with a 100-request-per-minute budget and a clock-skew check against the 30-second signing window. Buys then fill at `ask_inclusive_of_buy_spread` and sells at `bid_inclusive_of_sell_spread`, and the extra 1% is not applied again. Candles still come from the public source, because the Robinhood API does not publish OHLC. If you ask for Robinhood quotes but set neither variable, the bot stays on public prices and records `public_fallback`. If you set only one variable, it refuses to start.
+A missing Coinbase quote, a quote 30 seconds old or older, or a quote with no bid/ask denies new orders and sets health critical (`quote_hard_stop`). The bot does not switch to Robinhood, Kraken, or a last trade. A reduce_only kill or flatten sell may still use the last valid bid/ask. Robinhood best-bid/ask is not selected, including when the API key is missing.
 
 `LiveBroker` exists so the seam is obvious. Every method raises `LiveTradingDisabled`. It does not open a socket. The engine never constructs it. `mode: live` is rejected, and `RHBOT_LIVE`, `RHBOT_MODE=live`, `LIVE_TRADING`, and `ENABLE_LIVE_TRADING` are rejected too. None of those can place an order.
 

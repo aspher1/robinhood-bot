@@ -99,6 +99,7 @@ class Settings(BaseModel):
     # $1,000 / 52 weeks, rounded down to the cent. One coin per period.
     dca_notional: Decimal = FROZEN_DCA_NOTIONAL
     loop_seconds: int = 60
+    # v1 paper quotes are Coinbase public bid/ask. Kraken is diagnostic only.
     market_data: str = "public"
     public_provider: str = "coinbase"
 
@@ -147,15 +148,17 @@ class Settings(BaseModel):
     @field_validator("market_data")
     @classmethod
     def _market_data(cls, value: str) -> str:
-        if value not in ("public", "robinhood"):
-            raise ValueError("market_data must be public or robinhood")
+        if value != "public":
+            raise ValueError(
+                "market_data must be public; Coinbase public bid/ask is the v1 paper source"
+            )
         return value
 
     @field_validator("public_provider")
     @classmethod
     def _provider(cls, value: str) -> str:
-        if value not in ("coinbase", "kraken"):
-            raise ValueError("public_provider must be coinbase or kraken")
+        if value != "coinbase":
+            raise ValueError("public_provider must be coinbase; Kraken is diagnostic-only")
         return value
 
     @model_validator(mode="after")
