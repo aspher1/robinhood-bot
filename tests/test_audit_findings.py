@@ -832,6 +832,61 @@ def test_f011_shadow_enters_while_trend_is_frozen(tmp_path, now):
     bot.ledger.close()
 
 
+def test_f021_shadow_trade_cap_is_per_sleeve(tmp_path, now):
+    """Day 1 with every signal on: each shadow book has its own cap of 2.
+
+    Buy-and-hold has no shadow book. Trend and DCA do. A shared shadow budget
+    would let DCA take one slot and leave trend with one coin, and that gap
+    would show up as overlay_effect. It must not.
+    """
+    from rhbot.risk import RiskEngine
+    from rhbot.status import build_report
+
+    bot = engine(tmp_path, sma_window=3, trend_band=Decimal("0.01"))
+    view = snapshot(now, closes=["10", "10", "12"], last_open=now - timedelta(days=1))
+    bot.run_once(now=now, snapshot=view)
+    day = now.date().isoformat()
+    assert len(bot.ledger.fills_for("buy_and_hold")) == 2
+    assert len(bot.ledger.fills_for("dca_weekly")) == 1
+    assert len(bot.ledger.fills_for("trend_daily")) == 2
+    assert bot.ledger.shadow_strategy_trades_today("dca_weekly_shadow", day) == 1
+    assert bot.ledger.shadow_strategy_trades_today("trend_daily_shadow", day) == 2
+    assert set(bot.ledger.shadow_positions("trend_daily_shadow")) == {"BTC-USD", "ETH-USD"}
+    assert set(bot.ledger.positions("trend_daily")) == {"BTC-USD", "ETH-USD"}
+    report = build_report(bot.settings, "30d", now=now + timedelta(days=1))
+    trend_effect = report["no_overlay"]["sleeves"]["trend_daily_shadow"]["overlay_effect"]
+    dca_effect = report["no_overlay"]["sleeves"]["dca_weekly_shadow"]["overlay_effect"]
+    assert trend_effect["equity_delta"] == "0.00000000"
+    assert dca_effect["equity_delta"] == "0.00000000"
+    ctx = bot._shadow_context("trend_daily_shadow", view, now)
+    ctx.ordered_symbols_today = set()
+    ctx.cash = Decimal("1000")
+    ctx.equity = Decimal("1000")
+    ctx.positions = {}
+    ctx.turnover_today = Decimal("0")
+    denied = RiskEngine(bot.settings).evaluate(
+        OrderIntent("BTC-USD", "buy", "third", quote_amount=Decimal("20")),
+        ctx,
+        "trend_daily_shadow:BTC-USD:buy:third",
+        ignore_overlay=True,
+    )
+    assert denied.reasons == ["max_trades_per_day"]
+    other = bot._shadow_context("dca_weekly_shadow", view, now)
+    other.ordered_symbols_today = set()
+    other.cash = Decimal("1000")
+    other.equity = Decimal("1000")
+    other.positions = {}
+    other.turnover_today = Decimal("0")
+    allowed = RiskEngine(bot.settings).evaluate(
+        OrderIntent("ETH-USD", "buy", "still_open", quote_amount=Decimal("19.23")),
+        other,
+        "dca_weekly_shadow:ETH-USD:buy:still-open",
+        ignore_overlay=True,
+    )
+    assert allowed.allowed
+    bot.ledger.close()
+
+
 def test_f020_stale_open_order_is_critical(tmp_path, now):
     bot = engine(tmp_path, sma_window=200)
     bot.run_once(now=now, snapshot=snapshot(now))

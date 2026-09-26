@@ -30,6 +30,10 @@ Already in place from round 1, and still true: resume does not rebase `portfolio
 
 Added: an open order older than one loop is critical `open_order_stale`, and reconcile names its `client_order_id` (F-020). After a human resume, the same flattened mark does not kill again. Once that book is back above −40% of the original peak, a later cross of that same peak kills again. It does not need another 40% off the flattened equity.
 
+### Audit round 3
+
+F-021: `shadow_strategy_trades_today(sleeve, day)` counts one shadow book. The cap stays 2. On a day when buy-and-hold, DCA, and trend all signal, trend's shadow still buys both coins after DCA's shadow has traded. `overlay_effect` is zero when the overlay did not block anyone. A third order on that same shadow book is denied. Buy-and-hold stays the benchmark and has no shadow book.
+
 Not done, optional: F-015 through F-019.
 
 ### Left open
