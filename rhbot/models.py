@@ -33,6 +33,8 @@ class Quote:
     # When True, bid/ask already include the venue spread. The fill still
     # costs at least cost_per_side (the 1% floor) if the venue spread is tighter.
     spread_included: bool = False
+    # False when the timestamp is not from the market (for example an HTTP Date header).
+    ts_trusted: bool = True
 
 
 @dataclass(frozen=True)

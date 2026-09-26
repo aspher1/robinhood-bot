@@ -1,3 +1,4 @@
+import ast
 import re
 from pathlib import Path
 
@@ -35,10 +36,10 @@ def test_hard_caps_match_the_risk_policy():
     assert "dd_cut_quarter" not in HARD_CAPS
     assert "exposure_cap_at_half" not in HARD_CAPS
     assert "exposure_cap_at_quarter" not in HARD_CAPS
-    assert HARD_CAPS["pause_drawdown_pct"] == Decimal("0.10")
+    assert HARD_CAPS["freeze_drawdown_pct"] == Decimal("0.10")
     assert HARD_CAPS["kill_drawdown_pct"] == Decimal("0.40")
-    assert "drawdown_freeze_pct" not in HARD_CAPS
-    assert "max_drawdown_pct" not in HARD_CAPS
+    assert "pause_drawdown_pct" not in HARD_CAPS
+    assert "dd_cut_half" not in HARD_CAPS
     assert HARD_CAPS["max_quote_age_seconds"] == 30
     assert HARD_CAPS["max_spread_per_side"] == Decimal("0.02")
 
@@ -76,15 +77,79 @@ def test_engine_never_clears_the_kill_file():
     assert "rebase_peaks" not in cli
 
 
+_HTTP_WRITE_NAMES = {"request", "stream", "send", "post", "put", "patch", "delete"}
+
+
+def http_write_findings(source: str) -> list[str]:
+    """AST scan: only HTTP GET is allowed. Writes and urllib.request fail the build."""
+    tree = ast.parse(source)
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "urllib.request" or alias.name.startswith("urllib.request."):
+                    found.append(f"import {alias.name}")
+        elif isinstance(node, ast.ImportFrom) and node.module in ("urllib.request", "urllib"):
+            names = {alias.name for alias in node.names}
+            if node.module == "urllib.request" or "request" in names:
+                found.append(f"from {node.module} import {sorted(names)}")
+        elif isinstance(node, ast.Call):
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else func.id if isinstance(func, ast.Name) else ""
+            if name in _HTTP_WRITE_NAMES:
+                found.append(name)
+            if name in ("urlopen", "Request"):
+                if any(kw.arg == "data" for kw in node.keywords) or len(node.args) >= 2:
+                    found.append(f"{name}(data=...)")
+    return found
+
+
 def test_package_has_no_live_order_path():
     offenders = []
     for path in ROOT.rglob("*.py"):
         text = path.read_text(encoding="utf-8")
-        if ORDER_PATH.search(text) or HTTP_WRITE.search(text):
+        if ORDER_PATH.search(text) or HTTP_WRITE.search(text) or http_write_findings(text):
             offenders.append(str(path))
         if "trading.robinhood.com" in text and re.search(r"\borders?\b", text, re.I):
             offenders.append(str(path))
     assert offenders == []
+
+
+def test_http_write_forms_are_rejected(tmp_path):
+    samples = {
+        "post_request.py": "def f(client):\n    client.request('POST', 'https://example')\n",
+        "httpx_put.py": "import httpx\nhttpx.request('PUT', 'https://example')\n",
+        "stream_post.py": "def f(client):\n    client.stream('POST', 'https://example')\n",
+        "urllib_data.py": "import urllib.request\nurllib.request.Request('https://example', data=b'x')\n",
+        "urlopen_data.py": "def f(urlopen):\n    urlopen('https://example', data=b'x')\n",
+    }
+    for name, source in samples.items():
+        path = ROOT / f"_audit_{name}"
+        path.write_text(source, encoding="utf-8")
+        try:
+            assert http_write_findings(source), name
+            offenders = [str(item) for item in ROOT.rglob("*.py") if http_write_findings(item.read_text(encoding="utf-8"))]
+            assert str(path) in offenders
+        finally:
+            path.unlink(missing_ok=True)
+
+
+def test_live_broker_is_not_reexported():
+    import rhbot.brokers as brokers
+
+    assert not hasattr(brokers, "LiveBroker")
+    with pytest.raises(ImportError):
+        from rhbot.brokers import LiveBroker  # noqa: F401
+
+
+def test_config_yaml_is_gitignored():
+    import subprocess
+
+    root = Path(__file__).resolve().parents[1]
+    ignored = subprocess.run(["git", "check-ignore", "config.yaml"], cwd=root, check=False)
+    assert ignored.returncode == 0
+    example = subprocess.run(["git", "check-ignore", "config.example.yaml"], cwd=root, check=False)
+    assert example.returncode != 0
 
 
 def test_live_broker_cannot_submit_cancel_or_amend():

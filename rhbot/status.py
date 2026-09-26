@@ -53,6 +53,7 @@ def assess(settings: Settings, now: datetime | None = None) -> dict:
     portfolio_peak = Decimal(0)
     acknowledged = False
     drawdown_acks: list[dict] = []
+    overlay_view: dict = {}
     db_exists = _db_path(settings).exists()
     limit = max(180, settings.loop_seconds * 3)
 
@@ -150,8 +151,22 @@ def assess(settings: Settings, now: datetime | None = None) -> dict:
             last_quote_ts = ledger.get_meta("last_quote_ts")
             quote_source = ledger.get_meta("quote_source")
             data_age = _age_seconds(last_quote_ts, now)
-            quotes_ok = data_age is not None and 0 <= data_age <= settings.max_quote_age_seconds
-            checks["quotes"] = {"ok": quotes_ok, "age_seconds": data_age, "source": quote_source}
+            cycle_age_raw = ledger.get_meta("last_quote_age_at_cycle_s")
+            cycle_age = int(cycle_age_raw) if cycle_age_raw not in (None, "") else None
+            ok_age = _age_seconds(last_quote_ok_at, now)
+            quote_window = max(180, settings.loop_seconds * 3)
+            quotes_ok = (
+                cycle_age is not None
+                and cycle_age <= settings.max_quote_age_seconds
+                and ok_age is not None
+                and 0 <= ok_age <= quote_window
+            )
+            checks["quotes"] = {
+                "ok": quotes_ok,
+                "age_seconds": cycle_age,
+                "last_quote_ok_age_seconds": ok_age,
+                "source": quote_source,
+            }
             if ledger.event_count() and not quotes_ok:
                 level = _bump("critical", "stale_market_data", level, reasons)
             action_age = _age_seconds(last_successful, now)
@@ -172,18 +187,16 @@ def assess(settings: Settings, now: datetime | None = None) -> dict:
             stored_peak = ledger.get_meta("portfolio_peak")
             portfolio_peak = D(stored_peak) if stored_peak else combined
             portfolio_dd = peak_drawdown(combined, portfolio_peak)
-            # Paper-only combined drawdown. 40% is the hard kill. 10% is a buy freeze.
-            # These limits must not be carried into a live phase.
-            if kill_reason(combined, portfolio_peak, settings):
+            overlay_view = _overlay_view(ledger, now)
+            killed = any(item["state"] == "KILLED" for item in overlay_view.values())
+            if killed:
                 level = _bump("critical", "drawdown_breach", level, reasons)
-            acknowledged = (ledger.get_meta("drawdown_ack_peak") or "") == money_str(portfolio_peak)
+            acknowledged = not any(item["state"] == "FROZEN" for item in overlay_view.values())
             drawdown_acks = _ack_records(ledger, None)
         finally:
             ledger.close()
 
-    freeze_alert = freeze is not None or (
-        portfolio_dd >= settings.pause_drawdown_pct and not acknowledged
-    )
+    freeze_alert = any(item.get("state") == "FROZEN" for item in overlay_view.values())
     if freeze_alert:
         level = _bump("degraded", "drawdown_freeze", level, reasons)
         checks["drawdown_freeze"] = {
@@ -219,11 +232,12 @@ def assess(settings: Settings, now: datetime | None = None) -> dict:
         "mode": "paper",
         "running": bool(running),
         "kill_switch": kill is not None,
-        "buy_pause": freeze is not None,
-        "peak_equity": money_str(portfolio_peak) if equity else None,
-        "drawdown_pct": money_str(portfolio_dd),
-        "ack_required": (kill is not None and resume_needs_ack(kill)) or freeze is not None,
-        "rearm_eligible": freeze is None and portfolio_dd < settings.pause_drawdown_pct,
+        "buy_pause": freeze_alert,
+        "peak_equity": _worst_peak(overlay_view),
+        "drawdown_pct": _worst_dd(overlay_view),
+        "ack_required": (kill is not None and resume_needs_ack(kill)) or freeze_alert,
+        "rearm_eligible": not freeze_alert and _all_above_freeze(overlay_view, settings),
+        "overlay": overlay_view,
         "kill_reason": None if kill is None else kill.get("reason"),
         "drawdown_freeze": freeze is not None,
         "drawdown_acks": drawdown_acks,
@@ -250,6 +264,73 @@ def assess(settings: Settings, now: datetime | None = None) -> dict:
         "reasons": reasons,
         "checks": checks,
     }
+
+
+def _overlay_view(ledger: Ledger, now: datetime) -> dict:
+    from rhbot.overlay import OVERLAY_BOOKS, SHADOW_NAMES
+
+    out = {}
+    for name in OVERLAY_BOOKS:
+        row = ledger.overlay_row(name)
+        if row is None:
+            continue
+        ack_delay = None
+        if row["ack_ts"] and row["trip_ts"]:
+            delay = _age_seconds(str(row["trip_ts"]), parse_ts(str(row["ack_ts"])))
+            if delay is not None:
+                ack_delay = round(delay / 3600, 4)
+        shadow_name = SHADOW_NAMES[name]
+        shadow_equity = None
+        try:
+            shadow_equity = money_str(D(ledger.shadow_sleeve_row(shadow_name)["last_equity"]))
+        except KeyError:
+            shadow_equity = None
+        impact = None
+        if shadow_equity is not None:
+            impact = money_str(D(row["equity"]) - D(shadow_equity))
+        out[name] = {
+            "state": str(row["state"]),
+            "dd": str(row["dd"]),
+            "peak": str(row["peak"]),
+            "equity": str(row["equity"]),
+            "last_trip": None
+            if not row["trip_ts"]
+            else {
+                "ts": str(row["trip_ts"]),
+                "dd": str(row["trip_dd"] or ""),
+                "equity": str(row["trip_equity"] or ""),
+                "peak": str(row["trip_peak"] or ""),
+            },
+            "last_ack": None
+            if not row["ack_ts"]
+            else {"ts": str(row["ack_ts"]), "by": str(row["ack_by"] or ""), "note": str(row["ack_note"] or "")},
+            "ack_delay_hours": ack_delay,
+            "shadow": shadow_name,
+            "shadow_equity": shadow_equity,
+            "overlay_impact": impact,
+        }
+    del now
+    return out
+
+
+def _worst_dd(overlay_view: dict) -> str:
+    if not overlay_view:
+        return money_str(Decimal(0))
+    worst = min(D(item["dd"]) for item in overlay_view.values())
+    return format(q8(worst), "f")
+
+
+def _worst_peak(overlay_view: dict) -> str | None:
+    if not overlay_view:
+        return None
+    worst_name = min(overlay_view, key=lambda name: D(overlay_view[name]["dd"]))
+    return str(overlay_view[worst_name]["peak"])
+
+
+def _all_above_freeze(overlay_view: dict, settings: Settings) -> bool:
+    if not overlay_view:
+        return True
+    return all(D(item["dd"]) > -settings.freeze_drawdown_pct for item in overlay_view.values())
 
 
 def parse_since(text: str) -> timedelta:
@@ -287,23 +368,27 @@ def build_report(settings: Settings, since_text: str, now: datetime | None = Non
             if name not in ledger.sleeve_names():
                 continue
             sleeves[name] = _sleeve_report(ledger, name, start)
+        from rhbot.overlay import SHADOW_NAMES
+
         shadow: dict[str, dict] = {}
-        for name in SLEEVES:
-            if name not in ledger.shadow_sleeve_names():
+        for name, shadow_name in SHADOW_NAMES.items():
+            if shadow_name not in ledger.shadow_sleeve_names():
                 continue
-            shadow[name] = _shadow_report(ledger, name, start)
+            shadow[shadow_name] = _shadow_report(ledger, shadow_name, start)
             real = sleeves.get(name)
             if real is None:
-                shadow[name]["overlay_effect"] = None
+                shadow[shadow_name]["overlay_effect"] = None
+                shadow[shadow_name]["overlay_impact"] = None
                 continue
-            equity_delta = q8(D(real["equity"]) - D(shadow[name]["equity"]))
+            equity_delta = q8(D(real["equity"]) - D(shadow[shadow_name]["equity"]))
             return_delta = q8(
-                D(real["since_start"]["return_pct"]) - D(shadow[name]["since_start"]["return_pct"])
+                D(real["since_start"]["return_pct"]) - D(shadow[shadow_name]["since_start"]["return_pct"])
             )
-            shadow[name]["overlay_effect"] = {
+            shadow[shadow_name]["overlay_effect"] = {
                 "equity_delta": money_str(equity_delta),
                 "return_delta_pct": format(return_delta, "f"),
             }
+            shadow[shadow_name]["overlay_impact"] = money_str(equity_delta)
         using_shadow_benchmark = "buy_and_hold" in shadow
         if using_shadow_benchmark:
             benchmark = shadow["buy_and_hold"]["window"]["return_pct"]
@@ -321,8 +406,9 @@ def build_report(settings: Settings, since_text: str, now: datetime | None = Non
             if not body["fidelity"]["ok"]:
                 fidelity_ok = False
         trips = _risk_records(ledger, "kill_trip", None, start)
-        freezes = _risk_records(ledger, "drawdown_freeze", None, start)
+        freezes = _risk_records(ledger, "freeze_trip", None, start)
         acks = _ack_records(ledger, start)
+        overlay_view = _overlay_view(ledger, now)
         return {
             "since": since_text,
             "from": iso(start),
@@ -338,10 +424,11 @@ def build_report(settings: Settings, since_text: str, now: datetime | None = Non
             "sleeves": sleeves,
             "no_overlay": {
                 "benchmark": "buy_and_hold",
-                "benchmark_scored_without_overlay": using_shadow_benchmark,
+                "benchmark_scored_without_overlay": False,
                 "benchmark_return_pct": benchmark,
                 "sleeves": shadow,
             },
+            "overlay": overlay_view,
         }
     finally:
         ledger.close()
@@ -466,7 +553,7 @@ def _ack_records(ledger: Ledger, start: datetime | None) -> list[dict]:
     """Operator acknowledgements of a paper drawdown freeze."""
     found = []
     for event in ledger.conn.execute(
-        "SELECT payload FROM events WHERE kind='drawdown_ack' ORDER BY seq"
+        "SELECT payload FROM events WHERE kind IN ('drawdown_ack', 'freeze_ack') ORDER BY seq"
     ):
         payload = json.loads(event["payload"])
         if start is not None and parse_ts(str(payload["ts"])) < start:
@@ -475,7 +562,7 @@ def _ack_records(ledger: Ledger, start: datetime | None) -> list[dict]:
             {
                 "ts": payload.get("ts") or "",
                 "actor": payload.get("actor") or payload.get("by") or "",
-                "reason": payload.get("reason") or "",
+                "reason": payload.get("reason") or payload.get("note") or "",
                 "peak": payload.get("peak") or "",
             }
         )

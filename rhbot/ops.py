@@ -158,11 +158,12 @@ def read_freeze(state_dir: Path) -> dict | None:
 
 
 def engage_freeze(state_dir: Path, reason: str, by: str) -> dict:
-    """Create the freeze file if it is not already there. The first reason wins.
+    """Create the legacy freeze file if it is not already there.
 
-    The engine never deletes this file. The operator clears it with
-    ``rhbot ack-drawdown --reason``. That does not reset the drawdown peak
-    and does not clear a kill. A 40% kill stays human-only ``rhbot resume --ack``.
+    The live overlay is the per-book row in SQLite, not this file. The operator
+    acknowledges a frozen book with ``rhbot ack-drawdown --strategy``. That does
+    not move the peak. A 40% kill stays human-only
+    ``rhbot resume --ack --human-code``.
     """
     path = freeze_path(state_dir)
     if path.exists():

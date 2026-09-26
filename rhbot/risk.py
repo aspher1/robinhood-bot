@@ -8,9 +8,9 @@ from decimal import Decimal
 
 from rhbot.config import ALLOWED_SYMBOLS, Settings
 from rhbot.errors import OrderRejected
-from rhbot.models import OrderIntent, Quote
+from rhbot.models import RISK_REDUCTION_REASONS, OrderIntent, Quote
 from rhbot.money import q8
-from rhbot.ops import freeze_active, kill_active
+from rhbot.ops import kill_active
 from rhbot.pricing import plan_fill
 
 EPS = Decimal("0.01")
@@ -30,6 +30,8 @@ class RiskContext:
     turnover_today: Decimal
     known_client_ids: set[str]
     ordered_symbols_today: set[str] = field(default_factory=set)
+    overlay_state: str = "NONE"
+    opened_at: dict[str, datetime] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -98,14 +100,20 @@ def daily_loss(equity: Decimal, day_start: Decimal) -> Decimal:
     return (day_start - equity) / day_start
 
 
+def signed_drawdown(equity: Decimal, peak: Decimal) -> Decimal:
+    if peak <= 0:
+        return Decimal(0)
+    return equity / peak - Decimal(1)
+
+
 def kill_reason(equity: Decimal, peak: Decimal, settings: Settings) -> str | None:
-    """40% paper-only hard kill, measured by the caller on combined equity.
+    """40% paper-only hard kill on one strategy book's mark-to-bid equity.
 
     These drawdown limits must not be carried into a live phase.
     """
-    dd = peak_drawdown(equity, peak)
-    if dd >= settings.kill_drawdown_pct:
-        return f"max_drawdown {q8(dd)} >= {settings.kill_drawdown_pct}"
+    dd = signed_drawdown(equity, peak)
+    if dd <= -settings.kill_drawdown_pct:
+        return f"max_drawdown {q8(dd)} <= -{settings.kill_drawdown_pct}"
     return None
 
 
@@ -192,6 +200,8 @@ class RiskEngine:
         # The no-overlay shadow book skips only these two drawdown controls.
         if not ignore_overlay and kill_active(settings.state_dir) and not reduce_only:
             return deny("kill_switch", "kill_switch", "engaged")
+        if not ignore_overlay and ctx.overlay_state == "KILLED" and not reduce_only:
+            return deny("killed", "overlay_state", "KILLED", ctx.overlay_state)
 
         if reduce_only:
             return RiskDecision(True, [])
@@ -203,15 +213,12 @@ class RiskEngine:
             # Paper-only freeze. Sells above this check still go through.
             # Weekly DCA buys are new entries and are blocked with every other buy.
             # The engine raises the freeze from combined peak equity.
-            if not ignore_overlay and freeze_active(settings.state_dir):
+            if not ignore_overlay and ctx.overlay_state == "FROZEN":
                 return deny(
-                    "drawdown_freeze",
-                    "pause_drawdown_pct",
-                    settings.pause_drawdown_pct,
+                    "freeze",
+                    "freeze_drawdown_pct",
+                    settings.freeze_drawdown_pct,
                     "frozen",
-                    detail=(
-                        "drawdown_freeze: new buys are frozen until rhbot ack-drawdown"
-                    ),
                 )
             loss = daily_loss(ctx.equity, ctx.day_start_equity)
             if loss >= settings.max_daily_loss_pct:
@@ -266,7 +273,20 @@ class RiskEngine:
             return RiskDecision(True, [])
 
         # Strategy sells still count as trades. Caps do not block a shrink.
+        # The 7-day hold is a hard cap here. Flatten reasons skip this function
+        # via reduce_only above.
         assert intent.base_quantity is not None
+        if intent.reason not in RISK_REDUCTION_REASONS:
+            opened = ctx.opened_at.get(intent.symbol)
+            if opened is not None:
+                age_days = Decimal(str((ctx.now - opened).total_seconds())) / Decimal(86400)
+                if age_days < settings.min_hold_days:
+                    return deny(
+                        "min_hold",
+                        "min_hold_days",
+                        settings.min_hold_days,
+                        q8(age_days),
+                    )
         notional = q8(intent.base_quantity * quote.mid)
         if notional < settings.min_order_notional:
             return deny(
@@ -287,6 +307,8 @@ class RiskEngine:
     def _fresh(self, quote: Quote | None, now: datetime) -> LimitHit | None:
         if quote is None:
             return LimitHit("missing_quote", "quote", "required", "missing")
+        if not quote.ts_trusted:
+            return LimitHit("untrusted_quote_ts", "quote_ts", "market", "untrusted")
         if quote.ts.tzinfo is None or now.tzinfo is None:
             return LimitHit("naive_timestamp", "quote_ts", "timezone-aware", "naive")
         age = (now - quote.ts).total_seconds()

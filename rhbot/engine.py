@@ -16,6 +16,7 @@ from rhbot.errors import DataError, OrderRejected
 from rhbot.ledger import Ledger
 from rhbot.models import Fill, MarketSnapshot, OrderIntent
 from rhbot.money import D, money_str, q8
+from rhbot.overlay import OVERLAY_BOOKS, SHADOW_NAMES, mark_to_bid_equity, signed_drawdown
 from rhbot.pricing import plan_fill
 from rhbot.ops import (
     engage_freeze,
@@ -112,22 +113,25 @@ class Engine:
     def cycle(self, market_now: datetime, wall: datetime, snapshot: MarketSnapshot) -> dict:
         self._require_quotes(snapshot)
         self._note_quotes(snapshot, market_now, wall)
+        self._store_closed_bars(snapshot, market_now)
+        if not self.ledger.get_meta("paper_day1"):
+            self.ledger.set_meta("paper_day1", iso(market_now))
         if kill_active(self.settings.state_dir):
             self.ledger.cancel_open_orders(market_now, "kill_switch")
-        _equity, portfolio_peak = self._enforce_loss_policy(market_now, snapshot)
+        self._enforce_overlays(market_now, snapshot)
         equities: dict[str, str] = {}
         for strategy in self.strategies:
             equity = self._run_sleeve(strategy, market_now, snapshot)
-            self._run_shadow_sleeve(strategy, market_now, snapshot)
+            if strategy.name in SHADOW_NAMES:
+                self._run_shadow_sleeve(strategy, market_now, snapshot)
             equities[strategy.name] = money_str(equity)
         self.ledger.set_meta("last_decision_at", iso(wall))
         self.ledger.log_event(
             "cycle",
             {
                 "equities": equities,
-                "portfolio_peak": money_str(portfolio_peak),
                 "kill_switch": kill_active(self.settings.state_dir),
-                "drawdown_freeze": freeze_active(self.settings.state_dir),
+                "buy_pause": self._any_frozen(),
             },
             market_now,
         )
@@ -135,9 +139,9 @@ class Engine:
         return {
             "ts": iso(market_now),
             "kill_switch": kill_active(self.settings.state_dir),
-            "drawdown_freeze": freeze_active(self.settings.state_dir),
+            "buy_pause": self._any_frozen(),
+            "drawdown_freeze": self._any_frozen(),
             "equities": equities,
-            "portfolio_peak": money_str(portfolio_peak),
             "quote_source": snapshot.source,
         }
 
@@ -227,29 +231,36 @@ class Engine:
             equity += qty * quote.mid
         return q8(equity)
 
+    def mark_to_bid(self, sleeve: str, snapshot: MarketSnapshot):
+        return mark_to_bid_equity(
+            self.ledger.cash(sleeve),
+            self.ledger.positions(sleeve),
+            snapshot.quotes,
+            self.settings.cost_per_side,
+        )
+
     def heartbeat_body(self) -> dict:
-        buy_pause = freeze_active(self.settings.state_dir)
+        buy_pause = self._any_frozen()
         kill = read_kill(self.settings.state_dir)
-        peak_raw = self.ledger.get_meta("portfolio_peak")
-        equity_raw = self.ledger.get_meta("portfolio_equity")
-        if peak_raw:
-            peak = D(peak_raw)
-            marked = D(equity_raw) if equity_raw else peak
-            dd = peak_drawdown(marked, peak)
-            peak_equity = money_str(peak)
-            drawdown_pct = money_str(dd)
-        else:
-            peak_equity = None
-            dd = Decimal(0)
-            drawdown_pct = money_str(dd)
+        worst_dd = Decimal(0)
+        peak_equity = None
+        for name in OVERLAY_BOOKS:
+            row = self.ledger.overlay_row(name)
+            if row is None:
+                continue
+            dd = D(row["dd"])
+            if peak_equity is None or dd < worst_dd:
+                worst_dd = dd
+                peak_equity = str(row["peak"])
         return {
             "kill_switch": kill is not None,
             "buy_pause": buy_pause,
             "drawdown_freeze": buy_pause,
             "peak_equity": peak_equity,
-            "drawdown_pct": drawdown_pct,
+            "drawdown_pct": format(q8(worst_dd), "f"),
             "ack_required": (kill is not None and resume_needs_ack(kill)) or buy_pause,
-            "rearm_eligible": (not buy_pause) and dd < self.settings.pause_drawdown_pct,
+            "rearm_eligible": (not buy_pause) and worst_dd > -self.settings.freeze_drawdown_pct,
+            "overlay": self._overlay_public(),
             "last_decision_at": self.ledger.get_meta("last_decision_at"),
             "last_quote_ok_at": self.ledger.get_meta("last_quote_ok_at"),
             "last_loop_ok_at": self.ledger.get_meta("last_loop_ok_at"),
@@ -269,6 +280,10 @@ class Engine:
         state = self.ledger.strategy_state(strategy.name) or strategy.initial_state()
         positions = self.ledger.positions(strategy.name)
         cash = self.ledger.cash(strategy.name)
+        if strategy.name == "dca_weekly":
+            day1 = self.ledger.get_meta("paper_day1")
+            if day1 and not state.get("day1"):
+                state = {**state, "day1": day1}
         if kill_active(self.settings.state_dir):
             orders: list[OrderIntent] = []
             new_state = state
@@ -277,6 +292,8 @@ class Engine:
             orders, new_state, reason = strategy.decide(
                 snapshot, state, positions, cash, equity, market_now
             )
+        if strategy.name == "dca_weekly":
+            new_state, reason = self._dca_freeze_skip(new_state, reason, market_now)
         self.ledger.log_event(
             "decision",
             {
@@ -286,59 +303,66 @@ class Engine:
             },
             market_now,
         )
-        filled = []
+        filled: list[Fill] = []
+        fresh: list[Fill] = []
         for intent in orders:
             if kill_active(self.settings.state_dir):
                 break
             client_order_id = self._client_id(strategy.name, intent, market_now)
             try:
-                fill = self.broker.submit(
+                planned = self.broker.plan(
                     strategy.name,
                     intent,
                     client_order_id,
                     self._context(strategy.name, snapshot, market_now),
                     market_now,
                 )
-            except OrderRejected as exc:
-                if exc.kill:
-                    equity, peak = self._mark_portfolio(market_now, snapshot)
-                    self._trip_drawdown(exc.reasons[0], market_now, snapshot, equity=equity, peak=peak)
+            except OrderRejected:
                 continue
-            filled.append(fill)
-        positions = self.ledger.positions(strategy.name)
-        self.ledger.save_strategy_state(
-            strategy.name, strategy.commit(new_state, filled, positions, market_now)
-        )
+            filled.append(planned)
+            if self.ledger.get_fill(planned.client_order_id) is None:
+                fresh.append(planned)
+        with self.ledger.transaction():
+            for fill in fresh:
+                if self.ledger.get_fill(fill.client_order_id) is None:
+                    self.ledger.apply_fill(fill)
+            positions = self.ledger.positions(strategy.name)
+            final_state = strategy.commit(new_state, filled, positions, market_now)
+            self.ledger.save_strategy_state(strategy.name, final_state, commit=False)
         equity = self.mark(strategy.name, snapshot)
         self.ledger.mark_equity(strategy.name, equity, market_now)
         self.ledger.snapshot(strategy.name, equity, market_now)
         return equity
 
     def _run_shadow_sleeve(self, strategy, market_now: datetime, snapshot: MarketSnapshot) -> None:
-        """Same strategy, without the 10% freeze or the 40% kill.
+        """Same strategy and caps, without the 10% freeze or the 40% kill.
 
-        Other risk checks still apply. This book is the buy-and-hold benchmark
-        and the report's no-overlay ledger. It is never flattened by a kill.
+        Other risk checks still apply. These books are excluded from scoring.
         """
-        self.ledger.ensure_shadow_sleeve(strategy.name, market_now, strategy.initial_state())
-        equity = self.shadow_mark(strategy.name, snapshot)
-        self.ledger.mark_shadow_equity(strategy.name, equity, market_now)
-        state = self.ledger.shadow_strategy_state(strategy.name) or strategy.initial_state()
-        positions = self.ledger.shadow_positions(strategy.name)
-        cash = self.ledger.shadow_cash(strategy.name)
+        shadow = SHADOW_NAMES[strategy.name]
+        self.ledger.ensure_shadow_sleeve(shadow, market_now, strategy.initial_state())
+        equity = self.shadow_mark(shadow, snapshot)
+        self.ledger.mark_shadow_equity(shadow, equity, market_now)
+        state = self.ledger.shadow_strategy_state(shadow) or strategy.initial_state()
+        if strategy.name == "dca_weekly":
+            day1 = self.ledger.get_meta("paper_day1")
+            if day1 and not state.get("day1"):
+                state = {**state, "day1": day1}
+        positions = self.ledger.shadow_positions(shadow)
+        cash = self.ledger.shadow_cash(shadow)
         orders, new_state, _reason = strategy.decide(
             snapshot, state, positions, cash, equity, market_now
         )
         filled: list[Fill] = []
         for intent in orders:
-            client_order_id = "shadow-" + self._client_id(strategy.name, intent, market_now)
+            client_order_id = self._client_id(shadow, intent, market_now)
             existing = self.ledger.get_shadow_fill(client_order_id)
             if existing is not None:
                 filled.append(existing)
                 continue
             decision = self.risk.evaluate(
                 intent,
-                self._shadow_context(strategy.name, snapshot, market_now),
+                self._shadow_context(shadow, snapshot, market_now),
                 client_order_id,
                 ignore_overlay=True,
             )
@@ -355,7 +379,7 @@ class Engine:
                 continue
             qty_delta = qty if intent.side == "buy" else -qty
             fill = Fill(
-                sleeve=strategy.name,
+                sleeve=shadow,
                 symbol=intent.symbol,
                 side=intent.side,
                 qty=qty,
@@ -374,13 +398,13 @@ class Engine:
             except OrderRejected:
                 continue
             filled.append(fill)
-        positions = self.ledger.shadow_positions(strategy.name)
+        positions = self.ledger.shadow_positions(shadow)
         self.ledger.save_shadow_strategy_state(
-            strategy.name, strategy.commit(new_state, filled, positions, market_now)
+            shadow, strategy.commit(new_state, filled, positions, market_now)
         )
-        equity = self.shadow_mark(strategy.name, snapshot)
-        self.ledger.mark_shadow_equity(strategy.name, equity, market_now)
-        self.ledger.shadow_snapshot(strategy.name, equity, market_now)
+        equity = self.shadow_mark(shadow, snapshot)
+        self.ledger.mark_shadow_equity(shadow, equity, market_now)
+        self.ledger.shadow_snapshot(shadow, equity, market_now)
 
     def shadow_mark(self, sleeve: str, snapshot: MarketSnapshot):
         equity = self.ledger.shadow_cash(sleeve)
@@ -408,6 +432,8 @@ class Engine:
             turnover_today=turnover,
             known_client_ids=self.ledger.shadow_known_client_ids(),
             ordered_symbols_today=self.ledger.shadow_symbols_ordered_on(sleeve, day),
+            overlay_state="ARMED",
+            opened_at=self.ledger.position_opened_at(sleeve, shadow=True),
         )
 
     def _context(self, sleeve: str, snapshot: MarketSnapshot, market_now: datetime) -> RiskContext:
@@ -427,124 +453,206 @@ class Engine:
             turnover_today=turnover,
             known_client_ids=self.ledger.known_client_ids(),
             ordered_symbols_today=self.ledger.symbols_ordered_on(sleeve, day),
+            overlay_state=self._overlay_state(sleeve),
+            opened_at=self.ledger.position_opened_at(sleeve),
         )
 
-    def _mark_portfolio(self, market_now: datetime, snapshot: MarketSnapshot) -> tuple[Decimal, Decimal]:
-        """Sum of sleeve marks, and the combined high-water mark.
+    def _overlay_state(self, sleeve: str) -> str:
+        if sleeve not in OVERLAY_BOOKS:
+            return "NONE"
+        row = self.ledger.overlay_row(sleeve)
+        if row is None:
+            return "ARMED"
+        return str(row["state"])
 
-        The peak is portfolio-wide. A freeze acknowledgement does not rebase it.
+    def _any_frozen(self) -> bool:
+        return any(self._overlay_state(name) == "FROZEN" for name in OVERLAY_BOOKS)
+
+    def _overlay_public(self) -> dict:
+        out = {}
+        for name in OVERLAY_BOOKS:
+            row = self.ledger.overlay_row(name)
+            if row is None:
+                continue
+            out[name] = {
+                "state": str(row["state"]),
+                "dd": str(row["dd"]),
+                "peak": str(row["peak"]),
+                "equity": str(row["equity"]),
+            }
+        return out
+
+    def _store_closed_bars(self, snapshot: MarketSnapshot, market_now: datetime) -> None:
+        bars = [bar for series in snapshot.bars.values() for bar in series]
+        if bars:
+            self.ledger.upsert_candles(bars, fetched_at=market_now)
+
+    def _dca_freeze_skip(self, state: dict, reason: str, market_now: datetime) -> tuple[dict, str]:
+        """A due DCA buy during a freeze is denied and is not caught up later."""
+        if reason != "dca_amount_pending_owner_decision":
+            return state, reason
+        if self._overlay_state("dca_weekly") != "FROZEN":
+            return state, reason
+        index = state.get("seen_index")
+        skipped = [int(item) for item in (state.get("skipped_indexes") or [])]
+        if index is None or int(index) in skipped:
+            return state, "freeze"
+        skipped.append(int(index))
+        updated = {**state, "skipped_indexes": skipped}
+        for symbol in self.settings.symbols:
+            self.ledger.record_risk_event(
+                "risk_denial",
+                market_now,
+                sleeve="dca_weekly",
+                symbol=symbol,
+                side="buy",
+                reason="freeze",
+                limit_name="freeze_drawdown_pct",
+                limit_value=format(self.settings.freeze_drawdown_pct, "f"),
+                observed="frozen",
+                client_order_id="",
+                detail="freeze",
+            )
+        return updated, "freeze"
+
+    def _enforce_overlays(self, market_now: datetime, snapshot: MarketSnapshot) -> None:
+        """Option B on trend_daily and dca_weekly only. Never touches buy_and_hold.
+
+        DD = mark-to-bid equity / running peak − 1. An ack does not move the peak.
+        The engine never clears state/KILL.
         """
-        total = Decimal(0)
-        for strategy in self.strategies:
-            self.ledger.ensure_sleeve(strategy.name, market_now, strategy.initial_state())
-            equity = self.mark(strategy.name, snapshot)
-            self.ledger.mark_equity(strategy.name, equity, market_now)
-            total += equity
-        total = q8(total)
-        stored = self.ledger.get_meta("portfolio_peak")
-        peak = D(stored) if stored else total
-        if total > peak:
-            peak = total
-        self.ledger.set_meta("portfolio_peak", money_str(peak))
-        self.ledger.set_meta("portfolio_equity", money_str(total))
-        return total, peak
-
-    def _enforce_loss_policy(
-        self, market_now: datetime, snapshot: MarketSnapshot
-    ) -> tuple[Decimal, Decimal]:
-        """Paper-only drawdown on the combined portfolio peak.
-
-        At 10% from that peak, raise an alert and freeze new buys, including
-        weekly DCA. Exits stay allowed and nothing is force-sold. Acknowledging
-        the freeze does not rebase this peak. The freeze re-arms only after
-        drawdown recovers above the line and then falls through it again.
-        At 40%, flatten and write KILL. These looser limits must not be carried
-        into a live phase. This method never clears the freeze file or the kill
-        file. The AI operator may acknowledge the freeze. Only a human may
-        clear the kill, with ``rhbot resume --ack``.
-        """
-        equity, peak = self._mark_portfolio(market_now, snapshot)
-        dd = peak_drawdown(equity, peak)
-        if dd >= self.settings.kill_drawdown_pct:
-            # A human resume records this peak without moving it. The same
-            # episode must not flatten again. A new high, or a recovery under
-            # the kill line, clears that watermark.
-            if (self.ledger.get_meta("kill_ack_peak") or "") != money_str(peak):
-                reason = kill_reason(equity, peak, self.settings)
-                self._trip_drawdown(
-                    reason or f"max_drawdown {q8(dd)} >= {self.settings.kill_drawdown_pct}",
-                    market_now,
-                    snapshot,
-                    equity=equity,
-                    peak=peak,
+        for name in OVERLAY_BOOKS:
+            strategy = next(item for item in self.strategies if item.name == name)
+            self.ledger.ensure_sleeve(name, market_now, strategy.initial_state())
+            self.ledger.ensure_overlay(name)
+            equity = self.mark_to_bid(name, snapshot)
+            row = self.ledger.overlay_row(name)
+            assert row is not None
+            peak = D(row["peak"])
+            if peak <= 0 or equity > peak:
+                peak = equity
+            dd = signed_drawdown(equity, peak)
+            state = str(row["state"])
+            fields = {
+                "peak": money_str(peak),
+                "equity": money_str(equity),
+                "dd": format(q8(dd), "f"),
+            }
+            acked = str(row["kill_acked_peak"] or "")
+            if dd <= -self.settings.kill_drawdown_pct and acked != money_str(peak):
+                if state != "KILLED":
+                    self._kill_book(name, market_now, snapshot, equity, peak, dd)
+                else:
+                    self.ledger.save_overlay(name, fields)
+                continue
+            if state == "KILLED":
+                self.ledger.save_overlay(name, fields)
+                continue
+            if state == "ARMED" and dd <= -self.settings.freeze_drawdown_pct:
+                fields.update(
+                    {
+                        "state": "FROZEN",
+                        "trip_dd": format(q8(dd), "f"),
+                        "trip_equity": money_str(equity),
+                        "trip_peak": money_str(peak),
+                        "trip_ts": iso(market_now),
+                    }
                 )
-                return equity, peak
-        elif self.ledger.get_meta("kill_ack_peak"):
-            self.ledger.set_meta("kill_ack_peak", "")
-        if kill_active(self.settings.state_dir):
-            return equity, peak
-        if dd >= self.settings.pause_drawdown_pct:
-            self._raise_freeze(market_now, equity, peak, dd)
-        elif not freeze_active(self.settings.state_dir) and self.ledger.get_meta("drawdown_ack_peak"):
-            # Recovered above the freeze line. The next breach of this or a new peak may alert.
-            # The portfolio peak itself is left where it is.
-            self.ledger.set_meta("drawdown_ack_peak", "")
-        return equity, peak
+                self.ledger.save_overlay(name, fields)
+                self.ledger.record_risk_event(
+                    "freeze_trip",
+                    market_now,
+                    sleeve=name,
+                    symbol="",
+                    side="",
+                    reason="freeze",
+                    limit_name="freeze_drawdown_pct",
+                    limit_value=format(self.settings.freeze_drawdown_pct, "f"),
+                    observed=format(q8(dd), "f"),
+                    client_order_id="",
+                    detail="freeze",
+                    extra={
+                        "equity": money_str(equity),
+                        "peak": money_str(peak),
+                        "dd": format(q8(dd), "f"),
+                    },
+                )
+                continue
+            if state == "ACKED" and dd > -self.settings.freeze_drawdown_pct:
+                fields["state"] = "ARMED"
+                self.ledger.save_overlay(name, fields)
+                self.ledger.log_event(
+                    "freeze_rearm",
+                    {
+                        "sleeve": name,
+                        "equity": money_str(equity),
+                        "peak": money_str(peak),
+                        "dd": format(q8(dd), "f"),
+                    },
+                    market_now,
+                )
+                continue
+            self.ledger.save_overlay(name, fields)
 
-    def _raise_freeze(self, market_now: datetime, equity: Decimal, peak: Decimal, dd: Decimal) -> None:
-        if freeze_active(self.settings.state_dir):
-            return
-        if (self.ledger.get_meta("drawdown_ack_peak") or "") == money_str(peak):
-            return
+    def _kill_book(
+        self,
+        name: str,
+        market_now: datetime,
+        snapshot: MarketSnapshot,
+        equity: Decimal,
+        peak: Decimal,
+        dd: Decimal,
+    ) -> None:
         observed = format(q8(dd), "f")
-        reason = f"drawdown_freeze {observed} >= {self.settings.pause_drawdown_pct}"
-        engage_freeze(self.settings.state_dir, reason, "risk")
+        self.ledger.save_overlay(
+            name,
+            {
+                "state": "KILLED",
+                "peak": money_str(peak),
+                "equity": money_str(equity),
+                "dd": observed,
+                "trip_dd": observed,
+                "trip_equity": money_str(equity),
+                "trip_peak": money_str(peak),
+                "trip_ts": iso(market_now),
+            },
+        )
+        reason = f"max_drawdown {observed} <= -{self.settings.kill_drawdown_pct}"
+        engage_kill(self.settings.state_dir, reason, "risk", ack_required=True)
         self.ledger.record_risk_event(
-            "drawdown_freeze",
+            "kill_trip",
             market_now,
-            sleeve="portfolio",
+            sleeve=name,
             symbol="",
             side="",
-            reason="drawdown_freeze",
-            limit_name="pause_drawdown_pct",
-            limit_value=format(self.settings.pause_drawdown_pct, "f"),
+            reason="max_drawdown",
+            limit_name="kill_drawdown_pct",
+            limit_value=format(self.settings.kill_drawdown_pct, "f"),
             observed=observed,
             client_order_id="",
             detail=reason,
+            ack_required=True,
+            extra={"equity": money_str(equity), "peak": money_str(peak), "dd": observed},
         )
+        self._flatten_book(name, market_now, snapshot)
 
-    def _trip_drawdown(
-        self,
-        reason: str,
-        market_now: datetime,
-        snapshot: MarketSnapshot,
-        *,
-        equity: Decimal,
-        peak: Decimal,
-    ) -> None:
-        before = read_kill(self.settings.state_dir)
-        already_acked = bool(before and before.get("ack_required"))
-        engage_kill(self.settings.state_dir, reason, "risk", ack_required=True)
-        if not already_acked:
-            observed = format(q8(peak_drawdown(equity, peak)), "f")
-            self.ledger.record_risk_event(
-                "kill_trip",
-                market_now,
-                sleeve="portfolio",
-                symbol="",
-                side="",
-                reason="max_drawdown",
-                limit_name="kill_drawdown_pct",
-                limit_value=format(self.settings.kill_drawdown_pct, "f"),
-                observed=observed,
-                client_order_id="",
-                detail=reason,
-                ack_required=True,
-            )
-            self.ledger.cancel_open_orders(market_now, "drawdown")
-        held = any(self.ledger.positions(strategy.name) for strategy in self.strategies)
-        if held:
-            self.flatten(now=market_now, snapshot=snapshot, reason="drawdown_flatten")
+    def _flatten_book(self, name: str, market_now: datetime, snapshot: MarketSnapshot) -> None:
+        for symbol, qty in list(self.ledger.positions(name).items()):
+            intent = OrderIntent(symbol, "sell", "drawdown_flatten", base_quantity=qty)
+            client_order_id = self._client_id(name, intent, market_now)
+            try:
+                self.broker.submit(
+                    name,
+                    intent,
+                    client_order_id,
+                    self._context(name, snapshot, market_now),
+                    market_now,
+                    reduce_only=True,
+                )
+            except OrderRejected:
+                continue
+        equity = self.mark(name, snapshot)
+        self.ledger.mark_equity(name, equity, market_now)
 
     def _require_quotes(self, snapshot: MarketSnapshot) -> None:
         missing = [symbol for symbol in self.settings.symbols if symbol not in snapshot.quotes]
@@ -555,19 +663,30 @@ class Engine:
         oldest = min(snapshot.quotes[symbol].ts for symbol in self.settings.symbols)
         self.ledger.set_meta("last_quote_ts", iso(oldest))
         fresh = True
+        ages: list[float] = []
         for symbol in self.settings.symbols:
             age = (market_now - snapshot.quotes[symbol].ts).total_seconds()
+            ages.append(age)
             if age > self.settings.max_quote_age_seconds or age < -5:
                 fresh = False
+        self.ledger.set_meta("last_quote_age_at_cycle_s", str(int(max(ages) if ages else 0)))
         if fresh:
             self.ledger.set_meta("last_quote_ok_at", iso(wall))
             if snapshot.source == "robinhood":
                 self.ledger.set_meta("last_auth_ok_at", iso(wall))
 
     def _client_id(self, sleeve: str, intent: OrderIntent, market_now: datetime) -> str:
-        """One id per sleeve, symbol, side, and UTC day. No random entropy."""
-        day = ensure_utc(market_now).date().isoformat()
-        return f"{sleeve}-{intent.symbol}-{intent.side}-{day}"
+        """sleeve:symbol:side:decision_key. The key is the UTC bar date, or the DCA index."""
+        base = sleeve.removesuffix("_shadow")
+        if base == "dca_weekly":
+            from rhbot.ledger import parse_ts
+            from rhbot.strategies.dca import schedule_index
+
+            raw = self.ledger.get_meta("paper_day1")
+            key = str(schedule_index(market_now, parse_ts(raw))) if raw else ensure_utc(market_now).date().isoformat()
+        else:
+            key = ensure_utc(market_now).date().isoformat()
+        return f"{sleeve}:{intent.symbol}:{intent.side}:{key}"
 
 
 def _intent_payload(intent: OrderIntent) -> dict:

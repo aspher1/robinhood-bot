@@ -32,14 +32,14 @@ Reviews limits. May tighten them in `config.yaml` (smaller position size, tighte
 
 May not loosen a limit, hold credentials, resume the bot while health is critical for a reason other than the kill switch, or "fix" a drawdown by raising the cap.
 
-Drawdown is measured on the combined portfolio peak. These limits are paper-only and must not be carried into a live phase.
+Drawdown is mark-to-bid equity against that book's own peak, for trend and DCA only. These limits are paper-only and must not be carried into a live phase.
 
 Two different controls, two different actors:
 
-- **−10% freeze.** The engine writes `state/DRAWDOWN_FREEZE` and blocks new buys, including weekly DCA. Sells stay allowed and nothing is force-sold. The AI operator may acknowledge it with `rhbot ack-drawdown --reason "..."`. That acknowledgement is an audit event with actor `operator` and the reason. It does not reset the drawdown peak. Once acknowledged, the freeze re-arms only after drawdown recovers above −10% and then falls below it again.
-- **−40% hard kill.** The engine writes `state/KILL` and flattens the paper book. Automation may trip that kill and must never clear it. Clearing it is human-only: `rhbot resume --ack`. That acknowledgement does not reset the peak. The operator does not run that command. `ack-drawdown` does not clear a kill, and `resume --ack` is not a freeze acknowledgement.
+- **−10% freeze.** The engine sets that book to FROZEN and blocks its new buys, including a due DCA buy. Sells stay allowed and nothing is force-sold. The AI operator may acknowledge it with `rhbot ack-drawdown --strategy <name> --by operator|randy --note "..."`. That acknowledgement is an audit event. It does not move the peak. Buys are allowed again while drawdown is still at or below −10%. The book re-arms only after drawdown recovers above −10%.
+- **−40% hard kill.** The engine writes `state/KILL` and flattens that book. Automation may trip that kill and must never clear it. Clearing it is human-only: `rhbot resume --ack --human-code <code>`, matching `RHBOT_HUMAN_RESUME_FILE`. That acknowledgement does not move the peak. The operator does not run that command. `ack-drawdown` does not clear a kill.
 
-A 4% loss on the UTC day blocks new buys until the next UTC day. The buy-and-hold benchmark in `rhbot report` is the no-overlay shadow book, so a kill does not rewrite the benchmark.
+A 4% loss on the UTC day blocks new buys until the next UTC day. Buy-and-hold has no overlay, so a freeze or kill does not flatten it.
 
 ## Operations
 
@@ -50,8 +50,8 @@ Watches the process and is the only role that routinely restarts it.
 | Is it up, and did it do something recently? | `rhbot status`, `rhbot health` |
 | Stop new simulated orders | `rhbot kill --reason "..."` which creates `state/KILL` |
 | Allow orders again after health is clear | `rhbot resume` |
-| Acknowledge a 10% paper freeze (AI operator; does not reset the peak) | `rhbot ack-drawdown --reason "..."` |
-| Clear a 40% paper kill (human only; the operator must not run this) | `rhbot resume --ack` |
+| Acknowledge a 10% paper freeze (AI operator; does not move the peak) | `rhbot ack-drawdown --strategy trend_daily --by operator --note "..."` |
+| Clear a 40% paper kill (human only; the operator must not run this) | `rhbot resume --ack --human-code <code>` |
 | Preflight, including the kill path | `rhbot selftest` |
 | Sell the paper book | `rhbot flatten --paper` (kill first if it should stay sold) |
 | Process actually looping | `state/heartbeat.json` |

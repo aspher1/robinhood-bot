@@ -42,26 +42,30 @@ def test_buy_and_hold_deploys_once(tmp_path, now):
     assert reason2 == "holding"
 
 
-def test_dca_buys_once_per_iso_week(tmp_path, now):
+def test_dca_schedule_is_every_seven_days_and_emits_no_orders(tmp_path, now):
+    from rhbot.strategies.dca import schedule_index
+
     strategy = DcaWeekly(make_settings(tmp_path))
     view = snapshot(now)
     state = strategy.initial_state()
     first, state, reason = strategy.decide(view, state, {}, Decimal("1000"), Decimal("1000"), now)
-    assert reason == "weekly_buy"
-    assert [item.quote_amount for item in first] == [Decimal("25"), Decimal("25")]
-    state = strategy.commit(
-        state,
-        [_fill("BTC-USD", "buy", now), _fill("ETH-USD", "buy", now)],
-        {},
-        now,
-    )
+    assert first == []
+    assert reason == "dca_amount_pending_owner_decision"
+    assert schedule_index(now, now) == 0
+    state = strategy.commit(state, [_fill("BTC-USD", "buy", now)], {}, now)
     second, state, reason2 = strategy.decide(view, state, {}, Decimal("950"), Decimal("1000"), now)
     assert second == []
-    assert reason2 == "already_bought_this_week"
-    later = now + timedelta(days=7)
-    third, _, reason3 = strategy.decide(view, state, {}, Decimal("950"), Decimal("1000"), later)
-    assert reason3 == "weekly_buy"
-    assert len(third) == 2
+    assert reason2 == "already_scheduled"
+    day8 = now + timedelta(days=7)
+    day15 = now + timedelta(days=14)
+    assert schedule_index(day8, now) == 1
+    assert schedule_index(day15, now) == 2
+    third, state, reason3 = strategy.decide(view, state, {}, Decimal("950"), Decimal("1000"), day8)
+    assert third == []
+    assert reason3 == "dca_amount_pending_owner_decision"
+    again, _, reason4 = strategy.decide(view, state, {}, Decimal("950"), Decimal("1000"), day8)
+    assert again == []
+    assert reason4 == "dca_amount_pending_owner_decision"
 
 
 def test_trend_enters_above_band_and_holds_inside_it(tmp_path, now):
@@ -80,7 +84,7 @@ def test_trend_enters_above_band_and_holds_inside_it(tmp_path, now):
         hot, strategy.initial_state(), {}, Decimal("1000"), Decimal("1000"), now
     )
     assert {item.symbol for item in orders} == {"BTC-USD", "ETH-USD"}
-    assert all(item.side == "buy" for item in orders)
+    assert all(item.side == "buy" and item.quote_amount == Decimal("500.00") for item in orders)
     assert "enter" in reason
 
     again, _, reason2 = strategy.decide(hot, state, {}, Decimal("1000"), Decimal("1000"), now)
@@ -120,6 +124,18 @@ def test_trend_min_hold_blocks_exit(tmp_path, now):
     exits, _, exit_reason = strategy.decide(free, state, positions, Decimal("0"), Decimal("800"), free_day)
     assert {item.side for item in exits} == {"sell"}
     assert "exit" in exit_reason
+    flat = strategy.commit(state, [], {}, free_day)
+    reentry_day = free_day + timedelta(days=1)
+    hot_again = snapshot(
+        reentry_day,
+        closes=["8", "8", "12"],
+        last_open=reentry_day - timedelta(days=1),
+    )
+    reentry, _, reentry_reason = strategy.decide(
+        hot_again, flat, {}, Decimal("800"), Decimal("800"), reentry_day
+    )
+    assert {item.side for item in reentry} == {"buy"}
+    assert "enter" in reentry_reason
 
 
 def test_each_sleeve_through_the_engine(tmp_path, now):
@@ -127,25 +143,28 @@ def test_each_sleeve_through_the_engine(tmp_path, now):
     last_open = now - timedelta(days=1)
     view = snapshot(now, closes=["10", "10", "12"], last_open=last_open)
     bot.run_once(now=now, snapshot=view)
-    # Two trades a day, shared by every sleeve. Buy-and-hold uses the first day.
+    # Two trades a day, shared globally. Buy-and-hold uses the first day.
+    # DCA stays disabled until the weekly amount is decided.
     assert bot.ledger.positions("buy_and_hold")["BTC-USD"] > 0
     assert bot.ledger.positions("dca_weekly") == {}
     assert bot.ledger.positions("trend_daily") == {}
     assert len(bot.ledger.fills_for("buy_and_hold")) == 2
+    assert bot.ledger.fills_for("dca_weekly") == []
     bot.run_once(now=now, snapshot=view)
     assert len(bot.ledger.fills_for("buy_and_hold")) == 2
 
     day1 = now + timedelta(days=1)
     view1 = snapshot(day1, closes=["10", "10", "12"], last_open=day1 - timedelta(days=1))
     bot.run_once(now=day1, snapshot=view1)
-    assert len(bot.ledger.fills_for("dca_weekly")) == 2
-    assert bot.ledger.fills_for("trend_daily") == []
+    assert bot.ledger.fills_for("dca_weekly") == []
+    assert len(bot.ledger.fills_for("trend_daily")) == 2
 
     day2 = now + timedelta(days=2)
     view2 = snapshot(day2, closes=["10", "10", "12"], last_open=day2 - timedelta(days=1))
     bot.run_once(now=day2, snapshot=view2)
     assert len(bot.ledger.fills_for("trend_daily")) == 2
     assert len(bot.ledger.fills_for("buy_and_hold")) == 2
+    assert bot.ledger.get_meta("paper_day1")
     for name in ("buy_and_hold", "dca_weekly", "trend_daily"):
         ok, detail = bot.ledger.reconcile(name)
         assert ok, detail

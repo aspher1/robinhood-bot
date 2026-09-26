@@ -30,7 +30,36 @@ class PaperBroker:
         *,
         reduce_only: bool = False,
     ) -> Fill:
-        # Same client id returns the original fill and does not trade again.
+        fill = self.plan(
+            sleeve,
+            intent,
+            client_order_id,
+            ctx,
+            now,
+            reduce_only=reduce_only,
+        )
+        stored = self.ledger.get_fill(fill.client_order_id)
+        if stored is not None:
+            return stored
+        try:
+            self.ledger.commit_fill(fill)
+        except sqlite3.IntegrityError as exc:
+            blocked = deny("duplicate_client_order_id", "client_order_id", "unique")
+            self._record_denial(sleeve, intent, client_order_id, now, blocked)
+            raise OrderRejected(blocked.reasons) from exc
+        return fill
+
+    def plan(
+        self,
+        sleeve: str,
+        intent: OrderIntent,
+        client_order_id: str,
+        ctx: RiskContext,
+        now: datetime,
+        *,
+        reduce_only: bool = False,
+    ) -> Fill:
+        """Risk-check and build a fill. Does not write it."""
         existing = self.ledger.get_fill(client_order_id)
         if existing is not None:
             return existing
@@ -78,12 +107,6 @@ class PaperBroker:
             client_order_id=client_order_id,
             reason=intent.reason,
         )
-        try:
-            self.ledger.commit_fill(fill)
-        except sqlite3.IntegrityError as exc:
-            blocked = deny("duplicate_client_order_id", "client_order_id", "unique")
-            self._record_denial(sleeve, intent, client_order_id, now, blocked)
-            raise OrderRejected(blocked.reasons) from exc
         return fill
 
     def _record_denial(

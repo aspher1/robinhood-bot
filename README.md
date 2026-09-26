@@ -55,7 +55,6 @@ State lives in the directory you pass (default `./state`):
 | `bot.sqlite` | Cash, positions, fills, and the audit log |
 | `heartbeat.json` | Proof the loop finished recently |
 | `KILL` | When this file exists, strategies cannot open new risk. Flatten can still sell |
-| `DRAWDOWN_FREEZE` | When this file exists, new buys are frozen. Sells still work |
 
 ## Commands
 
@@ -68,20 +67,21 @@ rhbot report --since 24h --state-dir state
 rhbot report --since 7d --md --state-dir state
 rhbot kill --reason "quotes look wrong" --state-dir state
 rhbot resume --state-dir state
-rhbot ack-drawdown --reason "reviewed the paper drawdown" --state-dir state
-rhbot resume --ack --state-dir state
+rhbot ack-drawdown --strategy trend_daily --by operator --note "reviewed the paper drawdown" --state-dir state
+rhbot resume --ack --human-code "$CODE" --state-dir state
 rhbot flatten --paper --state-dir state
 rhbot selftest
 rhbot audit verify --state-dir state
+rhbot audit replay --since 7d --state-dir state
 ```
 
-`status` and `health` answer "did it actually do something recently?": last successful cycle, age of the last quote, and error counts. A fresh heartbeat with a stale quote is not healthy.
+`status` and `health` answer "did it actually do something recently?": last successful cycle, the quote age from the last cycle, and error counts. A quote that was fresh during the cycle stays acceptable until the next loop window. The risk engine still rejects a quote older than 30 seconds at order time.
 
 `report` is P&L after costs for each sleeve, next to buy-and-hold.
 
-`resume` will not clear the kill file if something else is critically wrong (a broken ledger, for example). Drawdown is measured on the combined portfolio peak, and these limits are paper-only: they must not be carried into a live phase. A 10% drop freezes new buys, including weekly DCA, until the operator runs `rhbot ack-drawdown --reason "..."`. That acknowledgement does not reset the peak, and the freeze re-arms only after drawdown recovers above −10% and then falls below it again. Sells stay allowed and nothing is force-sold. A 40% drop flattens the paper book and requires a human `rhbot resume --ack`. That acknowledgement does not reset the peak. The operator may trip that kill and must not clear it. `ack-drawdown` does not clear a kill. The hard caps are `pause_drawdown_pct` (10%) and `kill_drawdown_pct` (40%).
+`resume` will not clear the kill file if something else is critically wrong (a broken ledger, for example). Drawdown is mark-to-bid equity against that book's own peak. It applies to the trend and DCA books only, and these limits are paper-only: they must not be carried into a live phase. A 10% drop freezes that book's new buys until the operator runs `rhbot ack-drawdown --strategy <name> --by operator|randy --note "..."`. That acknowledgement does not move the peak. Buys are allowed again while drawdown is still at or below −10%, and the book re-arms only after drawdown recovers above −10%. Sells stay allowed and nothing is force-sold. A 40% drop flattens that book and requires `rhbot resume --ack --human-code <code>`, matching `RHBOT_HUMAN_RESUME_FILE`. That acknowledgement does not move the peak. The operator may trip that kill and must not clear it. `ack-drawdown` does not clear a kill. The hard caps are `freeze_drawdown_pct` (10%) and `kill_drawdown_pct` (40%).
 
-`report` scores buy-and-hold from a no-overlay shadow ledger (the same strategies without the freeze or the kill) and includes that shadow book so the overlay's effect is visible. `status` and `report` list each freeze acknowledgement with its actor and reason.
+`report` includes `trend_daily_shadow` and `dca_weekly_shadow` (the same strategies without the freeze or the kill) and `overlay_impact`. Buy-and-hold is the benchmark and has no overlay. `status` and `report` list each book's state, drawdown, peak, and acknowledgement.
 
 `flatten --paper` sells what the sleeves hold. The strategies will try to buy back on a later cycle unless the kill file is still in place. To stop the book: kill, then flatten.
 

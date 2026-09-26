@@ -11,9 +11,10 @@ cost_per_side: "0.01"
 max_position_pct: "0.50"
 max_total_exposure_pct: "1"
 max_daily_loss_pct: "0.04"
-# Paper only. Measured on the combined portfolio peak. Config may only tighten
-# these. Do not carry them into a live phase.
-pause_drawdown_pct: "0.10"
+# Paper only. Mark-to-bid drawdown on trend_daily and dca_weekly. Config may
+# only tighten these, and the freeze must stay below the kill. Do not carry
+# them into a live phase.
+freeze_drawdown_pct: "0.10"
 kill_drawdown_pct: "0.40"
 max_trades_per_day: 2
 max_quote_age_seconds: 30
@@ -21,8 +22,8 @@ max_daily_turnover_pct: "1"
 max_spread_per_side: "0.02"
 min_order_notional: "10"
 # Chosen before any backtest. The 7-day hold is the risk floor.
-sma_window: 20
-trend_band: "0.01"
+sma_window: 200
+trend_band: "0.02"
 min_hold_days: 7
 trend_target_weight: "0.50"
 dca_notional: "25"

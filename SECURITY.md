@@ -20,14 +20,14 @@ There is no live order path. `LiveBroker` raises `LiveTradingDisabled` on every 
 
 `state/KILL` stops new simulated risk. If the file is missing, unreadable, or not valid JSON, treat a present file as on. The engine never deletes it.
 
-`state/DRAWDOWN_FREEZE` blocks new paper buys, including weekly DCA. Sells still work. The engine never deletes that file. The AI operator clears it with `rhbot ack-drawdown --reason "..."`. That writes a `drawdown_ack` audit event with actor `operator` and the reason. It does not reset the drawdown peak. The freeze re-arms only after drawdown recovers above −10% and then falls below it again.
+A FROZEN strategy book blocks that book's new buys, including a due DCA buy. Sells still work. Buy-and-hold has no overlay. The operator acknowledges one book with `rhbot ack-drawdown --strategy <name> --by operator|randy --note "..."`. That writes a `freeze_ack` audit event. It does not move the peak. Buys are allowed again while drawdown is still at or below −10%. The book re-arms only after drawdown recovers above −10%.
 
-Drawdown is measured on the combined portfolio peak. These limits are paper-only and must not be carried into any live phase. The hard caps are `pause_drawdown_pct` (0.10) and `kill_drawdown_pct` (0.40). Config may only tighten them.
+Drawdown is mark-to-bid equity divided by that book's running peak, minus one. These limits are paper-only and must not be carried into any live phase. The hard caps are `freeze_drawdown_pct` (0.10) and `kill_drawdown_pct` (0.40). Config may only tighten them, and the freeze must stay below the kill.
 
-- 10% writes `state/DRAWDOWN_FREEZE` and does not sell. The operator may acknowledge it. That acknowledgement does not reset the peak.
-- 40% writes `state/KILL` with `ack_required` and sells the paper positions. This kill is human-only.
+- −10% sets that book to FROZEN and does not sell. The operator may acknowledge it. That acknowledgement does not move the peak.
+- −40% writes `state/KILL` with `ack_required` and flattens that book. This kill is human-only.
 
-Clearing that kill takes a human `rhbot resume --ack`. That acknowledgement does not rebase sleeve peaks or the combined peak. The peak rises only on a new equity high. Automation may trip a kill and cannot clear it. The operator must not run `resume --ack` for a drawdown kill. A manual `rhbot kill` can be cleared with `rhbot resume` once health is otherwise fine. Resume still refuses while some other health check is critical. `ack-drawdown` does not clear a kill. Alerts stay in the status and heartbeat JSON. There is no email, SMS, or webhook.
+Clearing that kill takes `rhbot resume --ack --human-code <code>`. The code must match the secret in `RHBOT_HUMAN_RESUME_FILE`. Without it the command exits 2. Resume does not move the peak. Automation may trip a kill and cannot clear it. The operator must not run that resume for a drawdown kill. A manual `rhbot kill` can be cleared with `rhbot resume` once health is otherwise fine. Resume still refuses while some other health check is critical. `ack-drawdown` does not clear a kill. Alerts stay in the status and heartbeat JSON. There is no email, SMS, or webhook.
 
 ## Ownership
 

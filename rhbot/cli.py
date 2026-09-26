@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+from decimal import Decimal
+from pathlib import Path
 
 from rhbot import __version__
 from rhbot.config import load_settings
@@ -15,6 +18,7 @@ from rhbot.ops import (
     clear_kill,
     engage_kill,
     freeze_active,
+    iso,
     kill_active,
     read_heartbeat,
     read_kill,
@@ -68,18 +72,21 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Required after a 40% drawdown kill. Human acknowledgement. Does not move the peak.",
     )
+    resume.add_argument(
+        "--human-code",
+        default=None,
+        help="Secret from RHBOT_HUMAN_RESUME_FILE. Required for a drawdown kill.",
+    )
     resume.set_defaults(func=cmd_resume)
 
     ack = sub.add_parser(
         "ack-drawdown",
         parents=[common],
-        help="Operator acknowledgement of a paper drawdown freeze. Does not clear a kill.",
+        help="Acknowledge a paper freeze on one strategy book. Does not clear a kill or move the peak.",
     )
-    ack.add_argument(
-        "--reason",
-        required=True,
-        help="Why the operator is acknowledging this freeze. Recorded in the audit log.",
-    )
+    ack.add_argument("--strategy", required=True, help="trend_daily or dca_weekly")
+    ack.add_argument("--by", required=True, choices=("operator", "randy"))
+    ack.add_argument("--note", required=True, help="Why this freeze is being acknowledged.")
     ack.set_defaults(func=cmd_ack_drawdown)
 
     flatten = sub.add_parser("flatten", parents=[common], help="Sell paper positions")
@@ -93,6 +100,9 @@ def _parser() -> argparse.ArgumentParser:
     audit_sub = audit.add_subparsers(dest="audit_cmd", required=True)
     verify = audit_sub.add_parser("verify", parents=[common], help="Check the hash chain")
     verify.set_defaults(func=cmd_audit)
+    replay = audit_sub.add_parser("replay", parents=[common], help="Diff live decisions against a temp replay")
+    replay.add_argument("--since", required=True, choices=("7d", "30d"))
+    replay.set_defaults(func=cmd_audit_replay)
 
     run = sub.add_parser("run", parents=[common], help="Long-lived paper loop")
     run.add_argument("--once", action="store_true", help="Run a single cycle and exit")
@@ -169,7 +179,16 @@ def cmd_resume(args: argparse.Namespace) -> int:
         _emit(
             {
                 "ok": False,
-                "error": "this kill requires rhbot resume --ack",
+                "error": "this kill requires rhbot resume --ack --human-code",
+                "ack_required": True,
+            }
+        )
+        return 2
+    if needs_ack and not _human_code_ok(args.human_code):
+        _emit(
+            {
+                "ok": False,
+                "error": "drawdown resume requires --human-code matching RHBOT_HUMAN_RESUME_FILE",
                 "ack_required": True,
             }
         )
@@ -194,13 +213,16 @@ def cmd_resume(args: argparse.Namespace) -> int:
         )
         return 2
     if needs_ack and (settings.state_dir / "bot.sqlite").exists():
-        # Remember this peak so the same episode does not flatten again.
-        # Sleeve peaks and the portfolio peak stay where they are.
+        # Remember each killed book's peak without moving it, so the same
+        # episode does not flatten again.
         ledger = Ledger(settings)
         try:
-            peak = ledger.get_meta("portfolio_peak") or ""
-            if peak:
-                ledger.set_meta("kill_ack_peak", peak)
+            from rhbot.overlay import OVERLAY_BOOKS
+
+            for name in OVERLAY_BOOKS:
+                row = ledger.overlay_row(name)
+                if row is not None and str(row["state"]) == "KILLED":
+                    ledger.save_overlay(name, {"kill_acked_peak": str(row["peak"])})
         finally:
             ledger.close()
     clear_kill(settings.state_dir)
@@ -214,48 +236,109 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_ack_drawdown(args: argparse.Namespace) -> int:
-    """Clear a paper buy-freeze. Does not touch the kill file or the drawdown peak.
+def _human_code_ok(code: str | None) -> bool:
+    path = os.environ.get("RHBOT_HUMAN_RESUME_FILE", "").strip()
+    if not path or not code:
+        return False
+    file_path = Path(path)
+    if not file_path.is_file():
+        return False
+    secret = file_path.read_text(encoding="utf-8").strip()
+    return bool(secret) and secret == str(code).strip()
 
-    The actor is the AI operator. A 40% kill still requires a human
-    ``rhbot resume --ack``. Neither command moves the portfolio peak.
-    """
-    reason = str(args.reason).strip()
-    if not reason:
-        _emit({"ok": False, "error": "ack-drawdown requires a reason"})
+
+def cmd_ack_drawdown(args: argparse.Namespace) -> int:
+    """Acknowledge one frozen book. Does not move the peak or clear a kill."""
+    from rhbot.money import D
+    from rhbot.overlay import OVERLAY_BOOKS, signed_drawdown
+
+    note = str(args.note).strip()
+    if not note:
+        _emit({"ok": False, "error": "ack-drawdown requires a note"})
+        return 2
+    if args.strategy not in OVERLAY_BOOKS:
+        _emit({"ok": False, "error": "strategy is not an overlay book"})
         return 2
     settings = load_settings(args.config, args.state_dir)
-    if not freeze_active(settings.state_dir):
-        _emit({"ok": True, "drawdown_freeze": False, "detail": "already_clear"})
-        return 0
-    clear_freeze(settings.state_dir)
-    peak = ""
-    actor = "operator"
-    if (settings.state_dir / "bot.sqlite").exists():
-        ledger = Ledger(settings)
-        try:
-            peak = ledger.get_meta("portfolio_peak") or ""
-            if peak:
-                ledger.set_meta("drawdown_ack_peak", peak)
-            ledger.log_event(
-                "drawdown_ack",
-                {"actor": actor, "reason": reason, "peak": peak},
-                utcnow(),
+    if not (settings.state_dir / "bot.sqlite").exists():
+        _emit({"ok": False, "error": "no ledger"})
+        return 2
+    ledger = Ledger(settings)
+    try:
+        row = ledger.overlay_row(args.strategy)
+        if row is None or str(row["state"]) != "FROZEN":
+            _emit({"ok": False, "error": "book is not FROZEN", "strategy": args.strategy})
+            return 2
+        ok, detail = ledger.reconcile(args.strategy)
+        if not ok:
+            _emit({"ok": False, "error": "reconcile failed", "detail": detail})
+            return 2
+        trip_equity = D(row["trip_equity"] or "0")
+        trip_peak = D(row["trip_peak"] or "0")
+        trip_dd = D(row["trip_dd"] or "0")
+        recomputed = signed_drawdown(trip_equity, trip_peak)
+        if abs(recomputed - trip_dd) > Decimal("0.000001"):
+            _emit(
+                {
+                    "ok": False,
+                    "error": "recomputed drawdown does not match the trip",
+                    "recomputed_dd": format(recomputed, "f"),
+                    "trip_dd": format(trip_dd, "f"),
+                }
             )
-        finally:
-            ledger.close()
+            return 2
+        peak = str(row["peak"])
+        ledger.save_overlay(
+            args.strategy,
+            {
+                "state": "ACKED",
+                "ack_ts": iso(utcnow()),
+                "ack_by": args.by,
+                "ack_note": note,
+            },
+        )
+        ledger.log_event(
+            "freeze_ack",
+            {
+                "sleeve": args.strategy,
+                "by": args.by,
+                "note": note,
+                "equity": str(row["equity"]),
+                "peak": peak,
+                "dd": str(row["dd"]),
+                "notify_randy": True,
+            },
+            utcnow(),
+        )
+    finally:
+        ledger.close()
     _emit(
         {
             "ok": True,
-            "drawdown_freeze": False,
-            "actor": actor,
-            "reason": reason,
-            "ack_peak": peak,
+            "notify_randy": True,
+            "strategy": args.strategy,
+            "by": args.by,
+            "note": note,
+            "state": "ACKED",
             "peak_unchanged": True,
+            "peak": peak,
             "kill_switch": kill_active(settings.state_dir),
         }
     )
     return 0
+
+
+def cmd_audit_replay(args: argparse.Namespace) -> int:
+    from rhbot.backtest import diff_live
+
+    settings = load_settings(args.config, args.state_dir)
+    try:
+        body = diff_live(settings, args.since)
+    except Exception as exc:
+        _emit({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+        return 2
+    _emit(body)
+    return 0 if body.get("ok") else 2
 
 
 def cmd_flatten(args: argparse.Namespace) -> int:

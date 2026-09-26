@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 venv/
 state/
+config.yaml
 .env
 *.sqlite
 *.sqlite-journal

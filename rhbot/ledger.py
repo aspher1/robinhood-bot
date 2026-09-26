@@ -91,7 +91,23 @@ CREATE TABLE IF NOT EXISTS candles (
     low TEXT NOT NULL,
     close TEXT NOT NULL,
     volume TEXT NOT NULL,
+    fetched_at TEXT,
     PRIMARY KEY (symbol, source, ts)
+);
+CREATE TABLE IF NOT EXISTS overlay_books (
+    sleeve TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    peak TEXT NOT NULL,
+    equity TEXT NOT NULL,
+    dd TEXT NOT NULL,
+    trip_dd TEXT,
+    trip_equity TEXT,
+    trip_peak TEXT,
+    trip_ts TEXT,
+    ack_ts TEXT,
+    ack_by TEXT,
+    ack_note TEXT,
+    kill_acked_peak TEXT
 );
 CREATE TRIGGER IF NOT EXISTS events_no_update
 BEFORE UPDATE ON events
@@ -210,7 +226,10 @@ class Ledger:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.executescript(SCHEMA)
-        self.set_meta("schema_version", "2")
+        columns = {str(row[1]) for row in self.conn.execute("PRAGMA table_info(candles)")}
+        if "fetched_at" not in columns:
+            self.conn.execute("ALTER TABLE candles ADD COLUMN fetched_at TEXT")
+        self.set_meta("schema_version", "3")
         self.set_meta("starting_cash", money_str(settings.starting_cash))
 
     def close(self) -> None:
@@ -326,7 +345,7 @@ class Ledger:
             return {}
         return data
 
-    def save_strategy_state(self, sleeve: str, state: dict) -> None:
+    def save_strategy_state(self, sleeve: str, state: dict, *, commit: bool = True) -> None:
         self.conn.execute(
             """
             INSERT INTO strategy_state(sleeve, state_json) VALUES(?, ?)
@@ -334,7 +353,8 @@ class Ledger:
             """,
             (sleeve, canonical(state)),
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     def known_client_ids(self) -> set[str]:
         rows = self.conn.execute("SELECT client_order_id FROM orders").fetchall()
@@ -351,7 +371,11 @@ class Ledger:
         return len(rows), q8(total)
 
     def strategy_trades_today(self, day: str) -> int:
-        """Fills that count toward the global daily trade cap."""
+        """Fills that count toward the global daily trade cap.
+
+        F-003 is waiting on Randy. The live path keeps this global count.
+        ``book_strategy_trades_today`` is the per-book count and is not wired in.
+        """
         placeholders = ",".join("?" for _ in RISK_REDUCTION_REASONS)
         row = self.conn.execute(
             f"""
@@ -359,6 +383,18 @@ class Ledger:
             WHERE substr(ts, 1, 10)=? AND reason NOT IN ({placeholders})
             """,
             (day, *RISK_REDUCTION_REASONS),
+        ).fetchone()
+        return int(row["n"])
+
+    def book_strategy_trades_today(self, sleeve: str, day: str) -> int:
+        """Per-book trade count. Not used by the engine until F-003 is decided."""
+        placeholders = ",".join("?" for _ in RISK_REDUCTION_REASONS)
+        row = self.conn.execute(
+            f"""
+            SELECT COUNT(*) AS n FROM fills
+            WHERE sleeve=? AND substr(ts, 1, 10)=? AND reason NOT IN ({placeholders})
+            """,
+            (sleeve, day, *RISK_REDUCTION_REASONS),
         ).fetchone()
         return int(row["n"])
 
@@ -431,9 +467,10 @@ class Ledger:
         client_order_id: str,
         detail: str,
         ack_required: bool = False,
+        extra: dict | None = None,
     ) -> None:
         """Write a risk denial, drawdown freeze, or kill trip to the trade log and the hash chain."""
-        if kind not in ("risk_denial", "drawdown_freeze", "kill_trip"):
+        if kind not in ("risk_denial", "drawdown_freeze", "freeze_trip", "kill_trip"):
             raise ValueError(f"unknown risk event {kind}")
         payload = {
             "ack_required": ack_required,
@@ -449,11 +486,13 @@ class Ledger:
         }
         if kind == "kill_trip":
             payload["by"] = "risk"
-        elif kind == "drawdown_freeze":
+        elif kind in ("drawdown_freeze", "freeze_trip"):
             payload["by"] = "risk"
             payload.pop("ack_required")
         else:
             payload.pop("ack_required")
+        if extra:
+            payload.update(extra)
         with self.transaction():
             self.conn.execute(
                 """
@@ -531,57 +570,107 @@ class Ledger:
 
     def commit_fill(self, fill: Fill) -> None:
         with self.transaction():
-            self.insert_open_order(
-                client_order_id=fill.client_order_id,
-                sleeve=fill.sleeve,
-                symbol=fill.symbol,
-                side=fill.side,
-                ts=fill.ts,
-                reason=fill.reason,
-            )
-            cash = self.cash(fill.sleeve)
-            new_cash = q8(cash + fill.cash_delta)
-            if new_cash < 0:
-                raise OrderRejected(["insufficient_cash"])
-            new_pos = q8(self.position_qty(fill.sleeve, fill.symbol) + fill.qty_delta)
-            if new_pos < 0:
-                raise OrderRejected(["insufficient_position"])
-            self.conn.execute(
-                "UPDATE sleeves SET cash=? WHERE name=?",
-                (money_str(new_cash), fill.sleeve),
-            )
-            self.conn.execute(
-                """
-                INSERT INTO positions(sleeve, symbol, qty) VALUES(?, ?, ?)
-                ON CONFLICT(sleeve, symbol) DO UPDATE SET qty=excluded.qty
-                """,
-                (fill.sleeve, fill.symbol, money_str(new_pos)),
-            )
-            self.conn.execute(
-                """
-                INSERT INTO fills(
-                    sleeve, symbol, side, qty, qty_delta, mid, fill_price,
-                    cash_delta, cost, notional, ts, client_order_id, reason
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    fill.sleeve,
-                    fill.symbol,
-                    fill.side,
-                    money_str(fill.qty),
-                    money_str(fill.qty_delta),
-                    money_str(fill.mid),
-                    money_str(fill.fill_price),
-                    money_str(fill.cash_delta),
-                    money_str(fill.cost),
-                    money_str(fill.notional),
-                    iso(fill.ts),
-                    fill.client_order_id,
-                    fill.reason,
-                ),
-            )
-            self.set_order_status(fill.client_order_id, "filled")
-            self.append_event("fill", fill.event_payload(), fill.ts)
+            self.apply_fill(fill)
+
+    def apply_fill(self, fill: Fill) -> None:
+        """Write one fill. Caller owns the transaction."""
+        self.insert_open_order(
+            client_order_id=fill.client_order_id,
+            sleeve=fill.sleeve,
+            symbol=fill.symbol,
+            side=fill.side,
+            ts=fill.ts,
+            reason=fill.reason,
+        )
+        cash = self.cash(fill.sleeve)
+        new_cash = q8(cash + fill.cash_delta)
+        if new_cash < 0:
+            raise OrderRejected(["insufficient_cash"])
+        new_pos = q8(self.position_qty(fill.sleeve, fill.symbol) + fill.qty_delta)
+        if new_pos < 0:
+            raise OrderRejected(["insufficient_position"])
+        self.conn.execute(
+            "UPDATE sleeves SET cash=? WHERE name=?",
+            (money_str(new_cash), fill.sleeve),
+        )
+        self.conn.execute(
+            """
+            INSERT INTO positions(sleeve, symbol, qty) VALUES(?, ?, ?)
+            ON CONFLICT(sleeve, symbol) DO UPDATE SET qty=excluded.qty
+            """,
+            (fill.sleeve, fill.symbol, money_str(new_pos)),
+        )
+        self.conn.execute(
+            """
+            INSERT INTO fills(
+                sleeve, symbol, side, qty, qty_delta, mid, fill_price,
+                cash_delta, cost, notional, ts, client_order_id, reason
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                fill.sleeve,
+                fill.symbol,
+                fill.side,
+                money_str(fill.qty),
+                money_str(fill.qty_delta),
+                money_str(fill.mid),
+                money_str(fill.fill_price),
+                money_str(fill.cash_delta),
+                money_str(fill.cost),
+                money_str(fill.notional),
+                iso(fill.ts),
+                fill.client_order_id,
+                fill.reason,
+            ),
+        )
+        self.set_order_status(fill.client_order_id, "filled")
+        self.append_event("fill", fill.event_payload(), fill.ts)
+
+    def position_opened_at(self, sleeve: str, *, shadow: bool = False) -> dict[str, datetime]:
+        """First buy after the book was last flat, per coin."""
+        table = "shadow_fills" if shadow else "fills"
+        rows = self.conn.execute(
+            f"SELECT symbol, qty_delta, ts FROM {table} WHERE sleeve=? ORDER BY id",
+            (sleeve,),
+        ).fetchall()
+        qty: dict[str, Decimal] = {}
+        opened: dict[str, datetime] = {}
+        for row in rows:
+            symbol = str(row["symbol"])
+            before = qty.get(symbol, Decimal(0))
+            after = q8(before + D(row["qty_delta"]))
+            if before <= 0 and after > 0:
+                opened[symbol] = parse_ts(str(row["ts"]))
+            if after <= 0:
+                opened.pop(symbol, None)
+            qty[symbol] = after
+        return {symbol: ts for symbol, ts in opened.items() if qty.get(symbol, Decimal(0)) > 0}
+
+    def ensure_overlay(self, sleeve: str) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO overlay_books(sleeve, state, peak, equity, dd)
+            VALUES(?, 'ARMED', '0', '0', '0')
+            ON CONFLICT(sleeve) DO NOTHING
+            """,
+            (sleeve,),
+        )
+        self.conn.commit()
+
+    def overlay_row(self, sleeve: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM overlay_books WHERE sleeve=?",
+            (sleeve,),
+        ).fetchone()
+
+    def save_overlay(self, sleeve: str, fields: dict[str, str]) -> None:
+        self.ensure_overlay(sleeve)
+        assignments = ", ".join(f"{key}=?" for key in fields)
+        self.conn.execute(
+            f"UPDATE overlay_books SET {assignments} WHERE sleeve=?",
+            (*fields.values(), sleeve),
+        )
+        self.conn.commit()
 
     def mark_equity(self, sleeve: str, equity: Decimal, now: datetime) -> tuple[Decimal, Decimal]:
         """Update peak and the UTC day-start mark. Returns (day_start, peak)."""
@@ -931,15 +1020,24 @@ class Ledger:
         row = self.conn.execute("PRAGMA integrity_check").fetchone()
         return row is not None and str(row[0]) == "ok"
 
-    def upsert_candles(self, bars: list[Bar]) -> None:
+    def upsert_candles(self, bars: list[Bar], *, fetched_at: datetime | None = None) -> None:
+        """Store a bar only when it was already closed at fetch time."""
+        from datetime import timedelta
+
+        when = fetched_at or datetime.now(timezone.utc)
         for bar in bars:
+            if bar.ts + timedelta(days=1) > when:
+                continue
             self.conn.execute(
                 """
-                INSERT INTO candles(symbol, source, ts, open, high, low, close, volume)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO candles(
+                    symbol, source, ts, open, high, low, close, volume, fetched_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(symbol, source, ts) DO UPDATE SET
                     open=excluded.open, high=excluded.high, low=excluded.low,
-                    close=excluded.close, volume=excluded.volume
+                    close=excluded.close, volume=excluded.volume,
+                    fetched_at=excluded.fetched_at
                 """,
                 (
                     bar.symbol,
@@ -950,27 +1048,34 @@ class Ledger:
                     money_str(bar.low),
                     money_str(bar.close),
                     money_str(bar.volume),
+                    iso(when),
                 ),
             )
         self.conn.commit()
+
+    def load_candles_any(self, symbol: str) -> list[Bar]:
+        rows = self.conn.execute(
+            "SELECT * FROM candles WHERE symbol=? ORDER BY ts",
+            (symbol,),
+        ).fetchall()
+        return [_bar_from_row(row) for row in rows]
 
     def load_candles(self, symbol: str, source: str) -> list[Bar]:
         rows = self.conn.execute(
             "SELECT * FROM candles WHERE symbol=? AND source=? ORDER BY ts",
             (symbol, source),
         ).fetchall()
-        out: list[Bar] = []
-        for row in rows:
-            out.append(
-                Bar(
-                    symbol=str(row["symbol"]),
-                    ts=parse_ts(str(row["ts"])),
-                    open=D(row["open"]),
-                    high=D(row["high"]),
-                    low=D(row["low"]),
-                    close=D(row["close"]),
-                    volume=D(row["volume"]),
-                    source=str(row["source"]),
-                )
-            )
-        return out
+        return [_bar_from_row(row) for row in rows]
+
+
+def _bar_from_row(row: sqlite3.Row) -> Bar:
+    return Bar(
+        symbol=str(row["symbol"]),
+        ts=parse_ts(str(row["ts"])),
+        open=D(row["open"]),
+        high=D(row["high"]),
+        low=D(row["low"]),
+        close=D(row["close"]),
+        volume=D(row["volume"]),
+        source=str(row["source"]),
+    )

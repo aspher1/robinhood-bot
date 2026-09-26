@@ -35,7 +35,7 @@ def test_round_trip_loses_about_two_percent(tmp_path, now):
     view = snapshot(now)
     buy = OrderIntent("BTC-USD", "buy", "test", quote_amount=Decimal("101"))
     bot.broker.submit("buy_and_hold", buy, "buy-1", bot._context("buy_and_hold", view, now), now)
-    later = now + timedelta(days=1)
+    later = now + timedelta(days=7)
     later_view = snapshot(later)
     sell = OrderIntent("BTC-USD", "sell", "test", base_quantity=Decimal("1"))
     bot.broker.submit(

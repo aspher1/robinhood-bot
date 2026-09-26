@@ -19,6 +19,16 @@ def closed_bars(bars: list[Bar], now: datetime) -> list[Bar]:
     return sorted((bar for bar in bars if bar.ts <= cutoff), key=lambda bar: bar.ts)
 
 
+def has_latest_closed_bar(bars: list[Bar], now: datetime) -> bool:
+    """True when yesterday's daily bar is present. A missing one is stale."""
+    closed = closed_bars(bars, now)
+    if not closed:
+        return False
+    expected = (now.astimezone(timezone.utc) - timedelta(days=1)).date()
+    latest = closed[-1].ts.astimezone(timezone.utc).date()
+    return latest >= expected
+
+
 class TrendDaily:
     name = "trend_daily"
 
@@ -30,7 +40,6 @@ class TrendDaily:
             "last_decision_date": None,
             "evaluated_on": {},
             "holding_since": {},
-            "flat_since": {},
         }
 
     def decide(
@@ -42,7 +51,6 @@ class TrendDaily:
         equity: Decimal,
         now: datetime,
     ) -> tuple[list[OrderIntent], dict, str]:
-        del cash
         today = now.astimezone(timezone.utc).date().isoformat()
         evaluated = dict(state.get("evaluated_on") or {})
         orders: list[OrderIntent] = []
@@ -51,12 +59,13 @@ class TrendDaily:
             if evaluated.get(symbol) == today:
                 notes.append(f"{symbol}:already_decided_today")
                 continue
-            closed = closed_bars(view.bars.get(symbol, []), now)
+            series = view.bars.get(symbol, [])
+            closed = closed_bars(series, now)
+            if not has_latest_closed_bar(series, now):
+                notes.append(f"{symbol}:stale_candles")
+                continue
             if len(closed) < self.settings.sma_window:
                 notes.append(f"{symbol}:insufficient_history")
-                continue
-            if now - closed[-1].ts > timedelta(days=3):
-                notes.append(f"{symbol}:stale_candles")
                 continue
             window = closed[-self.settings.sma_window :]
             sma = sum((bar.close for bar in window), Decimal(0)) / Decimal(len(window))
@@ -90,14 +99,9 @@ class TrendDaily:
                 )
                 notes.append(f"{symbol}:exit")
                 continue
-            flat_since = (state.get("flat_since") or {}).get(symbol)
-            if flat_since is not None and self._days(flat_since, today) < self.settings.min_hold_days:
-                notes.append(f"{symbol}:min_flat")
-                continue
-            quote = view.quotes.get(symbol)
-            current_value = qty * quote.mid if quote is not None else Decimal(0)
-            target = q_cent(equity * self.settings.trend_target_weight)
-            buy_amount = q_cent(target - current_value)
+            # One sleeve per coin: half the book, which is the full cash of that sleeve.
+            sleeve_cash = q_cent(self.settings.starting_cash / Decimal(len(self.settings.symbols)))
+            buy_amount = min(sleeve_cash, q_cent(cash))
             if buy_amount < self.settings.min_order_notional:
                 notes.append(f"{symbol}:below_min")
                 continue
@@ -120,18 +124,14 @@ class TrendDaily:
         del fills
         today = now.astimezone(timezone.utc).date().isoformat()
         holding = dict(state.get("holding_since") or {})
-        flat = dict(state.get("flat_since") or {})
         for symbol in self.settings.symbols:
             qty = positions.get(symbol, Decimal(0))
             if qty > 0:
                 holding.setdefault(symbol, today)
-                flat.pop(symbol, None)
-            elif symbol in holding:
-                flat[symbol] = today
+            else:
                 holding.pop(symbol, None)
         updated = dict(state)
         updated["holding_since"] = holding
-        updated["flat_since"] = flat
         return updated
 
     @staticmethod

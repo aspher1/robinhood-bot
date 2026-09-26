@@ -117,7 +117,36 @@ def parse_coinbase_ticker(symbol: str, payload: object) -> Quote:
     )
 
 
-def parse_kraken_ticker(symbol: str, payload: object, headers: dict[str, str]) -> Quote:
+def parse_kraken_trade_time(payload: object) -> datetime | None:
+    """Latest trade timestamp from Kraken's public Trades result.
+
+    Each trade row is [price, volume, time, side, type, misc]. The time is
+    Unix seconds from the market, not the HTTP Date header.
+    """
+    if not isinstance(payload, dict):
+        return None
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return None
+    latest: datetime | None = None
+    for key, value in result.items():
+        if key == "last" or not isinstance(value, list):
+            continue
+        for row in value:
+            if not isinstance(row, list) or len(row) < 3:
+                continue
+            ts = datetime.fromtimestamp(float(row[2]), tz=timezone.utc)
+            if latest is None or ts > latest:
+                latest = ts
+    return latest
+
+
+def parse_kraken_ticker(
+    symbol: str,
+    payload: object,
+    headers: dict[str, str] | None = None,
+    trade_time: datetime | None = None,
+) -> Quote:
     if not isinstance(payload, dict):
         raise DataError("kraken ticker payload is not an object")
     errors = payload.get("error") or []
@@ -138,14 +167,18 @@ def parse_kraken_ticker(symbol: str, payload: object, headers: dict[str, str]) -
         raise DataError("kraken ticker last price is empty")
     bid = D(series["b"][0]) if isinstance(series.get("b"), list) and series["b"] else None
     ask = D(series["a"][0]) if isinstance(series.get("a"), list) and series["a"] else None
+    del headers
+    trusted = trade_time is not None
+    ts = trade_time if trade_time is not None else datetime.now(timezone.utc)
     return Quote(
         symbol=symbol,
-        ts=_header_time(headers),
+        ts=ts,
         mid=D(last[0]),
         source="kraken",
         bid=bid,
         ask=ask,
         spread_included=False,
+        ts_trusted=trusted,
     )
 
 
@@ -196,7 +229,10 @@ class PublicMarketData:
                 status, body, headers = self._get(url)
                 if status != 200:
                     raise DataError(f"kraken ticker http {status}")
-                quotes[symbol] = parse_kraken_ticker(symbol, body, headers)
+                trade_url = f"https://api.kraken.com/0/public/Trades?pair={pair}"
+                trade_status, trade_body, _trade_headers = self._get(trade_url)
+                trade_time = parse_kraken_trade_time(trade_body) if trade_status == 200 else None
+                quotes[symbol] = parse_kraken_ticker(symbol, body, headers, trade_time=trade_time)
         return quotes
 
     def _get(self, url: str) -> tuple[int, object, dict[str, str]]:

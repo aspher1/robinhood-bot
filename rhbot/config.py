@@ -24,7 +24,7 @@ ALLOW_SHORT = False
 # "Stricter" means a smaller risk budget, a higher cost, a larger minimum order,
 # or a longer minimum hold.
 #
-# pause_drawdown_pct and kill_drawdown_pct are paper-only. A live phase must
+# freeze_drawdown_pct and kill_drawdown_pct are paper-only. A live phase must
 # not inherit these looser drawdown limits. Config may only lower them.
 HARD_CAPS = {
     "max_position_pct": Decimal("0.50"),
@@ -32,7 +32,7 @@ HARD_CAPS = {
     "max_daily_loss_pct": Decimal("0.04"),
     # Paper only: freeze new buys at 10% off the combined peak. Do not carry
     # this into a live phase.
-    "pause_drawdown_pct": Decimal("0.10"),
+    "freeze_drawdown_pct": Decimal("0.10"),
     # Paper only: hard kill and flatten at 40% off the combined peak. Do not
     # carry this into a live phase.
     "kill_drawdown_pct": Decimal("0.40"),
@@ -77,7 +77,7 @@ class Settings(BaseModel):
     max_daily_loss_pct: Decimal = Decimal("0.04")
     # Paper only. Combined-portfolio peak. Config may only tighten these.
     # They must not be copied into a live phase.
-    pause_drawdown_pct: Decimal = Decimal("0.10")
+    freeze_drawdown_pct: Decimal = Decimal("0.10")
     kill_drawdown_pct: Decimal = Decimal("0.40")
     max_trades_per_day: int = 2
     max_quote_age_seconds: int = 30
@@ -85,8 +85,8 @@ class Settings(BaseModel):
     max_spread_per_side: Decimal = Decimal("0.02")
     min_order_notional: Decimal = Decimal("10")
     # Chosen before any backtest. The hold is the risk floor. See ARCHITECTURE.md.
-    sma_window: int = 20
-    trend_band: Decimal = Decimal("0.01")
+    sma_window: int = 200
+    trend_band: Decimal = Decimal("0.02")
     min_hold_days: int = 7
     trend_target_weight: Decimal = Decimal("0.50")
     dca_notional: Decimal = Decimal("25")
@@ -100,7 +100,7 @@ class Settings(BaseModel):
         "max_position_pct",
         "max_total_exposure_pct",
         "max_daily_loss_pct",
-        "pause_drawdown_pct",
+        "freeze_drawdown_pct",
         "kill_drawdown_pct",
         "max_daily_turnover_pct",
         "max_spread_per_side",
@@ -157,7 +157,7 @@ class Settings(BaseModel):
             "max_position_pct",
             "max_total_exposure_pct",
             "max_daily_loss_pct",
-            "pause_drawdown_pct",
+            "freeze_drawdown_pct",
             "kill_drawdown_pct",
             "max_daily_turnover_pct",
             "max_spread_per_side",
@@ -181,8 +181,8 @@ class Settings(BaseModel):
             )
         if self.min_order_notional < HARD_CAPS["min_order_notional"]:
             problems.append("min_order_notional cannot be below 10")
-        if self.pause_drawdown_pct >= self.kill_drawdown_pct:
-            problems.append("pause_drawdown_pct must stay below kill_drawdown_pct")
+        if self.freeze_drawdown_pct >= self.kill_drawdown_pct:
+            problems.append("freeze_drawdown_pct must stay below kill_drawdown_pct")
         if not self.symbols:
             problems.append("symbols cannot be empty")
         unknown = [s for s in self.symbols if s not in ALLOWED_SYMBOLS]
