@@ -33,10 +33,57 @@ class RiskContext:
 
 
 @dataclass(frozen=True)
+class LimitHit:
+    """One risk check that failed, and the limit it was measured against."""
+
+    reason: str
+    limit_name: str
+    limit: str
+    observed: str = ""
+
+
+@dataclass(frozen=True)
 class RiskDecision:
     allowed: bool
     reasons: list[str]
     kill: bool = False
+    breaches: tuple[LimitHit, ...] = ()
+
+
+def _text(value: object) -> str:
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    if value is None:
+        return ""
+    return str(value)
+
+
+def deny(
+    code: str,
+    limit_name: str,
+    limit: object,
+    observed: object = "",
+    *,
+    kill: bool = False,
+    detail: str | None = None,
+) -> RiskDecision:
+    """A denial. ``code`` is the stable reason. ``detail`` is the sentence stored beside it."""
+    return RiskDecision(
+        False,
+        [detail or code],
+        kill=kill,
+        breaches=(LimitHit(code, limit_name, _text(limit), _text(observed)),),
+    )
+
+
+def _decision(hit: LimitHit, *, kill: bool = False) -> RiskDecision:
+    return RiskDecision(False, [hit.reason], kill=kill, breaches=(hit,))
+
+
+def _ratio(numerator: Decimal, denominator: Decimal) -> str:
+    if denominator <= 0:
+        return ""
+    return format(q8(numerator / denominator), "f")
 
 
 def peak_drawdown(equity: Decimal, peak: Decimal) -> Decimal:
@@ -111,9 +158,16 @@ class RiskEngine:
         try:
             return self._evaluate(intent, ctx, client_order_id, reduce_only=reduce_only)
         except OrderRejected as exc:
-            return RiskDecision(False, exc.reasons, kill=exc.kill)
+            code = exc.reasons[0] if exc.reasons else "rejected"
+            return deny(code, code, "deny", kill=exc.kill)
         except Exception as exc:
-            return RiskDecision(False, [f"fail_closed:{type(exc).__name__}"], kill=False)
+            return deny(
+                "fail_closed",
+                "fail_closed",
+                "deny",
+                type(exc).__name__,
+                detail=f"fail_closed:{type(exc).__name__}",
+            )
 
     def _evaluate(
         self,
@@ -125,57 +179,75 @@ class RiskEngine:
     ) -> RiskDecision:
         settings = self.settings
         if client_order_id in ctx.known_client_ids:
-            return RiskDecision(False, ["duplicate_client_order_id"])
+            return deny("duplicate_client_order_id", "client_order_id", "unique")
 
         if intent.symbol not in ALLOWED_SYMBOLS or intent.symbol not in settings.symbols:
-            return RiskDecision(False, ["symbol_not_allowed"])
+            return deny("symbol_not_allowed", "symbols", ",".join(ALLOWED_SYMBOLS), intent.symbol)
 
         if intent.side not in ("buy", "sell"):
-            return RiskDecision(False, ["side_not_allowed"])
+            return deny("side_not_allowed", "side", "buy,sell", intent.side)
 
         position = ctx.positions.get(intent.symbol, Decimal(0))
         if intent.side == "sell":
             if intent.base_quantity is None or intent.base_quantity <= 0:
-                return RiskDecision(False, ["sell_quantity"])
+                return deny("sell_quantity", "base_quantity", "positive")
             if q8(intent.base_quantity) > q8(position):
-                return RiskDecision(False, ["short_not_allowed"])
+                return deny("short_not_allowed", "allow_short", "false", intent.base_quantity)
         elif intent.side == "buy":
             if reduce_only:
-                return RiskDecision(False, ["reduce_only_sells"])
+                return deny("reduce_only_sells", "reduce_only", "sell")
             if intent.quote_amount is None or intent.quote_amount <= 0:
-                return RiskDecision(False, ["buy_amount"])
+                return deny("buy_amount", "quote_amount", "positive")
 
         quote = ctx.quotes.get(intent.symbol)
         fresh = self._fresh(quote, ctx.now)
         if fresh is not None:
-            return RiskDecision(False, [fresh])
+            return _decision(fresh)
         assert quote is not None
         spread = self._spread(quote)
         if spread is not None:
-            return RiskDecision(False, [spread])
+            return _decision(spread)
 
         if kill_active(settings.state_dir) and not reduce_only:
-            return RiskDecision(False, ["kill_switch"])
+            return deny("kill_switch", "kill_switch", "engaged")
 
         if reduce_only:
             return RiskDecision(True, [])
 
-        breach = kill_reason(ctx.equity, ctx.peak_equity, settings)
-        if breach:
-            return RiskDecision(False, [breach], kill=True)
+        dd = peak_drawdown(ctx.equity, ctx.peak_equity)
+        if dd >= settings.max_drawdown_pct:
+            return deny(
+                "max_drawdown",
+                "max_drawdown_pct",
+                settings.max_drawdown_pct,
+                q8(dd),
+                kill=True,
+                detail=f"max_drawdown {q8(dd)} >= {settings.max_drawdown_pct}",
+            )
 
         if intent.symbol in ctx.ordered_symbols_today:
-            return RiskDecision(False, ["one_order_per_symbol_per_bar"])
+            return deny("one_order_per_symbol_per_bar", "orders_per_symbol_per_bar", "1", intent.symbol)
 
         if intent.side == "buy":
-            blocked = daily_buy_block(ctx.equity, ctx.day_start_equity, settings)
-            if blocked:
-                return RiskDecision(False, [blocked])
+            loss = daily_loss(ctx.equity, ctx.day_start_equity)
+            if loss >= settings.max_daily_loss_pct:
+                return deny(
+                    "daily_loss",
+                    "max_daily_loss_pct",
+                    settings.max_daily_loss_pct,
+                    q8(loss),
+                    detail=f"daily_loss {q8(loss)} >= {settings.max_daily_loss_pct}",
+                )
             assert intent.quote_amount is not None
             if intent.quote_amount < settings.min_order_notional:
-                return RiskDecision(False, ["below_min_notional"])
+                return deny(
+                    "below_min_notional",
+                    "min_order_notional",
+                    settings.min_order_notional,
+                    intent.quote_amount,
+                )
             if intent.quote_amount > ctx.cash + EPS:
-                return RiskDecision(False, ["insufficient_cash"])
+                return deny("insufficient_cash", "cash", ctx.cash, intent.quote_amount)
             # Cap the coin's mid value, not the cash spent. The cash spent is
             # higher by the per-side cost, and blocking that would make a 50%
             # position impossible.
@@ -184,53 +256,84 @@ class RiskEngine:
             trade_cap_pct = min(settings.max_position_pct, limit)
             cap = ctx.equity * trade_cap_pct + EPS
             if notional > cap:
-                return RiskDecision(False, ["per_trade_cap"])
+                return deny("per_trade_cap", "per_trade_cap_pct", trade_cap_pct, _ratio(notional, ctx.equity))
             projected = (position + qty) * quote.mid
             if projected > cap:
-                return RiskDecision(False, ["position_cap"])
+                return deny("position_cap", "max_position_pct", trade_cap_pct, _ratio(projected, ctx.equity))
             exposure = self._exposure_after_buy(ctx, intent.symbol, projected)
             exposure_cap = ctx.equity * limit + EPS
             if exposure > exposure_cap:
-                return RiskDecision(False, ["exposure_cap"])
+                return deny("exposure_cap", "max_total_exposure_pct", limit, _ratio(exposure, ctx.equity))
             turnover_cap = ctx.day_start_equity * settings.max_daily_turnover_pct + EPS
             if ctx.turnover_today + intent.quote_amount > turnover_cap:
-                return RiskDecision(False, ["turnover_cap"])
+                return deny(
+                    "turnover_cap",
+                    "max_daily_turnover_pct",
+                    settings.max_daily_turnover_pct,
+                    intent.quote_amount,
+                )
             if ctx.trades_today >= settings.max_trades_per_day:
-                return RiskDecision(False, ["max_trades_per_day"])
+                return deny(
+                    "max_trades_per_day",
+                    "max_trades_per_day",
+                    settings.max_trades_per_day,
+                    ctx.trades_today,
+                )
             return RiskDecision(True, [])
 
         # Strategy sells still count as trades. Caps do not block a shrink.
         assert intent.base_quantity is not None
         notional = q8(intent.base_quantity * quote.mid)
         if notional < settings.min_order_notional:
-            return RiskDecision(False, ["below_min_notional"])
+            return deny(
+                "below_min_notional",
+                "min_order_notional",
+                settings.min_order_notional,
+                notional,
+            )
         if ctx.trades_today >= settings.max_trades_per_day:
-            return RiskDecision(False, ["max_trades_per_day"])
+            return deny(
+                "max_trades_per_day",
+                "max_trades_per_day",
+                settings.max_trades_per_day,
+                ctx.trades_today,
+            )
         return RiskDecision(True, [])
 
-    def _fresh(self, quote: Quote | None, now: datetime) -> str | None:
+    def _fresh(self, quote: Quote | None, now: datetime) -> LimitHit | None:
         if quote is None:
-            return "missing_quote"
+            return LimitHit("missing_quote", "quote", "required", "missing")
         if quote.ts.tzinfo is None or now.tzinfo is None:
-            return "naive_timestamp"
+            return LimitHit("naive_timestamp", "quote_ts", "timezone-aware", "naive")
         age = (now - quote.ts).total_seconds()
         if age < -5:
-            return "quote_from_the_future"
+            return LimitHit("quote_from_the_future", "max_quote_age_seconds", "0", str(int(age)))
         if age > self.settings.max_quote_age_seconds:
-            return "stale_quote"
+            return LimitHit(
+                "stale_quote",
+                "max_quote_age_seconds",
+                str(self.settings.max_quote_age_seconds),
+                str(int(age)),
+            )
         return None
 
-    def _spread(self, quote: Quote) -> str | None:
+    def _spread(self, quote: Quote) -> LimitHit | None:
         if quote.bid is None or quote.ask is None:
             return None
         if quote.ask < quote.bid:
-            return "crossed_quote"
+            return LimitHit("crossed_quote", "spread", "bid<=ask", "crossed")
         if quote.mid <= 0:
-            return "bad_mid"
+            return LimitHit("bad_mid", "mid", "positive", _text(quote.mid))
         buy_side = (quote.ask - quote.mid) / quote.mid
         sell_side = (quote.mid - quote.bid) / quote.mid
-        if buy_side > self.settings.max_spread_per_side or sell_side > self.settings.max_spread_per_side:
-            return "spread_too_wide"
+        wider = max(buy_side, sell_side)
+        if wider > self.settings.max_spread_per_side:
+            return LimitHit(
+                "spread_too_wide",
+                "max_spread_per_side",
+                _text(self.settings.max_spread_per_side),
+                _text(q8(wider)),
+            )
         return None
 
     def _exposure_after_buy(self, ctx: RiskContext, symbol: str, projected_value: Decimal) -> Decimal:

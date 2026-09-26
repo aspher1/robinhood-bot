@@ -251,9 +251,22 @@ def test_engine_stale_data_rejects_without_killing(tmp_path, now):
     view = snapshot_at(now - timedelta(minutes=10), now)
     bot.run_once(now=now, snapshot=view)
     assert bot.ledger.fills_for("buy_and_hold") == []
-    assert bot.ledger.count_events("risk_reject", "buy_and_hold") >= 1
+    assert bot.ledger.count_events("risk_denial", "buy_and_hold") >= 1
+    denial = _events(bot, "risk_denial")[0]
+    assert denial["reason"] == "stale_quote"
+    assert denial["limit_name"] == "max_quote_age_seconds"
+    assert denial["limit"] == "30"
     assert not (tmp_path / "KILL").exists()
     bot.ledger.close()
+
+
+def _events(bot, kind: str) -> list[dict]:
+    import json
+
+    rows = bot.ledger.conn.execute(
+        "SELECT payload FROM events WHERE kind=? ORDER BY seq", (kind,)
+    ).fetchall()
+    return [json.loads(row["payload"]) for row in rows]
 
 
 def snapshot_at(quote_time, market_now):

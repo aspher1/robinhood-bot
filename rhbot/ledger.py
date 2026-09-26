@@ -113,6 +113,30 @@ BEFORE DELETE ON fills
 BEGIN
     SELECT RAISE(ABORT, 'append-only');
 END;
+CREATE TABLE IF NOT EXISTS trade_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    sleeve TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    limit_name TEXT NOT NULL,
+    limit_value TEXT NOT NULL,
+    observed TEXT NOT NULL,
+    client_order_id TEXT NOT NULL,
+    detail TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS trade_log_no_update
+BEFORE UPDATE ON trade_log
+BEGIN
+    SELECT RAISE(ABORT, 'append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trade_log_no_delete
+BEFORE DELETE ON trade_log
+BEGIN
+    SELECT RAISE(ABORT, 'append-only');
+END;
 """
 
 
@@ -135,7 +159,7 @@ class Ledger:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.executescript(SCHEMA)
-        self.set_meta("schema_version", "1")
+        self.set_meta("schema_version", "2")
         self.set_meta("starting_cash", money_str(settings.starting_cash))
 
     def close(self) -> None:
@@ -345,6 +369,65 @@ class Ledger:
         """Append an event and commit it. Do not call this inside ``transaction()``."""
         with self.transaction():
             return self.append_event(kind, data, ts)
+
+    def record_risk_event(
+        self,
+        kind: str,
+        ts: datetime,
+        *,
+        sleeve: str,
+        symbol: str,
+        side: str,
+        reason: str,
+        limit_name: str,
+        limit_value: str,
+        observed: str,
+        client_order_id: str,
+        detail: str,
+        ack_required: bool = False,
+    ) -> None:
+        """Write one risk denial or kill trip to the trade log and the hash chain."""
+        if kind not in ("risk_denial", "kill_trip"):
+            raise ValueError(f"unknown risk event {kind}")
+        payload = {
+            "ack_required": ack_required,
+            "client_order_id": client_order_id,
+            "detail": detail,
+            "limit": limit_value,
+            "limit_name": limit_name,
+            "observed": observed,
+            "reason": reason,
+            "side": side,
+            "sleeve": sleeve,
+            "symbol": symbol,
+        }
+        if kind == "kill_trip":
+            payload["by"] = "risk"
+        else:
+            payload.pop("ack_required")
+        with self.transaction():
+            self.conn.execute(
+                """
+                INSERT INTO trade_log(
+                    ts, kind, sleeve, symbol, side, reason, limit_name,
+                    limit_value, observed, client_order_id, detail
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    iso(ts),
+                    kind,
+                    sleeve,
+                    symbol,
+                    side,
+                    reason,
+                    limit_name,
+                    limit_value,
+                    observed,
+                    client_order_id,
+                    detail,
+                ),
+            )
+            self.append_event(kind, payload, ts)
 
     def insert_open_order(
         self,

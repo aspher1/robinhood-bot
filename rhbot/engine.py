@@ -17,12 +17,13 @@ from rhbot.errors import OrderRejected
 from rhbot.ledger import Ledger
 from rhbot.models import MarketSnapshot, OrderIntent
 from rhbot.money import D, money_str, q8
-from rhbot.ops import engage_kill, iso, kill_active, sd_notify, utcnow, write_heartbeat
+from rhbot.ops import engage_kill, iso, kill_active, read_kill, sd_notify, utcnow, write_heartbeat
 from rhbot.risk import (
     RiskContext,
     RiskEngine,
     exposure_limit_pct,
     kill_reason,
+    peak_drawdown,
     target_sell_notional,
 )
 from rhbot.strategies import build_strategies
@@ -158,17 +159,6 @@ class Engine:
                         reduce_only=True,
                     )
                 except OrderRejected as exc:
-                    self.ledger.bump("error_risk_reject")
-                    self.ledger.log_event(
-                        "risk_reject",
-                        {
-                            "sleeve": strategy.name,
-                            "symbol": symbol,
-                            "side": "sell",
-                            "reasons": exc.reasons,
-                        },
-                        market_now,
-                    )
                     errors.append(
                         {"sleeve": strategy.name, "symbol": symbol, "reasons": exc.reasons}
                     )
@@ -278,19 +268,16 @@ class Engine:
                     market_now,
                 )
             except OrderRejected as exc:
-                self.ledger.bump("error_risk_reject")
-                self.ledger.log_event(
-                    "risk_reject",
-                    {
-                        "sleeve": strategy.name,
-                        "symbol": intent.symbol,
-                        "side": intent.side,
-                        "reasons": exc.reasons,
-                    },
-                    market_now,
-                )
                 if exc.kill:
-                    self._trip_drawdown(exc.reasons[0], market_now, snapshot, strategy.name)
+                    row = self.ledger.sleeve_row(strategy.name)
+                    self._trip_drawdown(
+                        exc.reasons[0],
+                        market_now,
+                        snapshot,
+                        strategy.name,
+                        equity=self.mark(strategy.name, snapshot),
+                        peak=D(row["peak_equity"]),
+                    )
                 continue
             filled.append(fill)
         positions = self.ledger.positions(strategy.name)
@@ -329,7 +316,9 @@ class Engine:
             _day_start, peak = self.ledger.mark_equity(strategy.name, equity, market_now)
             reason = kill_reason(equity, peak, self.settings)
             if reason:
-                self._trip_drawdown(reason, market_now, snapshot, strategy.name)
+                self._trip_drawdown(
+                    reason, market_now, snapshot, strategy.name, equity=equity, peak=peak
+                )
                 return
         if kill_active(self.settings.state_dir):
             return
@@ -346,14 +335,28 @@ class Engine:
         market_now: datetime,
         snapshot: MarketSnapshot,
         sleeve: str,
+        *,
+        equity: Decimal,
+        peak: Decimal,
     ) -> None:
-        already = kill_active(self.settings.state_dir)
+        before = read_kill(self.settings.state_dir)
+        already_acked = bool(before and before.get("ack_required"))
         engage_kill(self.settings.state_dir, reason, "risk", ack_required=True)
-        if not already:
-            self.ledger.log_event(
-                "kill",
-                {"reason": reason, "by": "risk", "sleeve": sleeve, "ack_required": True},
+        if not already_acked:
+            observed = format(q8(peak_drawdown(equity, peak)), "f")
+            self.ledger.record_risk_event(
+                "kill_trip",
                 market_now,
+                sleeve=sleeve,
+                symbol="",
+                side="",
+                reason="max_drawdown",
+                limit_name="max_drawdown_pct",
+                limit_value=format(self.settings.max_drawdown_pct, "f"),
+                observed=observed,
+                client_order_id="",
+                detail=reason,
+                ack_required=True,
             )
             self.ledger.cancel_open_orders(market_now, "drawdown")
         held = any(self.ledger.positions(strategy.name) for strategy in self.strategies)
@@ -408,18 +411,7 @@ class Engine:
                     market_now,
                     reduce_only=True,
                 )
-            except OrderRejected as exc:
-                self.ledger.bump("error_risk_reject")
-                self.ledger.log_event(
-                    "risk_reject",
-                    {
-                        "sleeve": sleeve,
-                        "symbol": symbol,
-                        "side": "sell",
-                        "reasons": exc.reasons,
-                    },
-                    market_now,
-                )
+            except OrderRejected:
                 continue
             sold = True
         if sold:

@@ -126,3 +126,80 @@ def test_backtest_replay_uses_the_engine(tmp_path, now):
     ok, detail = bot.ledger.verify_chain()
     assert ok, detail
     bot.ledger.close()
+
+
+def test_replay_separates_risk_blocks_from_fidelity(tmp_path, now):
+    import json
+    import sqlite3
+    from datetime import timedelta
+
+    from rhbot.backtest import replay
+    from rhbot.status import build_report
+    from tests.conftest import make_bars, make_settings
+
+    last_open = now - timedelta(days=1)
+    closes = ["100", "100", "100", "80"]
+    settings = make_settings(tmp_path, sma_window=20)
+    bars = {
+        "BTC-USD": make_bars("BTC-USD", closes, last_open),
+        "ETH-USD": make_bars("ETH-USD", closes, last_open),
+    }
+    bot = replay(settings, bars)
+    ok, detail = bot.ledger.verify_chain()
+    assert ok, detail
+    assert (tmp_path / "KILL").exists()
+    kill = json.loads((tmp_path / "KILL").read_text(encoding="utf-8"))
+    assert kill["ack_required"] is True
+    assert bot.ledger.positions("buy_and_hold") == {}
+
+    denials = [
+        json.loads(row["payload"])
+        for row in bot.ledger.conn.execute(
+            "SELECT payload FROM events WHERE kind='risk_denial'"
+        )
+    ]
+    assert any(
+        item["reason"] == "max_trades_per_day" and item["limit"] == "2" for item in denials
+    )
+    trips = [
+        json.loads(row["payload"])
+        for row in bot.ledger.conn.execute(
+            "SELECT payload FROM events WHERE kind='kill_trip'"
+        )
+    ]
+    assert len(trips) == 1
+    assert trips[0]["reason"] == "max_drawdown"
+    assert trips[0]["limit_name"] == "max_drawdown_pct"
+    assert trips[0]["limit"] == "0.10"
+    assert trips[0]["ack_required"] is True
+    trade_rows = bot.ledger.conn.execute(
+        "SELECT kind, reason, limit_name, limit_value FROM trade_log"
+    ).fetchall()
+    assert any(row["kind"] == "risk_denial" and row["limit_value"] == "2" for row in trade_rows)
+    assert any(
+        row["kind"] == "kill_trip" and row["limit_name"] == "max_drawdown_pct" and row["limit_value"] == "0.10"
+        for row in trade_rows
+    )
+    with __import__("pytest").raises(sqlite3.Error, match="append-only"):
+        bot.ledger.conn.execute("UPDATE trade_log SET reason='nope'")
+    for name in ("buy_and_hold", "dca_weekly", "trend_daily"):
+        match, message = bot.ledger.reconcile(name)
+        assert match, message
+    bot.ledger.close()
+
+    clean = build_report(settings, "30d", now=now + timedelta(days=2))
+    assert clean["fidelity_ok"] is True
+    assert any(item["reason"] == "max_trades_per_day" and item["limit"] == "2" for item in clean["risk_denials"])
+    assert clean["kill_trips"][0]["limit"] == "0.10"
+    assert clean["kill_trips"][0]["ack_required"] is True
+    assert all(body["fidelity"]["ok"] for body in clean["sleeves"].values())
+
+    raw = sqlite3.connect(tmp_path / "bot.sqlite")
+    raw.execute("UPDATE sleeves SET cash='1.00000000' WHERE name='buy_and_hold'")
+    raw.commit()
+    raw.close()
+    broken = build_report(settings, "30d", now=now + timedelta(days=2))
+    assert broken["fidelity_ok"] is False
+    assert broken["sleeves"]["buy_and_hold"]["fidelity"]["ok"] is False
+    assert any(item["reason"] == "max_trades_per_day" for item in broken["risk_denials"])
+    assert broken["kill_trips"][0]["reason"] == "max_drawdown"

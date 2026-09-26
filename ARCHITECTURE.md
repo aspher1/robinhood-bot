@@ -71,7 +71,9 @@ A 4% loss versus the UTC day-start equity blocks new buys in that sleeve until t
 
 ## Ledger and audit
 
-`state/bot.sqlite` holds sleeves, positions, fills, open-order rows, equity snapshots, candle cache, and the `events` table. Each event stores the previous row's hash and `sha256(prev + payload)`. Database triggers reject updates and deletes on `events` and `fills`. `rhbot audit verify` replays the chain and, when a heartbeat exists, checks that its `audit_head` matches the log. Health also replays cash and positions from fills.
+`state/bot.sqlite` holds sleeves, positions, fills, open-order rows, equity snapshots, candle cache, and the `events` table. Each event stores the previous row's hash and `sha256(prev + payload)`. Database triggers reject updates and deletes on `events`, `fills`, and `trade_log`. `rhbot audit verify` replays the chain and, when a heartbeat exists, checks that its `audit_head` matches the log. Health also replays cash and positions from fills.
+
+A risk denial is an audit event of kind `risk_denial` and a matching `trade_log` row. A 10% kill is kind `kill_trip`, with `ack_required`, the reason `max_drawdown`, and the limit `max_drawdown_pct`. Both carry the limit that was hit and the observed value. `rhbot report` lists those blocks on their own. A fidelity mismatch is a separate check: stored cash or positions do not match a replay of the fills. Offline replay (`rhbot/backtest.py`) calls the same `Engine.run_once` path, so the same risk engine writes those events. It does not clear a kill.
 
 ## Operator surface
 

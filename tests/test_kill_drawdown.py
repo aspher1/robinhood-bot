@@ -54,6 +54,21 @@ def test_ten_percent_drawdown_kills_flattens_and_requires_ack(tmp_path, now):
     assert kill["ack_required"] is True
     assert "drawdown" in kill["reason"]
     assert bot.ledger.positions("buy_and_hold") == {}
+    trips = bot.ledger.conn.execute(
+        "SELECT payload FROM events WHERE kind='kill_trip'"
+    ).fetchall()
+    assert len(trips) == 1
+    trip = __import__("json").loads(trips[0]["payload"])
+    assert trip["reason"] == "max_drawdown"
+    assert trip["limit_name"] == "max_drawdown_pct"
+    assert trip["limit"] == "0.10"
+    assert trip["ack_required"] is True
+    logged = bot.ledger.conn.execute(
+        "SELECT reason, limit_value FROM trade_log WHERE kind='kill_trip'"
+    ).fetchall()
+    assert len(logged) == 1
+    assert logged[0]["reason"] == "max_drawdown"
+    assert logged[0]["limit_value"] == "0.10"
     bot.ledger.close()
 
     assert main(["resume", "--state-dir", str(tmp_path)]) == 2

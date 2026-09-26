@@ -246,12 +246,19 @@ def build_report(settings: Settings, since_text: str, now: datetime | None = Non
                 continue
             sleeves[name] = _sleeve_report(ledger, name, start)
         benchmark = sleeves.get("buy_and_hold", {}).get("window", {}).get("return_pct")
+        denials = []
+        trips = []
+        fidelity_ok = True
         for name, body in sleeves.items():
             if benchmark is None or name == "buy_and_hold":
                 body["excess_return_vs_buy_and_hold_pct"] = None
             else:
                 excess = D(body["window"]["return_pct"]) - D(benchmark)
                 body["excess_return_vs_buy_and_hold_pct"] = format(q8(excess), "f")
+            denials.extend(body["risk_denials"])
+            trips.extend(body["kill_trips"])
+            if not body["fidelity"]["ok"]:
+                fidelity_ok = False
         return {
             "since": since_text,
             "from": iso(start),
@@ -259,6 +266,9 @@ def build_report(settings: Settings, since_text: str, now: datetime | None = Non
             "started": True,
             "starting_cash_per_sleeve": money_str(settings.starting_cash),
             "cost_per_side": format(settings.cost_per_side, "f"),
+            "risk_denials": denials,
+            "kill_trips": trips,
+            "fidelity_ok": fidelity_ok,
             "sleeves": sleeves,
         }
     finally:
@@ -303,13 +313,9 @@ def _sleeve_report(ledger: Ledger, sleeve: str, start: datetime) -> dict:
         if parse_ts(str(fill["ts"])) >= start:
             fees += D(fill["cost"])
             trades += 1
-    rejects = 0
-    for event in ledger.conn.execute("SELECT payload FROM events WHERE kind='risk_reject'"):
-        payload = json.loads(event["payload"])
-        if payload.get("sleeve") != sleeve:
-            continue
-        if parse_ts(str(payload["ts"])) >= start:
-            rejects += 1
+    denials = _risk_records(ledger, "risk_denial", sleeve, start)
+    trips = _risk_records(ledger, "kill_trip", sleeve, start)
+    fidelity_ok, fidelity_detail = ledger.reconcile(sleeve)
     since_pnl = q8(last_equity - starting)
     since_return = Decimal(0) if starting == 0 else (since_pnl / starting) * Decimal(100)
     return {
@@ -324,10 +330,38 @@ def _sleeve_report(ledger: Ledger, sleeve: str, start: datetime) -> dict:
             "return_pct": format(q8(window_return), "f"),
             "fees": money_str(fees),
             "trades": trades,
-            "risk_rejects": rejects,
             "max_drawdown_pct": format(q8(max_dd * Decimal(100)), "f"),
         },
+        "risk_denials": denials,
+        "kill_trips": trips,
+        "fidelity": {"ok": fidelity_ok, "detail": fidelity_detail},
     }
+
+
+def _risk_records(ledger: Ledger, kind: str, sleeve: str, start: datetime) -> list[dict]:
+    """Audit rows for one sleeve. These are risk blocks, not fill-replay mismatches."""
+    found = []
+    for event in ledger.conn.execute("SELECT payload FROM events WHERE kind=?", (kind,)):
+        payload = json.loads(event["payload"])
+        if payload.get("sleeve") != sleeve:
+            continue
+        if parse_ts(str(payload["ts"])) < start:
+            continue
+        found.append(
+            {
+                "ts": payload["ts"],
+                "sleeve": sleeve,
+                "symbol": payload.get("symbol") or "",
+                "side": payload.get("side") or "",
+                "reason": payload.get("reason") or "",
+                "limit_name": payload.get("limit_name") or "",
+                "limit": payload.get("limit") or "",
+                "observed": payload.get("observed") or "",
+                "detail": payload.get("detail") or "",
+                "ack_required": bool(payload.get("ack_required")),
+            }
+        )
+    return found
 
 
 def render_markdown(report: dict) -> str:
@@ -342,15 +376,33 @@ def render_markdown(report: dict) -> str:
     if not report.get("started"):
         lines.append("The bot has not started, so there is no P&L yet.")
         return "\n".join(lines)
-    lines.append("| Sleeve | Window P&L | Return % | Fees | Trades | Max DD % | vs buy & hold |")
-    lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+    lines.append(
+        "| Sleeve | Window P&L | Return % | Fees | Trades | Max DD % | vs buy & hold | Risk blocks | Kills | Fidelity |"
+    )
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for name, body in report["sleeves"].items():
         window = body["window"]
         excess = body.get("excess_return_vs_buy_and_hold_pct")
+        fidelity = "ok" if body["fidelity"]["ok"] else "mismatch"
         lines.append(
             f"| {name} | {window['pnl']} | {window['return_pct']} | {window['fees']} | "
-            f"{window['trades']} | {window['max_drawdown_pct']} | {excess if excess is not None else 'benchmark'} |"
+            f"{window['trades']} | {window['max_drawdown_pct']} | "
+            f"{excess if excess is not None else 'benchmark'} | {len(body['risk_denials'])} | "
+            f"{len(body['kill_trips'])} | {fidelity} |"
         )
+    if report.get("risk_denials") or report.get("kill_trips"):
+        lines.append("")
+        lines.append("Risk blocks are limit denials and kill trips. A fidelity mismatch is a cash or position replay that does not match the fills.")
+        for item in report.get("risk_denials", []):
+            lines.append(
+                f"- denial {item['sleeve']} {item['symbol']} {item['side']}: {item['reason']} "
+                f"limit {item['limit_name']}={item['limit']} observed {item['observed']}"
+            )
+        for item in report.get("kill_trips", []):
+            lines.append(
+                f"- kill {item['sleeve']}: {item['reason']} "
+                f"limit {item['limit_name']}={item['limit']} observed {item['observed']}"
+            )
     lines.append("")
     return "\n".join(lines)
 

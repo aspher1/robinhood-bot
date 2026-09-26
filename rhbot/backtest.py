@@ -1,6 +1,8 @@
 """Replay daily bars through the same engine the live loop uses.
 
 This is an offline helper. It does not fetch data and it does not tune parameters.
+Every bar goes through ``Engine.run_once``, so the same risk engine denies orders,
+cuts exposure, and trips the 10% kill. Replay does not clear a kill file.
 """
 
 from __future__ import annotations
