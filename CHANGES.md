@@ -46,6 +46,17 @@ F-023: a −40% trip sets that book to KILLED and flattens it. It does not write
 
 Not done, optional: F-015 through F-019.
 
+### Audit iteration 6
+
+The audited head `7f34324` is behind this branch. F-022 and F-023 were already closed here and stay closed. F-024 was already closed by keeping a single-book −40% trip off `state/KILL`. This pass adds the acceptance coverage and the two hardenings.
+
+- **F-022.** Still closed. `test_f022_kill_flatten_does_not_reuse_same_day_strategy_sell` keeps the distinct `:drawdown_flatten` client id.
+- **F-023.** Still closed. `test_f023_retry_flatten_until_book_is_flat` retries a rejected flatten, blocks resume while quantity remains, and leaves buy-and-hold and the peaks alone.
+- **F-024.** A −40% trip still kills and flattens only that book. `test_f024_kill_halt_stays_on_the_killed_book` checks that buy-and-hold and DCA still decide, that no process-wide `state/KILL` is written, and that human resume is still required. Peaks stay put.
+- **I-001.** The F-022 and F-023 acceptance tests above.
+- **I-002.** A leftover flatten writes a hash-chained `kill_flatten_incomplete` event and health lists that sleeve with each symbol and quantity. Thresholds and sizes are unchanged.
+- **I-003.** `status.assess` and `build_report` open the ledger with `mode=ro`. They do not migrate schema or rewrite meta. `test_i003_status_and_report_leave_the_ledger_mtime` checks that `bot.sqlite` is unchanged.
+
 ### Left open
 
 - No live Robinhood key was available here, so the quote adapter is covered with fixtures and the signature vector, not a production account.

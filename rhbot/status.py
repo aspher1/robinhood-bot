@@ -100,7 +100,7 @@ def assess(settings: Settings, now: datetime | None = None) -> dict:
         checks["db_integrity"] = {"ok": True, "skipped": True}
         checks["quotes"] = {"ok": True, "skipped": True}
     else:
-        ledger = Ledger(settings)
+        ledger = Ledger(settings, readonly=True)
         try:
             integrity = ledger.integrity_ok()
             checks["db_integrity"] = {"ok": integrity}
@@ -280,21 +280,25 @@ def assess(settings: Settings, now: datetime | None = None) -> dict:
     }
 
 
-def _incomplete_kill_flattens(ledger: Ledger, overlay_view: dict, positions: dict) -> list[str]:
+def _incomplete_kill_flattens(ledger: Ledger, overlay_view: dict, positions: dict) -> list[dict]:
     """Killed overlay books that still hold quantity, or were flagged as such."""
     flagged = {
         item
         for item in (ledger.get_meta("kill_flatten_incomplete") or "").split(",")
         if item
     }
-    names: list[str] = []
+    details: list[dict] = []
     for name, item in overlay_view.items():
         if item.get("state") != "KILLED":
             continue
-        held = any(D(qty) > 0 for qty in positions.get(name, {}).values())
+        held = {
+            symbol: qty
+            for symbol, qty in positions.get(name, {}).items()
+            if D(qty) > 0
+        }
         if held or name in flagged:
-            names.append(name)
-    return names
+            details.append({"sleeve": name, "positions": held})
+    return details
 
 
 def _overlay_view(ledger: Ledger, now: datetime) -> dict:
@@ -393,7 +397,7 @@ def build_report(settings: Settings, since_text: str, now: datetime | None = Non
             "cost_per_side": format(settings.cost_per_side, "f"),
             "sleeves": {},
         }
-    ledger = Ledger(settings)
+    ledger = Ledger(settings, readonly=True)
     try:
         sleeves: dict[str, dict] = {}
         for name in SLEEVES:

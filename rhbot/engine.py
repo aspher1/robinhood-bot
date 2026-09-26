@@ -727,9 +727,23 @@ class Engine:
                 errors.append(f"{symbol}: reused {fill.reason} fill {fill.client_order_id}")
         equity = self.mark(name, snapshot)
         self.ledger.mark_equity(name, equity, market_now)
-        left = sorted(symbol for symbol, qty in self.ledger.positions(name).items() if qty > 0)
+        remaining = {
+            symbol: qty
+            for symbol, qty in self.ledger.positions(name).items()
+            if qty > 0
+        }
+        left = sorted(remaining)
         incomplete = bool(left or errors)
         self._note_flatten_status(name, incomplete=incomplete)
+        if remaining:
+            self.ledger.log_event(
+                "kill_flatten_incomplete",
+                {
+                    "sleeve": name,
+                    "positions": {symbol: money_str(qty) for symbol, qty in remaining.items()},
+                },
+                market_now,
+            )
         if incomplete:
             detail = (
                 f"drawdown_flatten incomplete for {name}: "

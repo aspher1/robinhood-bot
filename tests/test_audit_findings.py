@@ -376,7 +376,13 @@ def test_f023_retry_flatten_until_book_is_flat(tmp_path, monkeypatch):
     status = assess(bot.settings, now=utcnow())
     assert status["health"] == "critical"
     assert "kill_flatten_incomplete" in status["reasons"]
-    assert "trend_daily" in status["checks"]["kill_flatten"]["sleeves"]
+    flagged = status["checks"]["kill_flatten"]["sleeves"]
+    assert flagged[0]["sleeve"] == "trend_daily"
+    assert D(flagged[0]["positions"]["BTC-USD"]) > 0
+    incomplete = _events(bot, "kill_flatten_incomplete")
+    assert incomplete[-1]["sleeve"] == "trend_daily"
+    assert D(incomplete[-1]["positions"]["BTC-USD"]) == bot.ledger.positions("trend_daily")["BTC-USD"]
+    assert bot.ledger.verify_chain()[0]
     bot.ledger.close()
 
     from rhbot.cli import main
@@ -415,6 +421,87 @@ def test_f023_retry_flatten_until_book_is_flat(tmp_path, monkeypatch):
     assert main(["resume", "--ack", "--state-dir", str(tmp_path)]) == 2
     assert main(["resume", "--ack", "--human-code", "nope", "--state-dir", str(tmp_path)]) == 2
     assert main(["resume", "--ack", "--human-code", "resume-ok", "--state-dir", str(tmp_path)]) == 0
+
+
+def test_f024_kill_halt_stays_on_the_killed_book(tmp_path, monkeypatch):
+    wall = datetime.now(UTC).replace(microsecond=0)
+    opened = wall - timedelta(days=2)
+    buy_at = wall - timedelta(days=1)
+    bot = engine(tmp_path, sma_window=200)
+    bot.run_once(now=opened, snapshot=snapshot(opened))
+    held_bh = dict(bot.ledger.positions("buy_and_hold"))
+    bot.broker.submit(
+        "trend_daily",
+        OrderIntent("BTC-USD", "buy", "trend_entry", quote_amount=Decimal("500")),
+        f"trend_daily:BTC-USD:buy:{buy_at.date().isoformat()}",
+        bot._context("trend_daily", snapshot(buy_at), buy_at),
+        buy_at,
+    )
+    overlay_peak = bot.ledger.overlay_row("trend_daily")["peak"]
+    dca_peak = bot.ledger.overlay_row("dca_weekly")["peak"]
+    portfolio_peak = bot.ledger.get_meta("portfolio_peak")
+    sleeve_peaks = {
+        str(row["name"]): str(row["peak_equity"])
+        for row in bot.ledger.conn.execute("SELECT name, peak_equity FROM sleeves")
+    }
+    bot.run_once(now=wall, snapshot=snapshot(wall, mid="10"))
+    assert read_kill(tmp_path) is None
+    assert not (tmp_path / "KILL").exists()
+    assert bot.ledger.overlay_row("trend_daily")["state"] == "KILLED"
+    assert bot.ledger.positions("trend_daily") == {}
+    assert bot.ledger.positions("buy_and_hold") == held_bh
+    assert bot.ledger.overlay_row("dca_weekly")["state"] != "KILLED"
+    assert bot.ledger.overlay_row("trend_daily")["peak"] == overlay_peak
+    assert bot.ledger.overlay_row("dca_weekly")["peak"] == dca_peak
+    assert bot.ledger.get_meta("portfolio_peak") == portfolio_peak
+    for name, stored in sleeve_peaks.items():
+        assert bot.ledger.sleeve_row(name)["peak_equity"] == stored
+    latest = {}
+    for item in _events(bot, "decision"):
+        latest[item["sleeve"]] = item
+    assert latest["buy_and_hold"]["reason"] == "holding"
+    assert latest["buy_and_hold"]["ts"] == iso(wall)
+    assert latest["dca_weekly"]["reason"] != "kill_switch"
+    assert latest["dca_weekly"]["ts"] == iso(wall)
+    assert "kill_switch" not in {item["reason"] for item in _events(bot, "decision")}
+    assert bot.ledger.conn.execute(
+        "SELECT COUNT(*) AS n FROM fills WHERE sleeve='buy_and_hold' AND reason='drawdown_flatten'"
+    ).fetchone()["n"] == 0
+    bot.ledger.close()
+
+    from rhbot.cli import main
+
+    assert main(["resume", "--state-dir", str(tmp_path)]) == 2
+    assert main(["resume", "--ack", "--state-dir", str(tmp_path)]) == 2
+    secret = tmp_path / "human-code"
+    secret.write_text("resume-ok\n", encoding="utf-8")
+    monkeypatch.setenv("RHBOT_HUMAN_RESUME_FILE", str(secret))
+    assert main(["resume", "--ack", "--human-code", "resume-ok", "--state-dir", str(tmp_path)]) == 0
+    bot = engine(tmp_path, sma_window=200)
+    assert bot.ledger.overlay_row("trend_daily")["peak"] == overlay_peak
+    assert bot.ledger.get_meta("portfolio_peak") == portfolio_peak
+    for name, stored in sleeve_peaks.items():
+        assert bot.ledger.sleeve_row(name)["peak_equity"] == stored
+    assert bot.ledger.positions("buy_and_hold") == held_bh
+    bot.ledger.close()
+
+
+def test_i003_status_and_report_leave_the_ledger_mtime(tmp_path):
+    from rhbot.status import build_report
+
+    wall = datetime.now(UTC).replace(microsecond=0)
+    bot = engine(tmp_path, sma_window=200)
+    bot.run_once(now=wall, snapshot=snapshot(wall))
+    bot.ledger.close()
+    path = tmp_path / "bot.sqlite"
+    before = path.stat().st_mtime_ns
+    size = path.stat().st_size
+    body = assess(bot.settings, now=utcnow())
+    report = build_report(bot.settings, "7d", now=utcnow())
+    assert body["health"] in ("ok", "degraded", "critical", "idle_ok")
+    assert report["started"] is True
+    assert path.stat().st_mtime_ns == before
+    assert path.stat().st_size == size
 
 
 def test_f001_buy_and_hold_drawdown_does_not_touch_other_books(tmp_path, now):

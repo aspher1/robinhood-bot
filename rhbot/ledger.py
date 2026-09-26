@@ -216,9 +216,20 @@ def parse_ts(value: str) -> datetime:
 
 
 class Ledger:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, *, readonly: bool = False):
         self.settings = settings
+        self.readonly = readonly
         self.path = Path(settings.state_dir) / "bot.sqlite"
+        if readonly:
+            if not self.path.is_file():
+                raise FileNotFoundError(self.path)
+            uri = self.path.resolve().as_uri() + "?mode=ro"
+            self.conn = sqlite3.connect(uri, uri=True, isolation_level=None)
+            self.conn.row_factory = sqlite3.Row
+            self.conn.execute("PRAGMA query_only=ON")
+            self.conn.execute("PRAGMA foreign_keys=ON")
+            self.conn.execute("PRAGMA busy_timeout=5000")
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.path, isolation_level=None)
         self.conn.row_factory = sqlite3.Row
