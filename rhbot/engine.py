@@ -17,15 +17,18 @@ from rhbot.errors import OrderRejected
 from rhbot.ledger import Ledger
 from rhbot.models import MarketSnapshot, OrderIntent
 from rhbot.money import D, money_str, q8
-from rhbot.ops import engage_kill, iso, kill_active, read_kill, sd_notify, utcnow, write_heartbeat
-from rhbot.risk import (
-    RiskContext,
-    RiskEngine,
-    exposure_limit_pct,
-    kill_reason,
-    peak_drawdown,
-    target_sell_notional,
+from rhbot.ops import (
+    engage_freeze,
+    engage_kill,
+    freeze_active,
+    iso,
+    kill_active,
+    read_kill,
+    sd_notify,
+    utcnow,
+    write_heartbeat,
 )
+from rhbot.risk import RiskContext, RiskEngine, kill_reason, peak_drawdown
 from rhbot.strategies import build_strategies
 
 
@@ -110,7 +113,7 @@ class Engine:
         self._note_quotes(snapshot, market_now, wall)
         if kill_active(self.settings.state_dir):
             self.ledger.cancel_open_orders(market_now, "kill_switch")
-        self._enforce_loss_policy(market_now, snapshot)
+        _equity, portfolio_peak = self._enforce_loss_policy(market_now, snapshot)
         equities: dict[str, str] = {}
         for strategy in self.strategies:
             equity = self._run_sleeve(strategy, market_now, snapshot)
@@ -118,14 +121,21 @@ class Engine:
         self.ledger.set_meta("last_decision_at", iso(wall))
         self.ledger.log_event(
             "cycle",
-            {"equities": equities, "kill_switch": kill_active(self.settings.state_dir)},
+            {
+                "equities": equities,
+                "portfolio_peak": money_str(portfolio_peak),
+                "kill_switch": kill_active(self.settings.state_dir),
+                "drawdown_freeze": freeze_active(self.settings.state_dir),
+            },
             market_now,
         )
         self.ledger.set_meta("audit_head", self.ledger.head_hash())
         return {
             "ts": iso(market_now),
             "kill_switch": kill_active(self.settings.state_dir),
+            "drawdown_freeze": freeze_active(self.settings.state_dir),
             "equities": equities,
+            "portfolio_peak": money_str(portfolio_peak),
             "quote_source": snapshot.source,
         }
 
@@ -218,6 +228,7 @@ class Engine:
     def heartbeat_body(self) -> dict:
         return {
             "kill_switch": kill_active(self.settings.state_dir),
+            "drawdown_freeze": freeze_active(self.settings.state_dir),
             "last_decision_at": self.ledger.get_meta("last_decision_at"),
             "last_quote_ok_at": self.ledger.get_meta("last_quote_ok_at"),
             "last_loop_ok_at": self.ledger.get_meta("last_loop_ok_at"),
@@ -269,15 +280,8 @@ class Engine:
                 )
             except OrderRejected as exc:
                 if exc.kill:
-                    row = self.ledger.sleeve_row(strategy.name)
-                    self._trip_drawdown(
-                        exc.reasons[0],
-                        market_now,
-                        snapshot,
-                        strategy.name,
-                        equity=self.mark(strategy.name, snapshot),
-                        peak=D(row["peak_equity"]),
-                    )
+                    equity, peak = self._mark_portfolio(market_now, snapshot)
+                    self._trip_drawdown(exc.reasons[0], market_now, snapshot, equity=equity, peak=peak)
                 continue
             filled.append(fill)
         positions = self.ledger.positions(strategy.name)
@@ -308,33 +312,78 @@ class Engine:
             ordered_symbols_today=self.ledger.symbols_ordered_on(sleeve, day),
         )
 
-    def _enforce_loss_policy(self, market_now: datetime, snapshot: MarketSnapshot) -> None:
-        """10% drawdown kills and flattens. 5% and 7.5% sell the book down."""
+    def _mark_portfolio(self, market_now: datetime, snapshot: MarketSnapshot) -> tuple[Decimal, Decimal]:
+        """Sum of sleeve marks, and the combined high-water mark.
+
+        The peak is portfolio-wide. A freeze acknowledgement does not rebase it.
+        """
+        total = Decimal(0)
         for strategy in self.strategies:
             self.ledger.ensure_sleeve(strategy.name, market_now, strategy.initial_state())
             equity = self.mark(strategy.name, snapshot)
-            _day_start, peak = self.ledger.mark_equity(strategy.name, equity, market_now)
-            reason = kill_reason(equity, peak, self.settings)
-            if reason:
-                self._trip_drawdown(
-                    reason, market_now, snapshot, strategy.name, equity=equity, peak=peak
-                )
-                return
+            self.ledger.mark_equity(strategy.name, equity, market_now)
+            total += equity
+        total = q8(total)
+        stored = self.ledger.get_meta("portfolio_peak")
+        peak = D(stored) if stored else total
+        if total > peak:
+            peak = total
+        self.ledger.set_meta("portfolio_peak", money_str(peak))
+        self.ledger.set_meta("portfolio_equity", money_str(total))
+        return total, peak
+
+    def _enforce_loss_policy(
+        self, market_now: datetime, snapshot: MarketSnapshot
+    ) -> tuple[Decimal, Decimal]:
+        """Paper-only drawdown on the combined portfolio peak.
+
+        At 10% from that peak, raise an alert and freeze new buys. Exits stay
+        allowed and nothing is force-sold. At 40%, flatten and write KILL.
+        These looser limits must not be carried into a live phase. This method
+        never clears the freeze file or the kill file.
+        """
+        equity, peak = self._mark_portfolio(market_now, snapshot)
+        dd = peak_drawdown(equity, peak)
+        reason = kill_reason(equity, peak, self.settings)
+        if reason:
+            self._trip_drawdown(reason, market_now, snapshot, equity=equity, peak=peak)
+            return equity, peak
         if kill_active(self.settings.state_dir):
+            return equity, peak
+        if dd >= self.settings.drawdown_freeze_pct:
+            self._raise_freeze(market_now, equity, peak, dd)
+        elif not freeze_active(self.settings.state_dir) and self.ledger.get_meta("drawdown_ack_peak"):
+            # The acknowledged episode has recovered. A later breach may alert again.
+            self.ledger.set_meta("drawdown_ack_peak", "")
+        return equity, peak
+
+    def _raise_freeze(self, market_now: datetime, equity: Decimal, peak: Decimal, dd: Decimal) -> None:
+        if freeze_active(self.settings.state_dir):
             return
-        for strategy in self.strategies:
-            equity = self.mark(strategy.name, snapshot)
-            peak = D(self.ledger.sleeve_row(strategy.name)["peak_equity"])
-            cap = exposure_limit_pct(self.settings, equity, peak)
-            if cap < self.settings.max_total_exposure_pct:
-                self._sell_down(strategy.name, snapshot, market_now, cap)
+        if (self.ledger.get_meta("drawdown_ack_peak") or "") == money_str(peak):
+            return
+        observed = format(q8(dd), "f")
+        reason = f"drawdown_freeze {observed} >= {self.settings.drawdown_freeze_pct}"
+        engage_freeze(self.settings.state_dir, reason, "risk")
+        self.ledger.record_risk_event(
+            "drawdown_freeze",
+            market_now,
+            sleeve="portfolio",
+            symbol="",
+            side="",
+            reason="drawdown_freeze",
+            limit_name="drawdown_freeze_pct",
+            limit_value=format(self.settings.drawdown_freeze_pct, "f"),
+            observed=observed,
+            client_order_id="",
+            detail=reason,
+        )
 
     def _trip_drawdown(
         self,
         reason: str,
         market_now: datetime,
         snapshot: MarketSnapshot,
-        sleeve: str,
         *,
         equity: Decimal,
         peak: Decimal,
@@ -347,7 +396,7 @@ class Engine:
             self.ledger.record_risk_event(
                 "kill_trip",
                 market_now,
-                sleeve=sleeve,
+                sleeve="portfolio",
                 symbol="",
                 side="",
                 reason="max_drawdown",
@@ -362,64 +411,6 @@ class Engine:
         held = any(self.ledger.positions(strategy.name) for strategy in self.strategies)
         if held:
             self.flatten(now=market_now, snapshot=snapshot, reason="drawdown_flatten")
-
-    def _sell_down(
-        self,
-        sleeve: str,
-        snapshot: MarketSnapshot,
-        market_now: datetime,
-        cap_pct,
-    ) -> None:
-        positions = self.ledger.positions(sleeve)
-        if not positions:
-            return
-        mids = {}
-        total = Decimal(0)
-        for symbol, qty in positions.items():
-            quote = snapshot.quotes.get(symbol)
-            if quote is None or quote.mid <= 0:
-                return
-            mids[symbol] = quote.mid
-            total += qty * quote.mid
-        equity = self.ledger.cash(sleeve) + total
-        sell_notional = target_sell_notional(
-            total, equity, cap_pct, self.settings.cost_per_side
-        )
-        if sell_notional <= 0 or total <= 0:
-            return
-        sold = False
-        for symbol, qty in list(positions.items()):
-            value = qty * mids[symbol]
-            portion = sell_notional * (value / total)
-            sell_qty = q8(portion / mids[symbol])
-            if sell_qty <= 0:
-                continue
-            if sell_qty > qty:
-                sell_qty = qty
-            if (
-                q8(sell_qty * mids[symbol]) < self.settings.min_order_notional
-                and sell_qty < qty
-            ):
-                continue
-            intent = OrderIntent(symbol, "sell", "exposure_cut", base_quantity=sell_qty)
-            try:
-                self.broker.submit(
-                    sleeve,
-                    intent,
-                    self._client_id(sleeve, intent, market_now),
-                    self._context(sleeve, snapshot, market_now),
-                    market_now,
-                    reduce_only=True,
-                )
-            except OrderRejected:
-                continue
-            sold = True
-        if sold:
-            self.ledger.log_event(
-                "exposure_cut",
-                {"sleeve": sleeve, "cap_pct": format(cap_pct, "f")},
-                market_now,
-            )
 
     def _require_quotes(self, snapshot: MarketSnapshot) -> None:
         missing = [symbol for symbol in self.settings.symbols if symbol not in snapshot.quotes]

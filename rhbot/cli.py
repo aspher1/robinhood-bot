@@ -11,8 +11,10 @@ from rhbot.config import load_settings
 from rhbot.engine import Engine
 from rhbot.ledger import Ledger
 from rhbot.ops import (
+    clear_freeze,
     clear_kill,
     engage_kill,
+    freeze_active,
     kill_active,
     read_heartbeat,
     read_kill,
@@ -67,6 +69,13 @@ def _parser() -> argparse.ArgumentParser:
         help="Required after a drawdown kill. Acknowledges the loss and rebases the peak.",
     )
     resume.set_defaults(func=cmd_resume)
+
+    ack = sub.add_parser(
+        "ack-drawdown",
+        parents=[common],
+        help="Acknowledge a paper drawdown freeze so new buys can resume",
+    )
+    ack.set_defaults(func=cmd_ack_drawdown)
 
     flatten = sub.add_parser("flatten", parents=[common], help="Sell paper positions")
     flatten.add_argument("--paper", action="store_true", help="Required. Confirms this is the paper book.")
@@ -166,7 +175,9 @@ def cmd_resume(args: argparse.Namespace) -> int:
         # The drawdown, and the daily loss that comes with it, are what --ack accepts.
         # The buy block still lasts until the next UTC day. Other critical checks do not.
         blockers = [
-            reason for reason in blockers if reason not in ("drawdown_breach", "daily_loss")
+            reason
+            for reason in blockers
+            if reason not in ("drawdown_breach", "drawdown_freeze", "daily_loss")
         ]
     if body["health"] == "critical" and blockers:
         _emit(
@@ -186,6 +197,34 @@ def cmd_resume(args: argparse.Namespace) -> int:
     clear_kill(settings.state_dir)
     _log_if_db(settings, "resume", {"by": "operator", "ack": bool(args.ack)})
     _emit({"ok": True, "kill_switch": False, "ack": bool(args.ack)})
+    return 0
+
+
+def cmd_ack_drawdown(args: argparse.Namespace) -> int:
+    """Clear a paper buy-freeze. Does not touch the kill file."""
+    settings = load_settings(args.config, args.state_dir)
+    if not freeze_active(settings.state_dir):
+        _emit({"ok": True, "drawdown_freeze": False, "detail": "already_clear"})
+        return 0
+    clear_freeze(settings.state_dir)
+    peak = ""
+    if (settings.state_dir / "bot.sqlite").exists():
+        ledger = Ledger(settings)
+        try:
+            peak = ledger.get_meta("portfolio_peak") or ""
+            if peak:
+                ledger.set_meta("drawdown_ack_peak", peak)
+            ledger.log_event("drawdown_ack", {"by": "operator", "peak": peak}, utcnow())
+        finally:
+            ledger.close()
+    _emit(
+        {
+            "ok": True,
+            "drawdown_freeze": False,
+            "ack_peak": peak,
+            "kill_switch": kill_active(settings.state_dir),
+        }
+    )
     return 0
 
 

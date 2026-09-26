@@ -31,11 +31,12 @@ def test_hard_caps_match_the_risk_policy():
     assert HARD_CAPS["max_daily_turnover_pct"] == Decimal("1")
     assert HARD_CAPS["min_hold_days"] == 7
     assert HARD_CAPS["max_daily_loss_pct"] == Decimal("0.04")
-    assert HARD_CAPS["dd_cut_half"] == Decimal("0.05")
-    assert HARD_CAPS["dd_cut_quarter"] == Decimal("0.075")
-    assert HARD_CAPS["exposure_cap_at_half"] == Decimal("0.50")
-    assert HARD_CAPS["exposure_cap_at_quarter"] == Decimal("0.25")
-    assert HARD_CAPS["max_drawdown_pct"] == Decimal("0.10")
+    assert "dd_cut_half" not in HARD_CAPS
+    assert "dd_cut_quarter" not in HARD_CAPS
+    assert "exposure_cap_at_half" not in HARD_CAPS
+    assert "exposure_cap_at_quarter" not in HARD_CAPS
+    assert HARD_CAPS["drawdown_freeze_pct"] == Decimal("0.10")
+    assert HARD_CAPS["max_drawdown_pct"] == Decimal("0.40")
     assert HARD_CAPS["max_quote_age_seconds"] == 30
     assert HARD_CAPS["max_spread_per_side"] == Decimal("0.02")
 
@@ -63,6 +64,9 @@ def test_env_cannot_enable_live(tmp_path, monkeypatch):
 def test_engine_never_clears_the_kill_file():
     text = (ROOT / "engine.py").read_text(encoding="utf-8")
     assert "clear_kill" not in text
+    assert "clear_freeze" not in text
+    assert "_sell_down" not in text
+    assert "exposure_cut" not in text
     assert "LiveBroker(" not in text
 
 

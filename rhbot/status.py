@@ -11,8 +11,8 @@ from pathlib import Path
 from rhbot.config import Settings
 from rhbot.ledger import Ledger, parse_ts
 from rhbot.money import D, money_str, q8
-from rhbot.ops import iso, read_heartbeat, read_kill, utcnow
-from rhbot.risk import daily_buy_block, kill_reason
+from rhbot.ops import iso, read_freeze, read_heartbeat, read_kill, utcnow
+from rhbot.risk import daily_buy_block, kill_reason, peak_drawdown
 
 SLEEVES = ("buy_and_hold", "dca_weekly", "trend_daily")
 RANK = {"ok": 0, "idle_ok": 1, "degraded": 2, "critical": 3}
@@ -48,6 +48,9 @@ def assess(settings: Settings, now: datetime | None = None) -> dict:
     checks: dict[str, dict] = {}
     heartbeat = read_heartbeat(settings.state_dir)
     kill = read_kill(settings.state_dir)
+    freeze = read_freeze(settings.state_dir)
+    portfolio_dd = Decimal(0)
+    acknowledged = False
     db_exists = _db_path(settings).exists()
     limit = max(180, settings.loop_seconds * 3)
 
@@ -118,9 +121,6 @@ def assess(settings: Settings, now: datetime | None = None) -> dict:
                 last_eq = D(row["last_equity"])
                 dd = Decimal(0) if peak <= 0 else (peak - last_eq) / peak
                 drawdowns[sleeve] = money_str(dd)
-                breach = kill_reason(last_eq, peak, settings)
-                if breach:
-                    level = _bump("critical", "drawdown_breach", level, reasons)
                 blocked = daily_buy_block(last_eq, D(row["day_start_equity"]), settings)
                 if blocked:
                     level = _bump("degraded", "daily_loss", level, reasons)
@@ -164,8 +164,36 @@ def assess(settings: Settings, now: datetime | None = None) -> dict:
             open_orders = ledger.open_orders()
             if quote_source == "public_fallback":
                 level = _bump("degraded", "robinhood_quotes_unavailable", level, reasons)
+            combined = Decimal(0)
+            for value in equity.values():
+                combined += D(value)
+            stored_peak = ledger.get_meta("portfolio_peak")
+            portfolio_peak = D(stored_peak) if stored_peak else combined
+            portfolio_dd = peak_drawdown(combined, portfolio_peak)
+            # Paper-only combined drawdown. 40% is the hard kill. 10% is a buy freeze.
+            # These limits must not be carried into a live phase.
+            if kill_reason(combined, portfolio_peak, settings):
+                level = _bump("critical", "drawdown_breach", level, reasons)
+            acknowledged = (ledger.get_meta("drawdown_ack_peak") or "") == money_str(portfolio_peak)
         finally:
             ledger.close()
+
+    freeze_alert = freeze is not None or (
+        portfolio_dd >= settings.drawdown_freeze_pct and not acknowledged
+    )
+    if freeze_alert:
+        level = _bump("degraded", "drawdown_freeze", level, reasons)
+        checks["drawdown_freeze"] = {
+            "ok": False,
+            "engaged": freeze is not None,
+            "drawdown": money_str(portfolio_dd),
+        }
+    else:
+        checks["drawdown_freeze"] = {
+            "ok": True,
+            "engaged": False,
+            "drawdown": money_str(portfolio_dd),
+        }
 
     free = shutil.disk_usage(settings.state_dir if Path(settings.state_dir).exists() else Path(".")).free
     if free < 100_000_000:
@@ -189,6 +217,7 @@ def assess(settings: Settings, now: datetime | None = None) -> dict:
         "running": bool(running),
         "kill_switch": kill is not None,
         "kill_reason": None if kill is None else kill.get("reason"),
+        "drawdown_freeze": freeze is not None,
         "last_heartbeat_at": None if not heartbeat else heartbeat.get("ts"),
         "last_decision_at": last_decision_at,
         "last_quote_ok_at": last_quote_ok_at,
@@ -202,7 +231,11 @@ def assess(settings: Settings, now: datetime | None = None) -> dict:
         "equity": equity,
         "open_orders": open_orders,
         "today_pnl": {"total": money_str(total_pnl), "sleeves": today_pnl},
-        "drawdown": {"worst": money_str(worst), "sleeves": drawdowns},
+        "drawdown": {
+            "worst": money_str(worst),
+            "portfolio": money_str(portfolio_dd),
+            "sleeves": drawdowns,
+        },
         "quote_source": quote_source,
         "health": level,
         "reasons": reasons,
@@ -247,7 +280,6 @@ def build_report(settings: Settings, since_text: str, now: datetime | None = Non
             sleeves[name] = _sleeve_report(ledger, name, start)
         benchmark = sleeves.get("buy_and_hold", {}).get("window", {}).get("return_pct")
         denials = []
-        trips = []
         fidelity_ok = True
         for name, body in sleeves.items():
             if benchmark is None or name == "buy_and_hold":
@@ -256,9 +288,10 @@ def build_report(settings: Settings, since_text: str, now: datetime | None = Non
                 excess = D(body["window"]["return_pct"]) - D(benchmark)
                 body["excess_return_vs_buy_and_hold_pct"] = format(q8(excess), "f")
             denials.extend(body["risk_denials"])
-            trips.extend(body["kill_trips"])
             if not body["fidelity"]["ok"]:
                 fidelity_ok = False
+        trips = _risk_records(ledger, "kill_trip", None, start)
+        freezes = _risk_records(ledger, "drawdown_freeze", None, start)
         return {
             "since": since_text,
             "from": iso(start),
@@ -267,6 +300,7 @@ def build_report(settings: Settings, since_text: str, now: datetime | None = Non
             "starting_cash_per_sleeve": money_str(settings.starting_cash),
             "cost_per_side": format(settings.cost_per_side, "f"),
             "risk_denials": denials,
+            "drawdown_freezes": freezes,
             "kill_trips": trips,
             "fidelity_ok": fidelity_ok,
             "sleeves": sleeves,
@@ -315,6 +349,7 @@ def _sleeve_report(ledger: Ledger, sleeve: str, start: datetime) -> dict:
             trades += 1
     denials = _risk_records(ledger, "risk_denial", sleeve, start)
     trips = _risk_records(ledger, "kill_trip", sleeve, start)
+    freezes = _risk_records(ledger, "drawdown_freeze", sleeve, start)
     fidelity_ok, fidelity_detail = ledger.reconcile(sleeve)
     since_pnl = q8(last_equity - starting)
     since_return = Decimal(0) if starting == 0 else (since_pnl / starting) * Decimal(100)
@@ -333,24 +368,30 @@ def _sleeve_report(ledger: Ledger, sleeve: str, start: datetime) -> dict:
             "max_drawdown_pct": format(q8(max_dd * Decimal(100)), "f"),
         },
         "risk_denials": denials,
+        "drawdown_freezes": freezes,
         "kill_trips": trips,
         "fidelity": {"ok": fidelity_ok, "detail": fidelity_detail},
     }
 
 
-def _risk_records(ledger: Ledger, kind: str, sleeve: str, start: datetime) -> list[dict]:
-    """Audit rows for one sleeve. These are risk blocks, not fill-replay mismatches."""
+def _risk_records(
+    ledger: Ledger, kind: str, sleeve: str | None, start: datetime
+) -> list[dict]:
+    """Audit rows for one sleeve, or every sleeve when ``sleeve`` is None.
+
+    These are risk blocks, freezes, and kill trips, not fill-replay mismatches.
+    """
     found = []
     for event in ledger.conn.execute("SELECT payload FROM events WHERE kind=?", (kind,)):
         payload = json.loads(event["payload"])
-        if payload.get("sleeve") != sleeve:
+        if sleeve is not None and payload.get("sleeve") != sleeve:
             continue
         if parse_ts(str(payload["ts"])) < start:
             continue
         found.append(
             {
                 "ts": payload["ts"],
-                "sleeve": sleeve,
+                "sleeve": payload.get("sleeve") or "",
                 "symbol": payload.get("symbol") or "",
                 "side": payload.get("side") or "",
                 "reason": payload.get("reason") or "",
@@ -377,9 +418,9 @@ def render_markdown(report: dict) -> str:
         lines.append("The bot has not started, so there is no P&L yet.")
         return "\n".join(lines)
     lines.append(
-        "| Sleeve | Window P&L | Return % | Fees | Trades | Max DD % | vs buy & hold | Risk blocks | Kills | Fidelity |"
+        "| Sleeve | Window P&L | Return % | Fees | Trades | Max DD % | vs buy & hold | Risk blocks | Freezes | Kills | Fidelity |"
     )
-    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for name, body in report["sleeves"].items():
         window = body["window"]
         excess = body.get("excess_return_vs_buy_and_hold_pct")
@@ -388,14 +429,22 @@ def render_markdown(report: dict) -> str:
             f"| {name} | {window['pnl']} | {window['return_pct']} | {window['fees']} | "
             f"{window['trades']} | {window['max_drawdown_pct']} | "
             f"{excess if excess is not None else 'benchmark'} | {len(body['risk_denials'])} | "
-            f"{len(body['kill_trips'])} | {fidelity} |"
+            f"{len(body.get('drawdown_freezes', []))} | {len(body['kill_trips'])} | {fidelity} |"
         )
-    if report.get("risk_denials") or report.get("kill_trips"):
+    if report.get("risk_denials") or report.get("drawdown_freezes") or report.get("kill_trips"):
         lines.append("")
-        lines.append("Risk blocks are limit denials and kill trips. A fidelity mismatch is a cash or position replay that does not match the fills.")
+        lines.append(
+            "Risk blocks, drawdown freezes, and kill trips are separate from a fidelity mismatch. "
+            "A fidelity mismatch is a cash or position replay that does not match the fills."
+        )
         for item in report.get("risk_denials", []):
             lines.append(
                 f"- denial {item['sleeve']} {item['symbol']} {item['side']}: {item['reason']} "
+                f"limit {item['limit_name']}={item['limit']} observed {item['observed']}"
+            )
+        for item in report.get("drawdown_freezes", []):
+            lines.append(
+                f"- freeze {item['sleeve']}: {item['reason']} "
                 f"limit {item['limit_name']}={item['limit']} observed {item['observed']}"
             )
         for item in report.get("kill_trips", []):

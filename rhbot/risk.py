@@ -10,7 +10,7 @@ from rhbot.config import ALLOWED_SYMBOLS, Settings
 from rhbot.errors import OrderRejected
 from rhbot.models import OrderIntent, Quote
 from rhbot.money import q8
-from rhbot.ops import kill_active
+from rhbot.ops import freeze_active, kill_active
 from rhbot.pricing import plan_fill
 
 EPS = Decimal("0.01")
@@ -99,6 +99,10 @@ def daily_loss(equity: Decimal, day_start: Decimal) -> Decimal:
 
 
 def kill_reason(equity: Decimal, peak: Decimal, settings: Settings) -> str | None:
+    """40% paper-only hard kill, measured by the caller on combined equity.
+
+    These drawdown limits must not be carried into a live phase.
+    """
     dd = peak_drawdown(equity, peak)
     if dd >= settings.max_drawdown_pct:
         return f"max_drawdown {q8(dd)} >= {settings.max_drawdown_pct}"
@@ -110,37 +114,6 @@ def daily_buy_block(equity: Decimal, day_start: Decimal, settings: Settings) -> 
     if loss >= settings.max_daily_loss_pct:
         return f"daily_loss {q8(loss)} >= {settings.max_daily_loss_pct}"
     return None
-
-
-def exposure_limit_pct(settings: Settings, equity: Decimal, peak: Decimal) -> Decimal:
-    """Total exposure allowed right now, as a fraction of equity."""
-    cap = settings.max_total_exposure_pct
-    dd = peak_drawdown(equity, peak)
-    if dd >= settings.dd_cut_quarter:
-        cap = min(cap, settings.exposure_cap_at_quarter)
-    elif dd >= settings.dd_cut_half:
-        cap = min(cap, settings.exposure_cap_at_half)
-    return cap
-
-
-def target_sell_notional(
-    position_value: Decimal,
-    equity: Decimal,
-    cap_pct: Decimal,
-    cost_per_side: Decimal,
-) -> Decimal:
-    """Mid notional to sell so the book left behind fits the cap after the sell cost."""
-    if position_value <= 0:
-        return Decimal(0)
-    if cap_pct <= 0:
-        return position_value
-    allowed = equity * cap_pct
-    if position_value <= allowed:
-        return Decimal(0)
-    denom = Decimal(1) - (cap_pct * cost_per_side)
-    if denom <= 0:
-        return position_value
-    return (position_value - allowed) / denom
 
 
 class RiskEngine:
@@ -214,21 +187,22 @@ class RiskEngine:
         if reduce_only:
             return RiskDecision(True, [])
 
-        dd = peak_drawdown(ctx.equity, ctx.peak_equity)
-        if dd >= settings.max_drawdown_pct:
-            return deny(
-                "max_drawdown",
-                "max_drawdown_pct",
-                settings.max_drawdown_pct,
-                q8(dd),
-                kill=True,
-                detail=f"max_drawdown {q8(dd)} >= {settings.max_drawdown_pct}",
-            )
-
         if intent.symbol in ctx.ordered_symbols_today:
             return deny("one_order_per_symbol_per_bar", "orders_per_symbol_per_bar", "1", intent.symbol)
 
         if intent.side == "buy":
+            # Paper-only freeze. Sells above this check still go through.
+            # The engine raises the freeze from combined peak equity.
+            if freeze_active(settings.state_dir):
+                return deny(
+                    "drawdown_freeze",
+                    "drawdown_freeze_pct",
+                    settings.drawdown_freeze_pct,
+                    "frozen",
+                    detail=(
+                        "drawdown_freeze: new buys are frozen until rhbot ack-drawdown"
+                    ),
+                )
             loss = daily_loss(ctx.equity, ctx.day_start_equity)
             if loss >= settings.max_daily_loss_pct:
                 return deny(
@@ -252,7 +226,7 @@ class RiskEngine:
             # higher by the per-side cost, and blocking that would make a 50%
             # position impossible.
             qty, _px, _cash, _cost, notional = plan_fill(intent, quote, settings.cost_per_side)
-            limit = exposure_limit_pct(settings, ctx.equity, ctx.peak_equity)
+            limit = settings.max_total_exposure_pct
             trade_cap_pct = min(settings.max_position_pct, limit)
             cap = ctx.equity * trade_cap_pct + EPS
             if notional > cap:

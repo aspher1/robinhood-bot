@@ -2,7 +2,9 @@
 
 This is an offline helper. It does not fetch data and it does not tune parameters.
 Every bar goes through ``Engine.run_once``, so the same risk engine denies orders,
-cuts exposure, and trips the 10% kill. Replay does not clear a kill file.
+freezes new buys at a 10% combined drawdown, and trips the 40% kill.
+Replay does not clear a freeze or a kill file. Those drawdown limits are
+paper-only and must not be carried into a live phase.
 """
 
 from __future__ import annotations

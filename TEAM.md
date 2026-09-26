@@ -32,7 +32,7 @@ Reviews limits. May tighten them in `config.yaml` (smaller position size, tighte
 
 May not loosen a limit, hold credentials, resume the bot while health is critical for a reason other than the kill switch, or "fix" a drawdown by raising the cap.
 
-The risk engine writes `state/KILL` and flattens the paper book at a 10% drawdown from peak. That is code, not a judgment call. Clearing it takes `rhbot resume --ack` from a person. At 5% it cuts exposure to 50%, and at 7.5% to 25%. A 4% loss on the UTC day blocks new buys until the next UTC day.
+Drawdown is measured on the combined portfolio peak. These limits are paper-only and must not be carried into a live phase. At 10% the engine writes `state/DRAWDOWN_FREEZE` and blocks new buys until a person runs `rhbot ack-drawdown`. Sells stay allowed and nothing is force-sold. At 40% it writes `state/KILL` and flattens the paper book. That is code, not a judgment call. Clearing that kill takes `rhbot resume --ack` from a person. Automation may trip the kill and cannot clear it. A 4% loss on the UTC day blocks new buys until the next UTC day.
 
 ## Operations
 
@@ -43,7 +43,8 @@ Watches the process and is the only role that routinely restarts it.
 | Is it up, and did it do something recently? | `rhbot status`, `rhbot health` |
 | Stop new simulated orders | `rhbot kill --reason "..."` which creates `state/KILL` |
 | Allow orders again after health is clear | `rhbot resume` |
-| Allow orders again after a 10% drawdown kill | `rhbot resume --ack` |
+| Acknowledge a 10% paper drawdown so new buys can resume | `rhbot ack-drawdown` |
+| Allow orders again after a 40% paper drawdown kill | `rhbot resume --ack` |
 | Preflight, including the kill path | `rhbot selftest` |
 | Sell the paper book | `rhbot flatten --paper` (kill first if it should stay sold) |
 | Process actually looping | `state/heartbeat.json` |

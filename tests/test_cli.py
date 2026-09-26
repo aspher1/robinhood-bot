@@ -138,7 +138,7 @@ def test_replay_separates_risk_blocks_from_fidelity(tmp_path, now):
     from tests.conftest import make_bars, make_settings
 
     last_open = now - timedelta(days=1)
-    closes = ["100", "100", "100", "80"]
+    closes = ["100", "100", "100", "60"]
     settings = make_settings(tmp_path, sma_window=20)
     bars = {
         "BTC-USD": make_bars("BTC-USD", closes, last_open),
@@ -147,10 +147,9 @@ def test_replay_separates_risk_blocks_from_fidelity(tmp_path, now):
     bot = replay(settings, bars)
     ok, detail = bot.ledger.verify_chain()
     assert ok, detail
-    assert (tmp_path / "KILL").exists()
-    kill = json.loads((tmp_path / "KILL").read_text(encoding="utf-8"))
-    assert kill["ack_required"] is True
-    assert bot.ledger.positions("buy_and_hold") == {}
+    assert not (tmp_path / "KILL").exists()
+    assert (tmp_path / "DRAWDOWN_FREEZE").exists()
+    assert bot.ledger.positions("buy_and_hold")
 
     denials = [
         json.loads(row["payload"])
@@ -161,23 +160,27 @@ def test_replay_separates_risk_blocks_from_fidelity(tmp_path, now):
     assert any(
         item["reason"] == "max_trades_per_day" and item["limit"] == "2" for item in denials
     )
-    trips = [
+    freezes = [
         json.loads(row["payload"])
         for row in bot.ledger.conn.execute(
-            "SELECT payload FROM events WHERE kind='kill_trip'"
+            "SELECT payload FROM events WHERE kind='drawdown_freeze'"
         )
     ]
-    assert len(trips) == 1
-    assert trips[0]["reason"] == "max_drawdown"
-    assert trips[0]["limit_name"] == "max_drawdown_pct"
-    assert trips[0]["limit"] == "0.10"
-    assert trips[0]["ack_required"] is True
+    assert len(freezes) == 1
+    assert freezes[0]["reason"] == "drawdown_freeze"
+    assert freezes[0]["limit_name"] == "drawdown_freeze_pct"
+    assert freezes[0]["limit"] == "0.10"
+    assert bot.ledger.conn.execute(
+        "SELECT COUNT(*) AS n FROM events WHERE kind='kill_trip'"
+    ).fetchone()["n"] == 0
     trade_rows = bot.ledger.conn.execute(
         "SELECT kind, reason, limit_name, limit_value FROM trade_log"
     ).fetchall()
     assert any(row["kind"] == "risk_denial" and row["limit_value"] == "2" for row in trade_rows)
     assert any(
-        row["kind"] == "kill_trip" and row["limit_name"] == "max_drawdown_pct" and row["limit_value"] == "0.10"
+        row["kind"] == "drawdown_freeze"
+        and row["limit_name"] == "drawdown_freeze_pct"
+        and row["limit_value"] == "0.10"
         for row in trade_rows
     )
     with __import__("pytest").raises(sqlite3.Error, match="append-only"):
@@ -190,8 +193,9 @@ def test_replay_separates_risk_blocks_from_fidelity(tmp_path, now):
     clean = build_report(settings, "30d", now=now + timedelta(days=2))
     assert clean["fidelity_ok"] is True
     assert any(item["reason"] == "max_trades_per_day" and item["limit"] == "2" for item in clean["risk_denials"])
-    assert clean["kill_trips"][0]["limit"] == "0.10"
-    assert clean["kill_trips"][0]["ack_required"] is True
+    assert clean["kill_trips"] == []
+    assert clean["drawdown_freezes"][0]["limit"] == "0.10"
+    assert clean["drawdown_freezes"][0]["reason"] == "drawdown_freeze"
     assert all(body["fidelity"]["ok"] for body in clean["sleeves"].values())
 
     raw = sqlite3.connect(tmp_path / "bot.sqlite")
@@ -202,4 +206,5 @@ def test_replay_separates_risk_blocks_from_fidelity(tmp_path, now):
     assert broken["fidelity_ok"] is False
     assert broken["sleeves"]["buy_and_hold"]["fidelity"]["ok"] is False
     assert any(item["reason"] == "max_trades_per_day" for item in broken["risk_denials"])
-    assert broken["kill_trips"][0]["reason"] == "max_drawdown"
+    assert broken["kill_trips"] == []
+    assert broken["drawdown_freezes"][0]["reason"] == "drawdown_freeze"

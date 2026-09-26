@@ -15,6 +15,7 @@ from pathlib import Path
 from rhbot.money import canonical
 
 KILL_NAME = "KILL"
+FREEZE_NAME = "DRAWDOWN_FREEZE"
 HEARTBEAT_NAME = "heartbeat.json"
 
 
@@ -30,6 +31,10 @@ def iso(ts: datetime) -> str:
 
 def kill_path(state_dir: Path) -> Path:
     return Path(state_dir) / KILL_NAME
+
+
+def freeze_path(state_dir: Path) -> Path:
+    return Path(state_dir) / FREEZE_NAME
 
 
 def heartbeat_path(state_dir: Path) -> Path:
@@ -111,6 +116,66 @@ def resume_needs_ack(payload: dict | None) -> bool:
 
 def clear_kill(state_dir: Path) -> bool:
     path = kill_path(state_dir)
+    if not path.exists():
+        return False
+    path.unlink()
+    return True
+
+
+def _file_active(path: Path) -> bool:
+    """Fail closed: a control file we cannot parse still counts as on."""
+    if not path.exists():
+        return False
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return True
+    if not raw:
+        return True
+    try:
+        json.loads(raw)
+    except json.JSONDecodeError:
+        return True
+    return True
+
+
+def freeze_active(state_dir: Path) -> bool:
+    """A paper drawdown freeze blocks new buys until a human acknowledges it."""
+    return _file_active(freeze_path(state_dir))
+
+
+def read_freeze(state_dir: Path) -> dict | None:
+    path = freeze_path(state_dir)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"reason": "unreadable drawdown freeze", "by": "unknown", "at": None}
+    if not isinstance(data, dict):
+        return {"reason": "malformed drawdown freeze", "by": "unknown", "at": None}
+    return data
+
+
+def engage_freeze(state_dir: Path, reason: str, by: str) -> dict:
+    """Create the freeze file if it is not already there. The first reason wins.
+
+    The engine never deletes this file. A human clears it with ``rhbot ack-drawdown``.
+    """
+    path = freeze_path(state_dir)
+    if path.exists():
+        return read_freeze(state_dir) or {}
+    payload = {
+        "at": iso(utcnow()),
+        "by": by,
+        "reason": reason,
+    }
+    atomic_write(path, json.dumps(payload, sort_keys=True))
+    return payload
+
+
+def clear_freeze(state_dir: Path) -> bool:
+    path = freeze_path(state_dir)
     if not path.exists():
         return False
     path.unlink()

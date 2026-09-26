@@ -342,9 +342,20 @@ class Ledger:
         )
 
     def rebase_peaks(self) -> None:
-        """Set each sleeve's peak to its last marked equity. Used only by an acked resume."""
+        """Set peaks to the equity left after an acked resume.
+
+        Sleeve peaks and the combined portfolio peak both move to the current
+        book. This does not add cash. The freeze acknowledgement watermark is
+        cleared so a new loss from this peak can alert again.
+        """
+        rows = self.conn.execute("SELECT last_equity FROM sleeves").fetchall()
+        total = Decimal(0)
+        for row in rows:
+            total += D(row["last_equity"])
         self.conn.execute("UPDATE sleeves SET peak_equity = last_equity")
         self.conn.commit()
+        self.set_meta("portfolio_peak", money_str(q8(total)))
+        self.set_meta("drawdown_ack_peak", "")
 
     def head_hash(self) -> str:
         row = self.conn.execute(
@@ -386,8 +397,8 @@ class Ledger:
         detail: str,
         ack_required: bool = False,
     ) -> None:
-        """Write one risk denial or kill trip to the trade log and the hash chain."""
-        if kind not in ("risk_denial", "kill_trip"):
+        """Write a risk denial, drawdown freeze, or kill trip to the trade log and the hash chain."""
+        if kind not in ("risk_denial", "drawdown_freeze", "kill_trip"):
             raise ValueError(f"unknown risk event {kind}")
         payload = {
             "ack_required": ack_required,
@@ -403,6 +414,9 @@ class Ledger:
         }
         if kind == "kill_trip":
             payload["by"] = "risk"
+        elif kind == "drawdown_freeze":
+            payload["by"] = "risk"
+            payload.pop("ack_required")
         else:
             payload.pop("ack_required")
         with self.transaction():

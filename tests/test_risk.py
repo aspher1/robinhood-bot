@@ -102,21 +102,39 @@ def test_daily_loss_blocks_buys_until_the_loss_is_gone(tmp_path, now):
     assert allowed.allowed
 
 
-def test_drawdown_tiers_and_kill(tmp_path, now):
-    from rhbot.risk import exposure_limit_pct
-
+def test_sleeve_drawdown_does_not_kill_and_freeze_blocks_buys_only(tmp_path, now):
     settings = _settings(tmp_path)
-    assert exposure_limit_pct(settings, Decimal("960"), Decimal("1000")) == Decimal("1")
-    assert exposure_limit_pct(settings, Decimal("940"), Decimal("1000")) == Decimal("0.50")
-    assert exposure_limit_pct(settings, Decimal("920"), Decimal("1000")) == Decimal("0.25")
     risk = RiskEngine(settings)
     deep = risk.evaluate(
         _buy(),
-        _ctx(settings, now, equity=Decimal("890"), cash=Decimal("890")),
-        "id-max",
+        _ctx(
+            settings,
+            now,
+            equity=Decimal("500"),
+            cash=Decimal("500"),
+            day_start_equity=Decimal("500"),
+            peak_equity=Decimal("1000"),
+        ),
+        "id-sleeve",
     )
-    assert deep.kill
-    assert any(reason.startswith("max_drawdown") for reason in deep.reasons)
+    assert deep.allowed
+    assert not deep.kill
+    from rhbot.ops import engage_freeze
+
+    engage_freeze(tmp_path, "paper drawdown", "risk")
+    frozen = risk.evaluate(_buy(), _ctx(settings, now), "id-frozen")
+    assert not frozen.allowed
+    assert not frozen.kill
+    assert frozen.reasons[0].startswith("drawdown_freeze")
+    assert frozen.breaches[0].limit_name == "drawdown_freeze_pct"
+    assert frozen.breaches[0].limit == "0.10"
+    sell = OrderIntent("BTC-USD", "sell", "exit", base_quantity=Decimal("1"))
+    allowed = risk.evaluate(
+        sell,
+        _ctx(settings, now, positions={"BTC-USD": Decimal("1")}, cash=Decimal("500")),
+        "id-sell",
+    )
+    assert allowed.allowed
 
 
 def test_duplicate_symbol_and_trade_cap(tmp_path, now):
@@ -156,7 +174,11 @@ def test_config_may_only_tighten(tmp_path):
     with pytest.raises(ValueError):
         Settings(state_dir=tmp_path, max_position_pct=Decimal("0.80"))
     with pytest.raises(ValueError):
-        Settings(state_dir=tmp_path, max_drawdown_pct=Decimal("0.20"))
+        Settings(state_dir=tmp_path, max_drawdown_pct=Decimal("0.50"))
+    with pytest.raises(ValueError):
+        Settings(state_dir=tmp_path, drawdown_freeze_pct=Decimal("0.11"))
+    with pytest.raises(ValueError):
+        Settings(state_dir=tmp_path, drawdown_freeze_pct=Decimal("0.20"), max_drawdown_pct=Decimal("0.20"))
     with pytest.raises(ValueError):
         Settings(state_dir=tmp_path, max_trades_per_day=3)
     with pytest.raises(ValueError):
@@ -182,9 +204,13 @@ def test_config_may_only_tighten(tmp_path):
         max_quote_age_seconds=20,
         min_hold_days=8,
         cost_per_side=Decimal("0.02"),
+        drawdown_freeze_pct=Decimal("0.08"),
+        max_drawdown_pct=Decimal("0.25"),
     )
     assert tightened.max_position_pct == Decimal("0.25")
     assert tightened.min_hold_days == 8
+    assert tightened.drawdown_freeze_pct == Decimal("0.08")
+    assert tightened.max_drawdown_pct == Decimal("0.25")
 
 
 def test_yaml_float_is_rejected(tmp_path):

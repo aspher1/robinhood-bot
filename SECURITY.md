@@ -16,11 +16,18 @@ There is no live order path. `LiveBroker` raises `LiveTradingDisabled` on every 
 
 `mode` accepts only `paper`. Setting `RHBOT_LIVE`, `RHBOT_MODE=live`, `LIVE_TRADING`, or `ENABLE_LIVE_TRADING` makes startup fail. No config flag turns live trading on. The test `test_package_has_no_live_order_path` fails CI if the package names a Robinhood order endpoint or issues an HTTP POST, PUT, PATCH, or DELETE.
 
-## Kill switch
+## Kill switch and drawdown freeze
 
 `state/KILL` stops new simulated risk. If the file is missing, unreadable, or not valid JSON, treat a present file as on. The engine never deletes it.
 
-A 10% drawdown from peak writes the file with `ack_required` and sells the paper positions. Clearing that kill takes `rhbot resume --ack`. A manual `rhbot kill` can be cleared with `rhbot resume` once health is otherwise fine. Resume still refuses while some other health check is critical.
+`state/DRAWDOWN_FREEZE` blocks new paper buys. Sells still work. The engine never deletes that file either. A human clears it with `rhbot ack-drawdown`.
+
+Drawdown is measured on the combined portfolio peak. These limits are paper-only and must not be carried into any live phase:
+
+- 10% writes `state/DRAWDOWN_FREEZE` and does not sell.
+- 40% writes `state/KILL` with `ack_required` and sells the paper positions.
+
+Clearing that kill takes `rhbot resume --ack`. Automation may trip a kill and cannot clear it. A manual `rhbot kill` can be cleared with `rhbot resume` once health is otherwise fine. Resume still refuses while some other health check is critical. `ack-drawdown` does not clear a kill.
 
 ## Ownership
 

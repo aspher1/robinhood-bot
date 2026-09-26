@@ -23,15 +23,19 @@ ALLOW_SHORT = False
 # Config may set a limit equal to these, or stricter. It may not go past them.
 # "Stricter" means a smaller risk budget, a higher cost, a larger minimum order,
 # or a longer minimum hold.
+#
+# drawdown_freeze_pct and max_drawdown_pct are paper-only. A live phase must
+# not inherit these looser drawdown limits. Config may only lower them.
 HARD_CAPS = {
     "max_position_pct": Decimal("0.50"),
     "max_total_exposure_pct": Decimal("1"),
     "max_daily_loss_pct": Decimal("0.04"),
-    "dd_cut_half": Decimal("0.05"),
-    "dd_cut_quarter": Decimal("0.075"),
-    "exposure_cap_at_half": Decimal("0.50"),
-    "exposure_cap_at_quarter": Decimal("0.25"),
-    "max_drawdown_pct": Decimal("0.10"),
+    # Paper only: freeze new buys at 10% off the combined peak. Do not carry
+    # this into a live phase.
+    "drawdown_freeze_pct": Decimal("0.10"),
+    # Paper only: hard kill and flatten at 40% off the combined peak. Do not
+    # carry this into a live phase.
+    "max_drawdown_pct": Decimal("0.40"),
     "max_trades_per_day": 2,
     "max_quote_age_seconds": 30,
     "max_daily_turnover_pct": Decimal("1"),
@@ -71,11 +75,10 @@ class Settings(BaseModel):
     max_position_pct: Decimal = Decimal("0.50")
     max_total_exposure_pct: Decimal = Decimal("1")
     max_daily_loss_pct: Decimal = Decimal("0.04")
-    dd_cut_half: Decimal = Decimal("0.05")
-    dd_cut_quarter: Decimal = Decimal("0.075")
-    exposure_cap_at_half: Decimal = Decimal("0.50")
-    exposure_cap_at_quarter: Decimal = Decimal("0.25")
-    max_drawdown_pct: Decimal = Decimal("0.10")
+    # Paper only. Combined-portfolio peak. Config may only tighten these.
+    # They must not be copied into a live phase.
+    drawdown_freeze_pct: Decimal = Decimal("0.10")
+    max_drawdown_pct: Decimal = Decimal("0.40")
     max_trades_per_day: int = 2
     max_quote_age_seconds: int = 30
     max_daily_turnover_pct: Decimal = Decimal("1")
@@ -97,10 +100,7 @@ class Settings(BaseModel):
         "max_position_pct",
         "max_total_exposure_pct",
         "max_daily_loss_pct",
-        "dd_cut_half",
-        "dd_cut_quarter",
-        "exposure_cap_at_half",
-        "exposure_cap_at_quarter",
+        "drawdown_freeze_pct",
         "max_drawdown_pct",
         "max_daily_turnover_pct",
         "max_spread_per_side",
@@ -157,10 +157,7 @@ class Settings(BaseModel):
             "max_position_pct",
             "max_total_exposure_pct",
             "max_daily_loss_pct",
-            "dd_cut_half",
-            "dd_cut_quarter",
-            "exposure_cap_at_half",
-            "exposure_cap_at_quarter",
+            "drawdown_freeze_pct",
             "max_drawdown_pct",
             "max_daily_turnover_pct",
             "max_spread_per_side",
@@ -184,10 +181,8 @@ class Settings(BaseModel):
             )
         if self.min_order_notional < HARD_CAPS["min_order_notional"]:
             problems.append("min_order_notional cannot be below 10")
-        if not self.dd_cut_half < self.dd_cut_quarter < self.max_drawdown_pct:
-            problems.append("drawdown tiers must stay ordered: 5% cut < 7.5% cut < 10% kill")
-        if self.exposure_cap_at_quarter > self.exposure_cap_at_half:
-            problems.append("the 7.5% exposure cap cannot be looser than the 5% cap")
+        if self.drawdown_freeze_pct >= self.max_drawdown_pct:
+            problems.append("drawdown_freeze_pct must stay below max_drawdown_pct")
         if not self.symbols:
             problems.append("symbols cannot be empty")
         unknown = [s for s in self.symbols if s not in ALLOWED_SYMBOLS]
