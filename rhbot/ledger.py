@@ -13,7 +13,7 @@ from rhbot.config import Settings
 from rhbot.errors import OrderRejected
 from rhbot.models import RISK_REDUCTION_REASONS, Bar, Fill
 from rhbot.money import D, canonical, money_str, q8
-from rhbot.ops import iso
+from rhbot.ops import iso, utcnow
 
 GENESIS = "0" * 64
 
@@ -743,7 +743,7 @@ class Ledger:
         positions = {k: v for k, v in positions.items() if v != 0}
         return cash, positions
 
-    def reconcile(self, sleeve: str) -> tuple[bool, str]:
+    def reconcile(self, sleeve: str, now: datetime | None = None) -> tuple[bool, str]:
         cash, positions = self.replay(sleeve)
         stored_cash = q8(self.cash(sleeve))
         stored_positions = {k: q8(v) for k, v in self.positions(sleeve).items()}
@@ -756,7 +756,23 @@ class Ledger:
         ).fetchone()
         if int(fill_rows["n"]) != self.count_events("fill", sleeve):
             return False, f"{sleeve} fill rows do not match fill events"
+        stale = self.stale_open_orders(sleeve, now or utcnow())
+        if stale:
+            ids = ", ".join(str(order["client_order_id"]) for order in stale)
+            return False, f"{sleeve} open order {ids} is stale"
         return True, "ok"
+
+    def stale_open_orders(self, sleeve: str, now: datetime) -> list[dict]:
+        """Open orders for one book older than one loop."""
+        limit = self.settings.loop_seconds
+        stale = []
+        for order in self.open_orders():
+            if str(order["sleeve"]) != sleeve:
+                continue
+            age = (now - parse_ts(str(order["ts"]))).total_seconds()
+            if age > limit:
+                stale.append(order)
+        return stale
 
     def ensure_shadow_sleeve(self, name: str, now: datetime, initial_state: dict) -> None:
         row = self.conn.execute(

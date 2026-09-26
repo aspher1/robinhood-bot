@@ -109,7 +109,7 @@ def assess(settings: Settings, now: datetime | None = None) -> dict:
             recon_ok = True
             recon_detail = "ok"
             for sleeve in ledger.sleeve_names():
-                ok, detail = ledger.reconcile(sleeve)
+                ok, detail = ledger.reconcile(sleeve, now=now)
                 if not ok:
                     recon_ok = False
                     recon_detail = detail
@@ -179,6 +179,14 @@ def assess(settings: Settings, now: datetime | None = None) -> dict:
             if heartbeat and decision_age is not None and decision_age > 36 * 3600:
                 level = _bump("degraded", "no_recent_decision", level, reasons)
             open_orders = ledger.open_orders()
+            stale_ids = []
+            for order in open_orders:
+                age = _age_seconds(str(order.get("ts")), now)
+                if age is None or age > settings.loop_seconds:
+                    stale_ids.append(str(order["client_order_id"]))
+            checks["open_orders"] = {"ok": not stale_ids, "client_order_ids": stale_ids}
+            if stale_ids:
+                level = _bump("critical", "open_order_stale", level, reasons)
             if quote_source == "public_fallback":
                 level = _bump("degraded", "robinhood_quotes_unavailable", level, reasons)
             combined = Decimal(0)

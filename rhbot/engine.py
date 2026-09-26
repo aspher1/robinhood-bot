@@ -125,6 +125,7 @@ class Engine:
             if strategy.name in SHADOW_NAMES:
                 self._run_shadow_sleeve(strategy, market_now, snapshot)
             equities[strategy.name] = money_str(equity)
+        self._note_portfolio_peak()
         self.ledger.set_meta("last_decision_at", iso(wall))
         self.ledger.log_event(
             "cycle",
@@ -221,6 +222,16 @@ class Engine:
             if once or stop["flag"]:
                 break
             sleep(self.settings.loop_seconds)
+
+    def _note_portfolio_peak(self) -> None:
+        """Combined high-water mark. It only rises. Resume does not write it."""
+        total = Decimal(0)
+        for name in self.ledger.sleeve_names():
+            total += D(self.ledger.sleeve_row(name)["last_equity"])
+        total = q8(total)
+        stored = self.ledger.get_meta("portfolio_peak")
+        peak = total if not stored else max(D(stored), total)
+        self.ledger.set_meta("portfolio_peak", money_str(peak))
 
     def mark(self, sleeve: str, snapshot: MarketSnapshot):
         equity = self.ledger.cash(sleeve)
@@ -557,8 +568,29 @@ class Engine:
                     self.ledger.save_overlay(name, fields)
                 continue
             if state == "KILLED":
+                # The flattened mark does not kill again. Once drawdown is back
+                # above −40% of the original peak, a later cross can.
+                recovered = (
+                    not kill_active(self.settings.state_dir)
+                    and dd > -self.settings.kill_drawdown_pct
+                )
+                if not recovered:
+                    self.ledger.save_overlay(name, fields)
+                    continue
+                fields["state"] = "ARMED"
+                fields["kill_acked_peak"] = ""
+                state = "ARMED"
                 self.ledger.save_overlay(name, fields)
-                continue
+                self.ledger.log_event(
+                    "kill_rearm",
+                    {
+                        "sleeve": name,
+                        "equity": money_str(equity),
+                        "peak": money_str(peak),
+                        "dd": format(q8(dd), "f"),
+                    },
+                    market_now,
+                )
             if state == "ARMED" and dd <= -self.settings.freeze_drawdown_pct:
                 fields.update(
                     {

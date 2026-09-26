@@ -24,6 +24,12 @@ Done: F-001, F-002 (including item 5: one $19.23 buy per week, BTC then ETH), F-
 
 Randy decided the two items that were on hold. F-003 is per book, and the cap stays 2. F-002 item 5 enables `dca_weekly` at $19.23. The $10 minimum is unchanged. Ack still does not move the peak. The −40% resume is still human-only. The 5% and 7.5% exposure sell-downs stay removed.
 
+### Audit round 2
+
+Already in place from round 1, and still true: resume does not rebase `portfolio_peak` or any sleeve `peak_equity` (peaks only rise on a new high); freeze and kill are per book on mark-to-bid and skip buy-and-hold; SMA 200 and a 2% band with no flat-time block; DCA on days 1, 8, 15, 22 at $19.23; the trade cap is 2 per book; quote health uses the cycle's quote age; client order ids have no random suffix.
+
+Added: an open order older than one loop is critical `open_order_stale`, and reconcile names its `client_order_id` (F-020). After a human resume, the same flattened mark does not kill again. Once that book is back above −40% of the original peak, a later cross of that same peak kills again. It does not need another 40% off the flattened equity.
+
 Not done, optional: F-015 through F-019.
 
 ### Left open

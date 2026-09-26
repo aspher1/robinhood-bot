@@ -217,6 +217,12 @@ def test_f001_kill_flattens_one_book_and_resume_needs_human_code(tmp_path, monke
     assert trips[-1]["sleeve"] == "trend_daily"
     assert trips[-1]["equity"] and trips[-1]["peak"] and trips[-1]["dd"]
     assert Decimal(trips[-1]["dd"]) <= Decimal("-0.40")
+    sleeve_peaks = {
+        str(row["name"]): str(row["peak_equity"])
+        for row in bot.ledger.conn.execute("SELECT name, peak_equity FROM sleeves")
+    }
+    portfolio_peak = bot.ledger.get_meta("portfolio_peak")
+    assert portfolio_peak
     bot.ledger.close()
 
     from rhbot.cli import main
@@ -233,9 +239,31 @@ def test_f001_kill_flattens_one_book_and_resume_needs_human_code(tmp_path, monke
 
     bot = engine(tmp_path, sma_window=200)
     assert bot.ledger.overlay_row("trend_daily")["peak"] == peak
+    assert bot.ledger.get_meta("portfolio_peak") == portfolio_peak
+    for name, stored in sleeve_peaks.items():
+        assert bot.ledger.sleeve_row(name)["peak_equity"] == stored
     bot.run_once(now=wall, snapshot=snapshot(wall, mid="10"))
     assert read_kill(tmp_path) is None
     assert bot.ledger.overlay_row("trend_daily")["peak"] == peak
+    assert bot.ledger.get_meta("portfolio_peak") == portfolio_peak
+    for name, stored in sleeve_peaks.items():
+        assert bot.ledger.sleeve_row(name)["peak_equity"] == stored
+    # 70% of the original peak is above the kill line and above a second
+    # 40% drop from the flattened book. 59% is still a kill versus that peak.
+    recovered = wall + timedelta(days=1)
+    _set_cash(bot, "trend_daily", money_str(D(peak) * Decimal("0.70")))
+    bot.run_once(now=recovered, snapshot=snapshot(recovered, mid="10"))
+    assert read_kill(tmp_path) is None
+    assert bot.ledger.overlay_row("trend_daily")["state"] == "FROZEN"
+    assert bot.ledger.overlay_row("trend_daily")["peak"] == peak
+    again = recovered + timedelta(days=1)
+    _set_cash(bot, "trend_daily", money_str(D(peak) * Decimal("0.59")))
+    bot.run_once(now=again, snapshot=snapshot(again, mid="10"))
+    assert read_kill(tmp_path) is not None
+    assert bot.ledger.overlay_row("trend_daily")["state"] == "KILLED"
+    assert bot.ledger.overlay_row("trend_daily")["peak"] == peak
+    assert bot.ledger.get_meta("portfolio_peak") == portfolio_peak
+    assert bot.ledger.sleeve_row("trend_daily")["peak_equity"] == sleeve_peaks["trend_daily"]
     bot.ledger.close()
 
 
@@ -802,6 +830,39 @@ def test_f011_shadow_enters_while_trend_is_frozen(tmp_path, now):
     assert "overlay_impact" in shadow
     assert report["overlay"]["trend_daily"]["shadow"] == "trend_daily_shadow"
     bot.ledger.close()
+
+
+def test_f020_stale_open_order_is_critical(tmp_path, now):
+    bot = engine(tmp_path, sma_window=200)
+    bot.run_once(now=now, snapshot=snapshot(now))
+    wall = utcnow()
+    client_order_id = "trend_daily:BTC-USD:buy:stuck"
+    bot.ledger.insert_open_order(
+        client_order_id=client_order_id,
+        sleeve="trend_daily",
+        symbol="BTC-USD",
+        side="buy",
+        ts=wall,
+        reason="stuck",
+    )
+    bot.ledger.conn.commit()
+    ok, detail = bot.ledger.reconcile("trend_daily", now=wall)
+    assert ok, detail
+    fresh = assess(bot.settings, now=wall)
+    assert "open_order_stale" not in fresh["reasons"]
+    bot.ledger.conn.execute(
+        "UPDATE orders SET ts=? WHERE client_order_id=?",
+        (iso(wall - timedelta(seconds=bot.settings.loop_seconds + 5)), client_order_id),
+    )
+    bot.ledger.conn.commit()
+    ok, detail = bot.ledger.reconcile("trend_daily", now=wall)
+    assert ok is False
+    assert client_order_id in detail
+    bot.ledger.close()
+    body = assess(bot.settings, now=wall)
+    assert body["health"] == "critical"
+    assert "open_order_stale" in body["reasons"]
+    assert client_order_id in body["checks"]["open_orders"]["client_order_ids"]
 
 
 def test_f012_and_f013_are_covered_by_safety_tests():

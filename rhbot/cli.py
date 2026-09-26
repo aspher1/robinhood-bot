@@ -213,8 +213,9 @@ def cmd_resume(args: argparse.Namespace) -> int:
         )
         return 2
     if needs_ack and (settings.state_dir / "bot.sqlite").exists():
-        # Remember each killed book's peak without moving it, so the same
-        # episode does not flatten again.
+        # Remember each killed book's peak without moving it. The same
+        # flattened mark does not kill again. A later drop through −40% of
+        # that original peak can.
         ledger = Ledger(settings)
         try:
             from rhbot.overlay import OVERLAY_BOOKS

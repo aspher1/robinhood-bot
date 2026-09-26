@@ -64,7 +64,7 @@ Drawdown is mark-to-bid equity divided by that book's running peak, minus one. I
 | Drawdown from that book's peak | What the engine does |
 | --- | --- |
 | 10% (`freeze_drawdown_pct`) | Sets that book to FROZEN, logs `freeze_trip`, and blocks its new buys until `rhbot ack-drawdown --strategy <name> --by operator|randy --note "..."`. Exits stay allowed. Nothing is force-sold. |
-| 40% (`kill_drawdown_pct`) | Writes `state/KILL` with `ack_required`, logs a `kill_trip`, and flattens that book. |
+| 40% (`kill_drawdown_pct`) | Writes `state/KILL` with `ack_required`, logs a `kill_trip`, and flattens that book. Resume does not move the peak. The same flattened mark does not kill again. After drawdown recovers above −40%, the next cross of that original peak does. |
 
 There is no 5% or 7.5% exposure cut. A 4% loss versus the UTC day-start equity still blocks new buys in that sleeve until the next UTC day. It does not freeze, kill, or sell. The engine never clears `state/KILL`. Drawdown uses mark-to-bid equity against that book's own peak.
 
@@ -80,6 +80,8 @@ Each cycle also fills a no-overlay shadow ledger: the same strategies and the sa
 ## Ledger and audit
 
 `state/bot.sqlite` holds sleeves, positions, fills, open-order rows, equity snapshots, candle cache, and the `events` table. Each event stores the previous row's hash and `sha256(prev + payload)`. Database triggers reject updates and deletes on `events`, `fills`, and `trade_log`. `rhbot audit verify` replays the chain and, when a heartbeat exists, checks that its `audit_head` matches the log. Health also replays cash and positions from fills.
+
+An open order older than one loop is critical (`open_order_stale`). Reconcile names its `client_order_id`. A fill closes its order in the same transaction, so a healthy book has none left open.
 
 A risk denial is an audit event of kind `risk_denial` and a matching `trade_log` row. A 10% paper freeze is kind `freeze_trip`, with the limit `freeze_drawdown_pct`, plus equity, peak, and drawdown. An acknowledgement is kind `freeze_ack`. A 40% paper kill is kind `kill_trip`, with `ack_required`, the reason `max_drawdown`, and the limit `kill_drawdown_pct`. `rhbot status` and the heartbeat distinguish `buy_pause` from `kill_switch` and include each book's overlay state. Client order ids are `sleeve:symbol:side:decision_key`, with no random suffix. `rhbot report` lists denials, freezes, acknowledgements, and kills on their own, plus `trend_daily_shadow` and `dca_weekly_shadow`. A fidelity mismatch is a separate check: stored cash or positions do not match a replay of the fills. Offline replay calls the same `Engine.run_once` path in a temporary directory. It refuses the live state dir and does not clear a kill.
 
