@@ -1,4 +1,4 @@
-"""Operator CLI. Every command prints JSON except ``report --md``."""
+"""Operator CLI. Every command prints JSON except ``report --md`` and dashboard or export text on stdout."""
 
 from __future__ import annotations
 
@@ -59,6 +59,24 @@ def _parser() -> argparse.ArgumentParser:
     report.add_argument("--json", action="store_true", help="JSON output (the default)")
     report.add_argument("--md", action="store_true", help="Print Markdown instead of JSON")
     report.set_defaults(func=cmd_report)
+
+    dashboard = sub.add_parser(
+        "dashboard",
+        parents=[common],
+        help="HTML page from recorded paper trades and equity",
+    )
+    dashboard.add_argument("--since", default="7d", help="Window such as 24h, 7d, or 30d")
+    dashboard.add_argument("--out", default=None, help="Write the HTML to this path instead of stdout")
+    dashboard.set_defaults(func=cmd_dashboard)
+
+    export = sub.add_parser("export", parents=[common], help="Recorded paper data as CSV")
+    export_sub = export.add_subparsers(dest="export_cmd", required=True)
+    trades = export_sub.add_parser("trades", parents=[common], help="CSV of simulated fills from the ledger")
+    trades.add_argument("--out", default=None, help="Write the CSV to this path instead of stdout")
+    trades.set_defaults(func=cmd_export_trades)
+    equity = export_sub.add_parser("equity", parents=[common], help="CSV of recorded equity snapshots")
+    equity.add_argument("--out", default=None, help="Write the CSV to this path instead of stdout")
+    equity.set_defaults(func=cmd_export_equity)
 
     kill = sub.add_parser("kill", parents=[common], help="Stop new simulated orders")
     kill.add_argument("--reason", required=True)
@@ -155,6 +173,47 @@ def cmd_report(args: argparse.Namespace) -> int:
         print(render_markdown(body))
     else:
         _emit(body)
+    return 0
+
+
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    try:
+        parse_since(args.since)
+    except ValueError as exc:
+        _emit({"ok": False, "error": str(exc)})
+        return 2
+    from rhbot.dashboard import render_dashboard
+
+    text = render_dashboard(load_settings(args.config, args.state_dir), args.since)
+    return _show_or_write(args.out, text)
+
+
+def cmd_export_trades(args: argparse.Namespace) -> int:
+    from rhbot.dashboard import trades_csv
+
+    text = trades_csv(load_settings(args.config, args.state_dir))
+    return _show_or_write(args.out, text)
+
+
+def cmd_export_equity(args: argparse.Namespace) -> int:
+    from rhbot.dashboard import equity_csv
+
+    text = equity_csv(load_settings(args.config, args.state_dir))
+    return _show_or_write(args.out, text)
+
+
+def _write_text(path: str, text: str) -> int:
+    payload = text.encode("utf-8")
+    Path(path).write_bytes(payload)
+    _emit({"ok": True, "wrote": str(path), "bytes": len(payload)})
+    return 0
+
+
+def _show_or_write(path: str | None, text: str) -> int:
+    if path is not None:
+        return _write_text(path, text)
+    sys.stdout.write(text)
+    sys.stdout.flush()
     return 0
 
 

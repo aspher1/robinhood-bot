@@ -62,13 +62,16 @@ State lives in the directory you pass (default `./state`):
 
 ## Commands
 
-All of these print JSON. Exit codes are 0 (ok or not started yet), 1 (degraded), and 2 (critical, or the command was refused).
+Status, health, report, kill, ack-drawdown, resume, flatten, selftest, and audit print JSON. `dashboard` prints HTML and `export` prints CSV. Pass `--out` to write a file instead. Exit codes are 0 (ok or not started yet), 1 (degraded), and 2 (critical, or the command was refused).
 
 ```bash
 rhbot status --state-dir state
 rhbot health --state-dir state
 rhbot report --since 24h --state-dir state
 rhbot report --since 7d --md --state-dir state
+rhbot dashboard --since 7d --out dashboard.html --state-dir state
+rhbot export trades --out trades.csv --state-dir state
+rhbot export equity --out equity.csv --state-dir state
 rhbot kill --reason "quotes look wrong" --state-dir state
 rhbot ack-drawdown --strategy trend_daily --by operator --note "reviewed the paper drawdown" --state-dir state
 rhbot resume --ack --human-code "$CODE" --state-dir state
@@ -83,6 +86,8 @@ rhbot audit replay --since 7d --state-dir state
 `status` and `health` answer "did it actually do something recently?": last successful cycle, the quote age from the last cycle, and error counts. A quote that was fresh during the cycle stays acceptable until the next loop window. The risk engine still rejects a quote older than 30 seconds at order time.
 
 `report` is P&L after costs for each sleeve, next to buy-and-hold.
+
+`dashboard`, `export trades`, and `export equity` read the paper ledger only. They do not start the bot, fetch prices, or change bot state. No API key. The HTML page has three separate sections: Saved results (recorded equity, P&L, and trades), Stale health (heartbeat or quotes are old; the numbers are still the last saved marks), and Incomplete data (no ledger yet, a book has no equity snapshots, reconcile failed, or a kill flatten did not finish). Returns and the buy-and-hold benchmark on the page are percent, the same percent `rhbot report` already prints. They are not dollars. A −1% cost is −1%, not −100% and not −$1. The equity CSV column `drawdown_fraction` keeps the stored fraction (0.10 means 10% off the peak), not a percent. CSV timestamps stay ISO. The page clock is `YYYY-MM-DD HH:MM:SS UTC`. `rhbot export trades` is simulated fills. `rhbot export equity` is equity snapshots. Omit `--out` to print to stdout. `--since` on dashboard matches report (`24h`, `7d`, `30d`).
 
 `resume` will not clear the kill file if something else is critically wrong (a broken ledger, for example). Reported drawdown is mark-to-bid equity against that book's all-time peak. The peak only rises. It applies to the trend and DCA books only, and these limits are paper-only: they must not be carried into a live phase. A 10% drop freezes that book's new buys until the operator runs `rhbot ack-drawdown --strategy <name> --by operator|randy --note "..."`. That acknowledgement does not move the peak or the restart baseline. Buys are allowed again while drawdown is still at or below −10%, and the book re-arms only after drawdown recovers above −10%. Sells stay allowed and nothing is force-sold. A 40% drop flattens that book and requires `rhbot resume --ack --human-code <code>`, matching `RHBOT_HUMAN_RESUME_FILE`. That human restart does not move the all-time peak. It records the book's mark-to-bid equity as `restart_baseline`. After that, the 10% pause and the 40% shutoff use the greater of that baseline and the highest equity since the restart. A new all-time high makes that reference the peak again. Nothing restarts the book on its own. The operator may trip that kill and must not clear it. `ack-drawdown` does not clear a kill. The hard caps are `freeze_drawdown_pct` (10%) and `kill_drawdown_pct` (40%).
 
