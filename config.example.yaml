@@ -1,0 +1,34 @@
+# Optional. Copy to config.yaml to override defaults.
+# Write decimals as strings. A bare 0.01 is a binary float and is rejected.
+# Every risk limit below is at the hard cap. You may tighten them. You may not loosen them.
+
+mode: paper
+starting_cash: "1000"
+symbols:
+  - BTC-USD
+  - ETH-USD
+cost_per_side: "0.01"
+max_position_pct: "0.50"
+max_total_exposure_pct: "1"
+max_daily_loss_pct: "0.04"
+# Paper only. Mark-to-bid drawdown on trend_daily and dca_weekly. Config may
+# only tighten these, and the freeze must stay below the kill. Do not carry
+# them into a live phase.
+freeze_drawdown_pct: "0.10"
+kill_drawdown_pct: "0.40"
+max_trades_per_day: 2
+max_quote_age_seconds: 30
+max_daily_turnover_pct: "1"
+max_spread_per_side: "0.02"
+min_order_notional: "10"
+# Chosen before any backtest. The 7-day hold is the risk floor.
+sma_window: 200
+trend_band: "0.02"
+min_hold_days: 7
+trend_target_weight: "0.50"
+dca_notional: "19.23"
+loop_seconds: 60
+# v1 paper source. Coinbase public bid/ask prices marks, fills, and the spread cap.
+# Kraken is diagnostic only. There is no Robinhood fallback.
+market_data: public
+public_provider: coinbase

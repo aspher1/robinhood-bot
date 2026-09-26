@@ -1,0 +1,101 @@
+# Changes
+
+## 0.1.0
+
+Paper-only BTC/ETH bot.
+
+- Three sleeves, each starting at $1,000. Buy-and-hold deploys once. The daily trend uses a 200-day average and a 2% band, with a 7-day minimum hold and no re-entry cooldown. BTC and ETH keep separate cash inside that book. Each entry is the minimum of that coin's cash and the largest size the existing caps allow (50% per trade, 50% per coin, 100% total, after the 1% cost). A size under $10 is skipped. The coin is sold on exit. Weekly DCA (F-002 item 5, Randy's decision) buys one coin every 7 days from paper day 1, BTC then ETH, at $19.23 (`$1,000 / 52`, rounded down to the cent). That clears the $10 minimum, which is unchanged. The average and the band were chosen up front and are not fitted. The hold is the risk floor.
+- Public Coinbase bid/ask for marks, fills, and the spread cap. No API key required. Kraken parsers are diagnostic only and are not a trading quote source. Fills cost at least 1% per side. Config can raise that cost and cannot lower it.
+- v1 paper does not use Robinhood quotes. A missing key is not a fallback, and health does not report that fallback as degraded.
+- Risk checks before every simulated fill. Hard caps in code, which config may only tighten: BTC-USD and ETH-USD, long-only spot, no margin or shorting, 50% per coin, 100% total exposure, 50% per trade, $10 minimum, 2 strategy trades per day per book (F-003, Randy's decision; risk-reduction sells do not count), 100% daily turnover, 7-day minimum hold, quotes older than 30 seconds rejected, spread wider than 2% per side skipped. The same client order id returns the original fill. One strategy order per symbol per day. There is no 5% or 7.5% forced sell.
+- Loss policy, paper only (F-001). A 4% UTC-day loss blocks new buys until the next UTC day. Drawdown is mark-to-bid equity divided by that book's running peak, minus one. It applies to `trend_daily` and `dca_weekly` only. Buy-and-hold is never frozen, killed, or flattened by it. Hard caps are `freeze_drawdown_pct` 0.10 and `kill_drawdown_pct` 0.40. Config may only tighten them, and the freeze must stay below the kill. At −10% the book goes FROZEN, logs `freeze_trip` (equity, peak, dd), and denies new trend and DCA buys with reason `freeze`. Exits stay allowed. Nothing is force-sold. The operator acknowledges with `rhbot ack-drawdown --strategy <name> --by operator|randy --note "..."`. That does not move the peak and does not fill skipped entries. Buys are allowed again while still at or below −10%. The book re-arms only after drawdown recovers above −10%, and the next crossing freezes again. The ack is refused unless reconcile passes, the book is FROZEN, and the stored trip drawdown matches a recomputation within 1e-6. At −40% that book logs `kill_trip`, flattens at the 1% cost floor with reason `drawdown_flatten`, and stays KILLED. It does not write the process-wide `state/KILL`. If that flatten leaves a position, the next cycle retries it and health stays critical (`kill_flatten_incomplete`) until the book is flat. Resume is human-only: `rhbot resume --ack --human-code <code>` must match the secret in `RHBOT_HUMAN_RESUME_FILE`. Without it the command exits 2. Resume does not move the peak. Clearing `state/KILL`, including a manual kill, takes `rhbot resume --ack --human-code`. The 5% and 7.5% exposure cuts stay removed. These limits must not be carried into any live phase.
+- Client order ids are `sleeve:symbol:side:decision_key` (F-006). The key is the UTC bar date, or the DCA schedule index. The fill and the strategy-state update commit in one transaction. A rerun returns the original fill.
+- `rhbot status`, health, and the heartbeat show each overlay book's state, drawdown, peak, last trip, last ack, and ack delay (F-001, F-004). Quote health uses the cycle's quote age plus the age of `last_quote_ok_at`, not a raw now-minus-quote-time check. The risk engine still rejects quotes older than 30 seconds at order time. Kraken quote time comes from the public trades feed; a missing trade time is untrusted and buys are denied (F-007).
+- `trend_daily_shadow` and `dca_weekly_shadow` run the same code and the same caps without the overlay (F-011). They are excluded from the scored book. The report shows overlaid equity, shadow equity, and `overlay_impact`.
+- Every freeze, kill, and risk denial is its own hash-chained event, with equity, peak, and drawdown on overlay transitions. `rhbot audit replay --since 7d|30d` replays stored closed candles in a temp directory and exits 2 on a decision or fill mismatch (F-010). `replay()` refuses a state dir that already has a ledger or is the service dir (F-005). The candle cache stores a bar only when it was already closed (F-009).
+- `rhbot` commands: `run`, `status`, `health`, `report`, `kill`, `resume`, `ack-drawdown`, `flatten --paper`, `selftest`, `audit verify`, `audit replay`. JSON on stdout. Heartbeat file written every cycle. Alerts stay JSON-only.
+- Append-only hash-chained decision and fill log. `audit verify` recomputes it.
+- Offline pytest suite and GitHub Actions. One test fails the build if the package references a Robinhood order endpoint or an HTTP write.
+- `LiveBroker` raises on every call. There is no live order path. No config flag or environment variable can enable one. `.github/CODEOWNERS` covers the risk module, the hard caps, and the broker directory.
+
+### Audit round 1
+
+Done: F-001, F-002 (including item 5: one $19.23 buy per week, BTC then ETH), F-003 (2 trades/day per book, risk-reduction exempt), F-004, F-005, F-006, F-007, F-008, F-009, F-010, F-011, F-012, F-013, F-014 (LiveBroker is not re-exported).
+
+Randy decided the two items that were on hold. F-003 is per book, and the cap stays 2. F-002 item 5 enables `dca_weekly` at $19.23. The $10 minimum is unchanged. Ack still does not move the peak. The −40% resume is still human-only. The 5% and 7.5% exposure sell-downs stay removed.
+
+### Audit round 2
+
+Already in place from round 1, and still true: resume does not rebase `portfolio_peak` or any sleeve `peak_equity` (peaks only rise on a new high); freeze and kill are per book on mark-to-bid and skip buy-and-hold; SMA 200 and a 2% band with no flat-time block; DCA on days 1, 8, 15, 22 at $19.23; the trade cap is 2 per book; quote health uses the cycle's quote age; client order ids have no random suffix.
+
+Added: an open order older than one loop is critical `open_order_stale`, and reconcile names its `client_order_id` (F-020). After a human resume, the same flattened mark does not kill again. Later 10% and 40% lines use the restart baseline from I-R006, not another measurement against the original peak.
+
+### Audit round 3
+
+F-021: `shadow_strategy_trades_today(sleeve, day)` counts one shadow book. The cap stays 2. On a day when buy-and-hold, DCA, and trend all signal, trend's shadow still buys both coins after DCA's shadow has traded. `overlay_effect` is zero when the overlay did not block anyone. A third order on that same shadow book is denied. Buy-and-hold stays the benchmark and has no shadow book.
+
+### Audit round 4
+
+F-022: a risk-reduction sell's client order id includes its reason (`drawdown_flatten` or `flatten`). Returning an earlier fill is allowed only when the reason matches. A same-day `trend_exit` is not reused as the flatten. If the flatten leaves a position, health is critical `kill_flatten_incomplete` and the next cycle retries (F-023).
+
+### Audit iteration 5
+
+Already closed on this branch after `50fead7` (the audited head): F-022 (risk-reduction sells use their own client id and a leftover position fails closed), F-003 (2 trades/day per book), F-002 item 5 (`dca_weekly` buys one coin at $19.23, BTC then ETH), F-021 (shadow trade cap is per book).
+
+F-024: a −40% trip sets that book to KILLED and flattens it. It does not write `state/KILL`, so the other overlay book is not blocked by the file. Buy-and-hold is untouched. `rhbot resume --ack --human-code` matching `RHBOT_HUMAN_RESUME_FILE` is still required before that book can leave the kill. Peaks are not reset.
+
+F-023: if the first flatten leaves quantity, the next cycle retries `drawdown_flatten` for that book only. Until the book is flat, health is critical `kill_flatten_incomplete` and resume stays blocked. After the book is flat, resume is still human-only. F-022 was already closed: the flatten client id includes `drawdown_flatten`.
+
+Not done, optional: F-015 through F-019.
+
+### Audit iteration 6
+
+The audited head `7f34324` is behind this branch. F-022 and F-023 were already closed here and stay closed. F-024 was already closed by keeping a single-book −40% trip off `state/KILL`. This pass adds the acceptance coverage and the two hardenings.
+
+- **F-022.** Still closed. `test_f022_kill_flatten_does_not_reuse_same_day_strategy_sell` keeps the distinct `:drawdown_flatten` client id.
+- **F-023.** Still closed. `test_f023_retry_flatten_until_book_is_flat` retries a rejected flatten, blocks resume while quantity remains, and leaves buy-and-hold and the peaks alone.
+- **F-024.** A −40% trip still kills and flattens only that book. `test_f024_kill_halt_stays_on_the_killed_book` checks that buy-and-hold and DCA still decide, that no process-wide `state/KILL` is written, and that human resume is still required. Peaks stay put.
+- **I-001.** The F-022 and F-023 acceptance tests above.
+- **I-002.** A leftover flatten writes a hash-chained `kill_flatten_incomplete` event and health lists that sleeve with each symbol and quantity. Thresholds and sizes are unchanged.
+- **I-003.** `status.assess` and `build_report` open the ledger with `mode=ro`. They do not migrate schema or rewrite meta. `test_i003_status_and_report_leave_the_ledger_mtime` checks that `bot.sqlite` is unchanged.
+
+### I-R002
+
+Randy approved marking every sleeve at the same mark-to-bid the 10% freeze and 40% kill already use (the venue bid when it is below the cost-floor haircut). Sleeve equity, that book's drawdown, the portfolio peak, the 4% daily-loss check, and reports all use it. Order size, exposure still measured at mid, and the hard caps are unchanged. I-R003 and I-R004 were declined and are not in this build.
+
+### Audit iteration 11
+
+`rhbot audit replay` starts at `paper_day1`, uses earlier candles only as warmup, compares the first decision of each day (or the one that placed an order), and limits the diff to `--since`. The 7-day hold is UTC calendar days in both the trend book and the risk check. A `min_hold`, stale-quote, or spread denial does not consume that day's trend decision, so a later cycle can still exit. A position below the $10 minimum is still sold by a kill flatten, a flatten retry, and `flatten --paper`.
+
+### Risk review after replay and calendar hold
+
+These only tighten. Resume-after-kill peak behavior is decided in I-R006 below: the all-time peak stays, and a human restart adds a separate baseline.
+
+- Every `state/KILL` clear requires `rhbot resume --ack --human-code`. The resume event says `human` only when that code matches `RHBOT_HUMAN_RESUME_FILE`.
+- A quote with no bid or ask is `missing_bid_ask`. A quote 30 seconds old or older is `stale_quote`.
+- `sma_window` 200, `trend_band` 0.02, `dca_notional` 19.23, `starting_cash` 1000, `trend_target_weight` 0.50, and BTC-then-ETH are code constants. Config that sets another value is rejected. Paper day 1 stores their hash, and a later change refuses to run.
+- `exposure_cut` is not a risk-reduction reason. Only a `reduce_only` sell skips the minimum hold and the trade cap. A sell with no open time is `min_hold`.
+- The second order in a cycle is risk-checked against the earlier orders in that cycle. Shadow books honor `state/KILL`.
+- A flatten retry uses a new client order id each attempt, so a second flatten the same UTC day can sell. `flatten --paper` is not ok when a position remains.
+- A killed DCA book logs `killed` once per state change. The report freeze column counts `freeze_trip`.
+- The safety scan covers the whole repo, Coinbase and Kraken order paths, and `getattr` write bypasses. `mid` is `(bid + ask) / 2` when both exist. Exposure caps still use that mid.
+
+### Trend entry size (Risk P1-5)
+
+A trend entry is no longer a fixed $500. Each coin's cash is tracked on its own, so a loss on one does not shrink the other. The order is the minimum of that cash and the largest notional the existing caps allow: 50% per trade, 50% per coin, and 100% total, after the 1% cost. The caps, the $10 minimum, turnover, trades per day, the hold, the band, and the average are unchanged. A result under $10 is skipped and logged (`below_min`).
+
+### Quote source (Risk P1-3)
+
+Randy approved Coinbase public bid/ask as the v1 paper source for marks, fills, and the spread cap. `market_data` is `public` and `public_provider` is `coinbase`. The Robinhood-key-missing path that switched to public prices and reported degraded is gone. Kraken stays diagnostic and is not used for those prices. If the Coinbase quote is missing, 30 seconds old or older, or has no bid/ask, new orders are denied and health is critical (`quote_hard_stop`). Nothing else is substituted. A reduce_only kill or flatten sell may still use the last valid bid/ask.
+
+### I-R006 restart baseline
+
+Randy's decision on the sticky peak after a −40% kill. The all-time peak is not rebased and is not overwritten. `rhbot status` and `rhbot report` still show drawdown from that peak. A human `rhbot resume --ack --human-code` after the shutoff records that book's mark-to-bid equity as `restart_baseline` and appends a `restart_baseline` audit event with the timestamp and the old peak. Nothing restarts itself. After that restart, the 10% pause and the 40% shutoff use max(`restart_baseline`, the highest equity since the restart). A new all-time high above the old peak makes that reference the peak again. The 10% and 40% caps are unchanged. Acknowledging a pause does not move the peak or the baseline. Weekly DCA still waits out a pause, and the pause re-arms only after equity is back above the 10% line of the active baseline. The baseline is stored on the book and replay applies the same audit event, so replay and live agree. Without the human restart the book stays off. A drawdown flatten credits that coin's trend cash, because the sale does not go through the strategy's own commit; after the restart the book can size a new entry with the cash it actually holds. Those sleeve totals stay equal to the trend book's ledger cash after normal fills and after the flatten. `rhbot audit replay --since` ignores a mismatch older than the window. Replay checks drawdown once a day at the close; the live loop checks it every cycle. A missing Coinbase quote stops the whole cycle before any sleeve trades. Paper starts from an empty `state/` directory.
+
+### Left open
+
+- The Robinhood quote parser is covered with fixtures and the signature vector. v1 paper does not call it.
+- Selftest runs in a throwaway directory. It exercises the same kill functions without flipping the running bot's kill file.
+- No email or SMS. The operator reads JSON (or `report --md`) and escalates.
+- No multi-year candle downloader beyond what the public daily endpoint returns (a few hundred bars).
+- No path from paper results to real money. That still requires Randy's written approval, and the code for it is intentionally absent.
