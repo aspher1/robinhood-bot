@@ -100,7 +100,7 @@ Kraken parsers are diagnostic only. They do not price marks, fills, or the sprea
 
 ## Tests
 
-Most tests use offline snapshots or mocked HTTP; the CLI flatten integration test also requests public market data. The suite covers fees and fills, each strategy, position and exposure caps, the kill switch, drawdown, the audit hash chain, and a scan that fails if any bot code names a Robinhood order endpoint or issues an HTTP POST, PUT, PATCH, or DELETE. GitHub Actions runs `pytest` on push and on pull requests.
+The tests use offline snapshots or mocked HTTP. The suite covers fees and fills, each strategy, position and exposure caps, the kill switch, drawdown, the audit hash chain, and a scan that fails if any bot code names a Robinhood order endpoint or issues an HTTP POST, PUT, PATCH, or DELETE. GitHub Actions runs `pytest` on push and on pull requests.
 
 ## Real money
 
