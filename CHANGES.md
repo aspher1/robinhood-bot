@@ -63,6 +63,10 @@ The audited head `7f34324` is behind this branch. F-022 and F-023 were already c
 
 Randy approved marking every sleeve at the same mark-to-bid the 10% freeze and 40% kill already use (the venue bid when it is below the cost-floor haircut). Sleeve equity, that book's drawdown, the portfolio peak, the 4% daily-loss check, and reports all use it. Order size, exposure still measured at mid, and the hard caps are unchanged. I-R003 and I-R004 were declined and are not in this build.
 
+### Audit iteration 11
+
+`rhbot audit replay` starts at `paper_day1`, uses earlier candles only as warmup, compares the first decision of each day (or the one that placed an order), and limits the diff to `--since`. The 7-day hold is UTC calendar days in both the trend book and the risk check. A `min_hold`, stale-quote, or spread denial does not consume that day's trend decision, so a later cycle can still exit. A position below the $10 minimum is still sold by a kill flatten, a flatten retry, and `flatten --paper`.
+
 ### Left open
 
 - No live Robinhood key was available here, so the quote adapter is covered with fixtures and the signature vector, not a production account.

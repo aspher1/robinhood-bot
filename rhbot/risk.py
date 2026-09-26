@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from rhbot.config import ALLOWED_SYMBOLS, Settings
@@ -279,13 +279,17 @@ class RiskEngine:
         if intent.reason not in RISK_REDUCTION_REASONS:
             opened = ctx.opened_at.get(intent.symbol)
             if opened is not None:
-                age_days = Decimal(str((ctx.now - opened).total_seconds())) / Decimal(86400)
-                if age_days < settings.min_hold_days:
+                # Same UTC calendar-day count the trend book uses. A sell on
+                # day 7 is allowed even when the clock time is earlier than the entry.
+                opened_day = opened.astimezone(timezone.utc).date()
+                today = ctx.now.astimezone(timezone.utc).date()
+                held_days = (today - opened_day).days
+                if held_days < settings.min_hold_days:
                     return deny(
                         "min_hold",
                         "min_hold_days",
                         settings.min_hold_days,
-                        q8(age_days),
+                        held_days,
                     )
         notional = q8(intent.base_quantity * quote.mid)
         if notional < settings.min_order_notional:

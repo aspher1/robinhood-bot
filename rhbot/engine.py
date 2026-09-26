@@ -33,6 +33,30 @@ from rhbot.risk import RiskContext, RiskEngine, kill_reason, peak_drawdown
 from rhbot.strategies import build_strategies
 
 
+# A later cycle the same UTC day may still pass these. Other denials stick.
+_TRANSIENT_DENIALS = ("min_hold", "stale_quote", "spread_too_wide")
+
+
+def _transient_denial(reasons: list[str]) -> bool:
+    if not reasons:
+        return False
+    head = reasons[0]
+    return any(head == code or head.startswith(f"{code} ") for code in _TRANSIENT_DENIALS)
+
+
+def _release_transient_trend(state: dict, symbols: set[str]) -> dict:
+    """Drop today's trend mark so a transient denial can be retried."""
+    if not symbols:
+        return state
+    updated = dict(state)
+    evaluated = dict(updated.get("evaluated_on") or {})
+    for symbol in symbols:
+        evaluated.pop(symbol, None)
+    updated["evaluated_on"] = evaluated
+    updated["last_decision_date"] = None
+    return updated
+
+
 def ensure_utc(ts: datetime) -> datetime:
     if ts.tzinfo is None:
         raise ValueError("timestamp must be timezone-aware")
@@ -316,6 +340,7 @@ class Engine:
         filled: list[Fill] = []
         fresh: list[Fill] = []
         planned_strategy = 0
+        transient: set[str] = set()
         for intent in orders:
             if kill_active(self.settings.state_dir):
                 break
@@ -330,7 +355,9 @@ class Engine:
                     ctx,
                     market_now,
                 )
-            except OrderRejected:
+            except OrderRejected as exc:
+                if strategy.name == "trend_daily" and _transient_denial(exc.reasons):
+                    transient.add(intent.symbol)
                 continue
             filled.append(planned)
             if self.ledger.get_fill(planned.client_order_id) is None:
@@ -342,6 +369,8 @@ class Engine:
                 if self.ledger.get_fill(fill.client_order_id) is None:
                     self.ledger.apply_fill(fill)
             positions = self.ledger.positions(strategy.name)
+            if transient:
+                new_state = _release_transient_trend(new_state, transient)
             final_state = strategy.commit(new_state, filled, positions, market_now)
             self.ledger.save_strategy_state(strategy.name, final_state, commit=False)
         equity = self.mark(strategy.name, snapshot)
@@ -369,6 +398,7 @@ class Engine:
             snapshot, state, positions, cash, equity, market_now
         )
         filled: list[Fill] = []
+        transient: set[str] = set()
         for intent in orders:
             client_order_id = self._client_id(shadow, intent, market_now)
             existing = self.ledger.get_shadow_fill(client_order_id)
@@ -382,6 +412,8 @@ class Engine:
                 ignore_overlay=True,
             )
             if not decision.allowed:
+                if strategy.name == "trend_daily" and _transient_denial(decision.reasons):
+                    transient.add(intent.symbol)
                 continue
             quote = snapshot.quotes.get(intent.symbol)
             if quote is None:
@@ -414,6 +446,8 @@ class Engine:
                 continue
             filled.append(fill)
         positions = self.ledger.shadow_positions(shadow)
+        if transient:
+            new_state = _release_transient_trend(new_state, transient)
         self.ledger.save_shadow_strategy_state(
             shadow, strategy.commit(new_state, filled, positions, market_now)
         )

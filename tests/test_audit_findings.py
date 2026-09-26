@@ -1115,11 +1115,229 @@ def test_f010_audit_replay_matches_then_flags_an_extra_fill(tmp_path):
             cash_delta, cost, notional, ts, client_order_id, reason
         ) VALUES('trend_daily', 'BTC-USD', 'buy', '1', '1', '100', '101', '-101', '1', '100', ?, 'injected', 'extra')
         """,
-        (iso(start + timedelta(days=10)),),
+        (iso(market_now),),
     )
     raw.commit()
     raw.close()
     assert main(["audit", "replay", "--since", "30d", "--state-dir", str(tmp_path)]) == 2
+
+
+def test_p1a_replay_starts_at_paper_day1_and_honors_since(tmp_path):
+    """Warmup candles and later same-day cycles must not look like a mismatch."""
+    from rhbot.backtest import diff_live
+    from rhbot.cli import main
+    from rhbot.models import MarketSnapshot
+    from tests.conftest import make_settings
+
+    day1 = datetime(2026, 8, 1, 0, 0, 40, tzinfo=UTC)
+    warmup_last = day1 - timedelta(days=1)
+    warmup_last = warmup_last.replace(hour=0, minute=0, second=0, microsecond=0)
+    closes = ["100"] * 180 + ["110"] * 120
+    series = {
+        "BTC-USD": make_bars("BTC-USD", closes, warmup_last),
+        "ETH-USD": make_bars("ETH-USD", closes, warmup_last),
+    }
+    bot = engine(tmp_path)
+    for offset in range(31):
+        day = day1 + timedelta(days=offset)
+        bar_ts = day.replace(hour=0, minute=0, second=0, microsecond=0)
+        for symbol in series:
+            series[symbol] = [
+                *series[symbol],
+                Bar(
+                    symbol=symbol,
+                    ts=bar_ts,
+                    open=Decimal("110"),
+                    high=Decimal("110"),
+                    low=Decimal("110"),
+                    close=Decimal("110"),
+                    volume=Decimal("1"),
+                    source="test",
+                ),
+            ]
+        for extra in (timedelta(0), timedelta(seconds=65)):
+            market_now = day + extra
+            window = {symbol: list(bars) for symbol, bars in series.items()}
+            quotes = {
+                symbol: Quote(symbol=symbol, ts=market_now, mid=Decimal("110"), source="test")
+                for symbol in window
+            }
+            bot.run_once(
+                now=market_now,
+                snapshot=MarketSnapshot(bars=window, quotes=quotes, source="test"),
+            )
+    assert len(bot.ledger.fills_for("buy_and_hold")) == 2
+    assert any(row["reason"] == "dca_buy" for row in bot.ledger.fills_for("dca_weekly"))
+    assert any(row["reason"] == "trend_entry" for row in bot.ledger.fills_for("trend_daily"))
+    bot.ledger.close()
+    report = diff_live(make_settings(tmp_path), "30d")
+    assert report["ok"] is True, report["mismatches"][:12]
+    assert report["mismatches"] == []
+
+    raw = __import__("sqlite3").connect(tmp_path / "bot.sqlite")
+    raw.execute(
+        """
+        INSERT INTO fills(
+            sleeve, symbol, side, qty, qty_delta, mid, fill_price,
+            cash_delta, cost, notional, ts, client_order_id, reason
+        ) VALUES(
+            'trend_daily', 'BTC-USD', 'buy', '1', '1', '110', '111',
+            '-111', '1', '110', ?, 'injected-extra', 'extra'
+        )
+        """,
+        (iso(day1 + timedelta(days=30, seconds=65)),),
+    )
+    raw.commit()
+    raw.close()
+    assert main(["audit", "replay", "--since", "30d", "--state-dir", str(tmp_path)]) == 2
+
+
+def test_p1b_seventh_day_exit_fills_and_day_six_does_not(tmp_path):
+    opened = datetime(2026, 4, 1, 0, 0, 50, tzinfo=UTC)
+    bot = engine(tmp_path, sma_window=3, trend_band=Decimal("0.01"))
+    bot.run_once(
+        now=opened,
+        snapshot=snapshot(opened, mid="12", closes=["10", "10", "12"], last_open=opened - timedelta(days=1)),
+    )
+    assert bot.ledger.positions("trend_daily")
+    too_soon = opened + timedelta(days=6)
+    too_soon = too_soon.replace(hour=23, minute=59)
+    bot.run_once(
+        now=too_soon,
+        snapshot=snapshot(
+            too_soon,
+            mid="8",
+            closes=["12", "12", "8"],
+            last_open=too_soon - timedelta(days=1),
+        ),
+    )
+    assert bot.ledger.positions("trend_daily")
+    assert any(
+        item["sleeve"] == "trend_daily" and "min_hold" in item["reason"]
+        for item in _events(bot, "decision")
+    )
+    exit_at = opened + timedelta(days=7)
+    exit_at = exit_at.replace(hour=0, minute=0, second=20)
+    stale = snapshot(
+        exit_at - timedelta(seconds=45),
+        mid="8",
+        closes=["12", "8", "8"],
+        last_open=exit_at - timedelta(days=1),
+    )
+    bot.run_once(now=exit_at, snapshot=stale)
+    assert bot.ledger.positions("trend_daily")
+    marked = (bot.ledger.strategy_state("trend_daily").get("evaluated_on") or {})
+    assert marked.get("BTC-USD") != exit_at.date().isoformat()
+    retry_at = exit_at + timedelta(minutes=1, seconds=25)
+    bot.run_once(
+        now=retry_at,
+        snapshot=snapshot(
+            retry_at,
+            mid="8",
+            closes=["12", "8", "8"],
+            last_open=retry_at - timedelta(days=1),
+        ),
+    )
+    assert bot.ledger.positions("trend_daily") == {}
+    assert any(row["reason"] == "trend_exit" for row in bot.ledger.fills_for("trend_daily"))
+    bot.ledger.close()
+
+
+def test_p1b_kill_flatten_on_day_two_still_sells(tmp_path):
+    opened = datetime(2026, 5, 1, 0, 0, 50, tzinfo=UTC)
+    bot = engine(tmp_path, sma_window=3, trend_band=Decimal("0.01"))
+    bot.run_once(
+        now=opened,
+        snapshot=snapshot(opened, mid="12", closes=["10", "10", "12"], last_open=opened - timedelta(days=1)),
+    )
+    held_bh = dict(bot.ledger.positions("buy_and_hold"))
+    day2 = opened + timedelta(days=2)
+    bot.run_once(
+        now=day2,
+        snapshot=snapshot(day2, mid="1", closes=["12", "12", "1"], last_open=day2 - timedelta(days=1)),
+    )
+    assert day2 < opened + timedelta(days=7)
+    assert bot.ledger.positions("trend_daily") == {}
+    assert any(row["reason"] == "drawdown_flatten" for row in bot.ledger.fills_for("trend_daily"))
+    assert bot.ledger.positions("buy_and_hold") == held_bh
+    bot.ledger.close()
+
+
+def test_p2_five_dollar_position_is_fully_sold(tmp_path, monkeypatch):
+    from rhbot.cli import main
+
+    wall = datetime.now(UTC).replace(microsecond=0)
+
+    def _plant(bot) -> None:
+        bot.ledger.conn.execute("DELETE FROM positions WHERE sleeve='trend_daily'")
+        bot.ledger.conn.execute(
+            "UPDATE sleeves SET cash='400.00000000' WHERE name='trend_daily'"
+        )
+        bot.ledger.conn.execute(
+            "INSERT INTO positions(sleeve, symbol, qty) VALUES('trend_daily', 'BTC-USD', '0.05000000')"
+        )
+        bot.ledger.conn.commit()
+
+    bot = engine(tmp_path, sma_window=200)
+    bot.run_once(now=wall, snapshot=snapshot(wall))
+    held_bh = dict(bot.ledger.positions("buy_and_hold"))
+    _plant(bot)
+    bot.run_once(now=wall, snapshot=snapshot(wall, mid="100"))
+    assert bot.ledger.positions("trend_daily") == {}
+    sold = [
+        row
+        for row in bot.ledger.fills_for("trend_daily")
+        if row["reason"] == "drawdown_flatten" and row["symbol"] == "BTC-USD"
+    ]
+    assert len(sold) == 1
+    assert D(sold[0]["qty"]) == Decimal("0.05000000")
+    assert bot.ledger.positions("buy_and_hold") == held_bh
+    bot.ledger.close()
+
+    retry_dir = tmp_path / "retry"
+    retry_dir.mkdir()
+    bot = engine(retry_dir, sma_window=200)
+    bot.run_once(now=wall, snapshot=snapshot(wall))
+    _plant(bot)
+    real_submit = bot.broker.submit
+
+    def flaky(sleeve, intent, client_order_id, context, now, reduce_only=False):
+        if intent.reason == "drawdown_flatten":
+            raise OrderRejected(["stale_quote"])
+        return real_submit(
+            sleeve, intent, client_order_id, context, now, reduce_only=reduce_only
+        )
+
+    monkeypatch.setattr(bot.broker, "submit", flaky)
+    bot.run_once(now=wall, snapshot=snapshot(wall, mid="100"))
+    assert bot.ledger.positions("trend_daily").get("BTC-USD") == Decimal("0.05000000")
+    bot.ledger.close()
+    bot = engine(retry_dir, sma_window=200)
+    bot.run_once(now=wall, snapshot=snapshot(wall, mid="100"))
+    assert bot.ledger.positions("trend_daily") == {}
+    assert D(
+        next(
+            row["qty"]
+            for row in bot.ledger.fills_for("trend_daily")
+            if row["reason"] == "drawdown_flatten"
+        )
+    ) == Decimal("0.05000000")
+    bot.ledger.close()
+
+    flat_dir = tmp_path / "flat"
+    flat_dir.mkdir()
+    bot = engine(flat_dir, sma_window=200)
+    bot.run_once(now=wall, snapshot=snapshot(wall))
+    _plant(bot)
+    bot.ledger.close()
+    assert main(["flatten", "--paper", "--state-dir", str(flat_dir)]) == 0
+    bot = engine(flat_dir, sma_window=200)
+    assert bot.ledger.positions("trend_daily") == {}
+    assert any(
+        row["reason"] == "flatten" and D(row["qty"]) == Decimal("0.05000000")
+        for row in bot.ledger.fills_for("trend_daily")
+    )
+    bot.ledger.close()
 
 
 def test_f011_shadow_enters_while_trend_is_frozen(tmp_path, now):

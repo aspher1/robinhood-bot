@@ -80,15 +80,17 @@ class TrendDaily:
                 want_long = False
             else:
                 want_long = in_pos
-            evaluated[symbol] = today
             if want_long == in_pos:
+                evaluated[symbol] = today
                 notes.append(f"{symbol}:hold")
                 continue
             if in_pos and not want_long:
                 held = (state.get("holding_since") or {}).get(symbol)
                 if held is not None and self._days(held, today) < self.settings.min_hold_days:
+                    # Not a finished decision. A later cycle the same day may exit.
                     notes.append(f"{symbol}:min_hold")
                     continue
+                evaluated[symbol] = today
                 orders.append(
                     OrderIntent(
                         symbol=symbol,
@@ -102,6 +104,7 @@ class TrendDaily:
             # One sleeve per coin: half the book, which is the full cash of that sleeve.
             sleeve_cash = q_cent(self.settings.starting_cash / Decimal(len(self.settings.symbols)))
             buy_amount = min(sleeve_cash, q_cent(cash))
+            evaluated[symbol] = today
             if buy_amount < self.settings.min_order_notional:
                 notes.append(f"{symbol}:below_min")
                 continue
