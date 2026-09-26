@@ -392,22 +392,6 @@ class Ledger:
             reason=str(row["reason"]),
         )
 
-    def rebase_peaks(self) -> None:
-        """Set peaks to the equity left after an acked resume.
-
-        Sleeve peaks and the combined portfolio peak both move to the current
-        book. This does not add cash. The freeze acknowledgement watermark is
-        cleared so a new loss from this peak can alert again.
-        """
-        rows = self.conn.execute("SELECT last_equity FROM sleeves").fetchall()
-        total = Decimal(0)
-        for row in rows:
-            total += D(row["last_equity"])
-        self.conn.execute("UPDATE sleeves SET peak_equity = last_equity")
-        self.conn.commit()
-        self.set_meta("portfolio_peak", money_str(q8(total)))
-        self.set_meta("drawdown_ack_peak", "")
-
     def head_hash(self) -> str:
         row = self.conn.execute(
             "SELECT hash FROM events ORDER BY seq DESC LIMIT 1"
@@ -801,6 +785,29 @@ class Ledger:
     def shadow_known_client_ids(self) -> set[str]:
         rows = self.conn.execute("SELECT client_order_id FROM shadow_fills").fetchall()
         return {str(row["client_order_id"]) for row in rows}
+
+    def get_shadow_fill(self, client_order_id: str) -> Fill | None:
+        row = self.conn.execute(
+            "SELECT * FROM shadow_fills WHERE client_order_id=?",
+            (client_order_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return Fill(
+            sleeve=str(row["sleeve"]),
+            symbol=str(row["symbol"]),
+            side=str(row["side"]),
+            qty=D(row["qty"]),
+            qty_delta=D(row["qty_delta"]),
+            mid=D(row["mid"]),
+            fill_price=D(row["fill_price"]),
+            cash_delta=D(row["cash_delta"]),
+            cost=D(row["cost"]),
+            notional=D(row["notional"]),
+            ts=parse_ts(str(row["ts"])),
+            client_order_id=str(row["client_order_id"]),
+            reason=str(row["reason"]),
+        )
 
     def commit_shadow_fill(self, fill: Fill) -> None:
         """Apply one strategy fill to the no-overlay book. Does not touch the live sleeves."""

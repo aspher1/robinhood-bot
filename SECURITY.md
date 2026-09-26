@@ -22,12 +22,12 @@ There is no live order path. `LiveBroker` raises `LiveTradingDisabled` on every 
 
 `state/DRAWDOWN_FREEZE` blocks new paper buys, including weekly DCA. Sells still work. The engine never deletes that file. The AI operator clears it with `rhbot ack-drawdown --reason "..."`. That writes a `drawdown_ack` audit event with actor `operator` and the reason. It does not reset the drawdown peak. The freeze re-arms only after drawdown recovers above −10% and then falls below it again.
 
-Drawdown is measured on the combined portfolio peak. These limits are paper-only and must not be carried into any live phase:
+Drawdown is measured on the combined portfolio peak. These limits are paper-only and must not be carried into any live phase. The hard caps are `pause_drawdown_pct` (0.10) and `kill_drawdown_pct` (0.40). Config may only tighten them.
 
-- 10% writes `state/DRAWDOWN_FREEZE` and does not sell. The operator may acknowledge it.
+- 10% writes `state/DRAWDOWN_FREEZE` and does not sell. The operator may acknowledge it. That acknowledgement does not reset the peak.
 - 40% writes `state/KILL` with `ack_required` and sells the paper positions. This kill is human-only.
 
-Clearing that kill takes a human `rhbot resume --ack`. Automation may trip a kill and cannot clear it. The operator must not run `resume --ack` for a drawdown kill. A manual `rhbot kill` can be cleared with `rhbot resume` once health is otherwise fine. Resume still refuses while some other health check is critical. `ack-drawdown` does not clear a kill.
+Clearing that kill takes a human `rhbot resume --ack`. That acknowledgement does not rebase sleeve peaks or the combined peak. The peak rises only on a new equity high. Automation may trip a kill and cannot clear it. The operator must not run `resume --ack` for a drawdown kill. A manual `rhbot kill` can be cleared with `rhbot resume` once health is otherwise fine. Resume still refuses while some other health check is critical. `ack-drawdown` does not clear a kill. Alerts stay in the status and heartbeat JSON. There is no email, SMS, or webhook.
 
 ## Ownership
 

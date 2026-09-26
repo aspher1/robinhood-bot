@@ -168,7 +168,7 @@ def test_replay_separates_risk_blocks_from_fidelity(tmp_path, now):
     ]
     assert len(freezes) == 1
     assert freezes[0]["reason"] == "drawdown_freeze"
-    assert freezes[0]["limit_name"] == "drawdown_freeze_pct"
+    assert freezes[0]["limit_name"] == "pause_drawdown_pct"
     assert freezes[0]["limit"] == "0.10"
     assert bot.ledger.conn.execute(
         "SELECT COUNT(*) AS n FROM events WHERE kind='kill_trip'"
@@ -179,7 +179,7 @@ def test_replay_separates_risk_blocks_from_fidelity(tmp_path, now):
     assert any(row["kind"] == "risk_denial" and row["limit_value"] == "2" for row in trade_rows)
     assert any(
         row["kind"] == "drawdown_freeze"
-        and row["limit_name"] == "drawdown_freeze_pct"
+        and row["limit_name"] == "pause_drawdown_pct"
         and row["limit_value"] == "0.10"
         for row in trade_rows
     )

@@ -11,7 +11,7 @@ from pathlib import Path
 from rhbot.config import Settings
 from rhbot.ledger import Ledger, parse_ts
 from rhbot.money import D, money_str, q8
-from rhbot.ops import iso, read_freeze, read_heartbeat, read_kill, utcnow
+from rhbot.ops import iso, read_freeze, read_heartbeat, read_kill, resume_needs_ack, utcnow
 from rhbot.risk import daily_buy_block, kill_reason, peak_drawdown
 
 SLEEVES = ("buy_and_hold", "dca_weekly", "trend_daily")
@@ -50,6 +50,7 @@ def assess(settings: Settings, now: datetime | None = None) -> dict:
     kill = read_kill(settings.state_dir)
     freeze = read_freeze(settings.state_dir)
     portfolio_dd = Decimal(0)
+    portfolio_peak = Decimal(0)
     acknowledged = False
     drawdown_acks: list[dict] = []
     db_exists = _db_path(settings).exists()
@@ -181,7 +182,7 @@ def assess(settings: Settings, now: datetime | None = None) -> dict:
             ledger.close()
 
     freeze_alert = freeze is not None or (
-        portfolio_dd >= settings.drawdown_freeze_pct and not acknowledged
+        portfolio_dd >= settings.pause_drawdown_pct and not acknowledged
     )
     if freeze_alert:
         level = _bump("degraded", "drawdown_freeze", level, reasons)
@@ -218,6 +219,11 @@ def assess(settings: Settings, now: datetime | None = None) -> dict:
         "mode": "paper",
         "running": bool(running),
         "kill_switch": kill is not None,
+        "buy_pause": freeze is not None,
+        "peak_equity": money_str(portfolio_peak) if equity else None,
+        "drawdown_pct": money_str(portfolio_dd),
+        "ack_required": (kill is not None and resume_needs_ack(kill)) or freeze is not None,
+        "rearm_eligible": freeze is None and portfolio_dd < settings.pause_drawdown_pct,
         "kill_reason": None if kill is None else kill.get("reason"),
         "drawdown_freeze": freeze is not None,
         "drawdown_acks": drawdown_acks,

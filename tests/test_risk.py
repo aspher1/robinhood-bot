@@ -126,7 +126,7 @@ def test_sleeve_drawdown_does_not_kill_and_freeze_blocks_buys_only(tmp_path, now
     assert not frozen.allowed
     assert not frozen.kill
     assert frozen.reasons[0].startswith("drawdown_freeze")
-    assert frozen.breaches[0].limit_name == "drawdown_freeze_pct"
+    assert frozen.breaches[0].limit_name == "pause_drawdown_pct"
     assert frozen.breaches[0].limit == "0.10"
     sell = OrderIntent("BTC-USD", "sell", "exit", base_quantity=Decimal("1"))
     allowed = risk.evaluate(
@@ -174,11 +174,11 @@ def test_config_may_only_tighten(tmp_path):
     with pytest.raises(ValueError):
         Settings(state_dir=tmp_path, max_position_pct=Decimal("0.80"))
     with pytest.raises(ValueError):
-        Settings(state_dir=tmp_path, max_drawdown_pct=Decimal("0.50"))
+        Settings(state_dir=tmp_path, kill_drawdown_pct=Decimal("0.50"))
     with pytest.raises(ValueError):
-        Settings(state_dir=tmp_path, drawdown_freeze_pct=Decimal("0.11"))
+        Settings(state_dir=tmp_path, pause_drawdown_pct=Decimal("0.11"))
     with pytest.raises(ValueError):
-        Settings(state_dir=tmp_path, drawdown_freeze_pct=Decimal("0.20"), max_drawdown_pct=Decimal("0.20"))
+        Settings(state_dir=tmp_path, pause_drawdown_pct=Decimal("0.20"), kill_drawdown_pct=Decimal("0.20"))
     with pytest.raises(ValueError):
         Settings(state_dir=tmp_path, max_trades_per_day=3)
     with pytest.raises(ValueError):
@@ -204,13 +204,13 @@ def test_config_may_only_tighten(tmp_path):
         max_quote_age_seconds=20,
         min_hold_days=8,
         cost_per_side=Decimal("0.02"),
-        drawdown_freeze_pct=Decimal("0.08"),
-        max_drawdown_pct=Decimal("0.25"),
+        pause_drawdown_pct=Decimal("0.08"),
+        kill_drawdown_pct=Decimal("0.25"),
     )
     assert tightened.max_position_pct == Decimal("0.25")
     assert tightened.min_hold_days == 8
-    assert tightened.drawdown_freeze_pct == Decimal("0.08")
-    assert tightened.max_drawdown_pct == Decimal("0.25")
+    assert tightened.pause_drawdown_pct == Decimal("0.08")
+    assert tightened.kill_drawdown_pct == Decimal("0.25")
 
 
 def test_yaml_float_is_rejected(tmp_path):

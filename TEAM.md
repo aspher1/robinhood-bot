@@ -37,7 +37,7 @@ Drawdown is measured on the combined portfolio peak. These limits are paper-only
 Two different controls, two different actors:
 
 - **−10% freeze.** The engine writes `state/DRAWDOWN_FREEZE` and blocks new buys, including weekly DCA. Sells stay allowed and nothing is force-sold. The AI operator may acknowledge it with `rhbot ack-drawdown --reason "..."`. That acknowledgement is an audit event with actor `operator` and the reason. It does not reset the drawdown peak. Once acknowledged, the freeze re-arms only after drawdown recovers above −10% and then falls below it again.
-- **−40% hard kill.** The engine writes `state/KILL` and flattens the paper book. Automation may trip that kill and must never clear it. Clearing it is human-only: `rhbot resume --ack`. The operator does not run that command. `ack-drawdown` does not clear a kill, and `resume --ack` is not a freeze acknowledgement.
+- **−40% hard kill.** The engine writes `state/KILL` and flattens the paper book. Automation may trip that kill and must never clear it. Clearing it is human-only: `rhbot resume --ack`. That acknowledgement does not reset the peak. The operator does not run that command. `ack-drawdown` does not clear a kill, and `resume --ack` is not a freeze acknowledgement.
 
 A 4% loss on the UTC day blocks new buys until the next UTC day. The buy-and-hold benchmark in `rhbot report` is the no-overlay shadow book, so a kill does not rewrite the benchmark.
 

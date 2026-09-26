@@ -50,7 +50,7 @@ def test_ten_percent_combined_drawdown_freezes_buys_until_ack(tmp_path, now):
     assert len(freezes) == 1
     payload = json.loads(freezes[0]["payload"])
     assert payload["reason"] == "drawdown_freeze"
-    assert payload["limit_name"] == "drawdown_freeze_pct"
+    assert payload["limit_name"] == "pause_drawdown_pct"
     assert payload["limit"] == "0.10"
     assert Decimal(payload["observed"]) >= Decimal("0.10")
     logged = bot.ledger.conn.execute(
@@ -88,10 +88,12 @@ def test_ten_percent_combined_drawdown_freezes_buys_until_ack(tmp_path, now):
     assert (tmp_path / "DRAWDOWN_FREEZE").exists()
 
     peak_before = bot.ledger.get_meta("portfolio_peak")
+    sleeve_peak = bot.ledger.sleeve_row("buy_and_hold")["peak_equity"]
     assert main(
         ["ack-drawdown", "--reason", "reviewed the paper drawdown", "--state-dir", str(tmp_path)]
     ) == 0
     assert bot.ledger.get_meta("portfolio_peak") == peak_before
+    assert bot.ledger.sleeve_row("buy_and_hold")["peak_equity"] == sleeve_peak
     ack_rows = bot.ledger.conn.execute(
         "SELECT payload FROM events WHERE kind='drawdown_ack'"
     ).fetchall()
@@ -176,7 +178,7 @@ def test_forty_percent_combined_drawdown_kills_and_requires_ack(tmp_path):
     assert len(trips) == 1
     trip = json.loads(trips[0]["payload"])
     assert trip["reason"] == "max_drawdown"
-    assert trip["limit_name"] == "max_drawdown_pct"
+    assert trip["limit_name"] == "kill_drawdown_pct"
     assert trip["limit"] == "0.40"
     assert trip["ack_required"] is True
     assert Decimal(trip["observed"]) >= Decimal("0.40")
@@ -188,6 +190,10 @@ def test_forty_percent_combined_drawdown_kills_and_requires_ack(tmp_path):
     assert logged[0]["limit_value"] == "0.40"
     bot.run_once(now=wall, snapshot=crashed)
     assert (tmp_path / "KILL").exists()
+    peak_before = bot.ledger.get_meta("portfolio_peak")
+    sleeve_peaks = {
+        name: bot.ledger.sleeve_row(name)["peak_equity"] for name in bot.ledger.sleeve_names()
+    }
     bot.ledger.close()
 
     assert main(["resume", "--state-dir", str(tmp_path)]) == 2
@@ -200,8 +206,14 @@ def test_forty_percent_combined_drawdown_kills_and_requires_ack(tmp_path):
     assert not (tmp_path / "KILL").exists()
 
     bot = engine(tmp_path, sma_window=3)
+    assert bot.ledger.get_meta("portfolio_peak") == peak_before
+    for name, peak in sleeve_peaks.items():
+        assert bot.ledger.sleeve_row(name)["peak_equity"] == peak
     bot.run_once(now=wall, snapshot=crashed)
     assert read_kill(tmp_path) is None
+    assert bot.ledger.get_meta("portfolio_peak") == peak_before
+    for name, peak in sleeve_peaks.items():
+        assert bot.ledger.sleeve_row(name)["peak_equity"] == peak
     bot.ledger.close()
 
 

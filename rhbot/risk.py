@@ -104,8 +104,8 @@ def kill_reason(equity: Decimal, peak: Decimal, settings: Settings) -> str | Non
     These drawdown limits must not be carried into a live phase.
     """
     dd = peak_drawdown(equity, peak)
-    if dd >= settings.max_drawdown_pct:
-        return f"max_drawdown {q8(dd)} >= {settings.max_drawdown_pct}"
+    if dd >= settings.kill_drawdown_pct:
+        return f"max_drawdown {q8(dd)} >= {settings.kill_drawdown_pct}"
     return None
 
 
@@ -206,8 +206,8 @@ class RiskEngine:
             if not ignore_overlay and freeze_active(settings.state_dir):
                 return deny(
                     "drawdown_freeze",
-                    "drawdown_freeze_pct",
-                    settings.drawdown_freeze_pct,
+                    "pause_drawdown_pct",
+                    settings.pause_drawdown_pct,
                     "frozen",
                     detail=(
                         "drawdown_freeze: new buys are frozen until rhbot ack-drawdown"

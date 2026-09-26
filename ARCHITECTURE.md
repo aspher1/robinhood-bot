@@ -63,15 +63,15 @@ Drawdown is measured on the combined portfolio: the sum of the sleeve equities, 
 
 | Drawdown from the combined peak | What the engine does |
 | --- | --- |
-| 10% | Writes `state/DRAWDOWN_FREEZE`, logs a `drawdown_freeze` event, and blocks new buys, including weekly DCA, until the operator runs `rhbot ack-drawdown --reason "..."`. Exits and sells stay allowed. Nothing is force-sold. |
-| 40% | Writes `state/KILL` with `ack_required`, logs a `kill_trip`, and flattens every paper sleeve. |
+| 10% (`pause_drawdown_pct`) | Writes `state/DRAWDOWN_FREEZE`, logs a `drawdown_freeze` event, and blocks new buys, including weekly DCA, until the operator runs `rhbot ack-drawdown --reason "..."`. Exits and sells stay allowed. Nothing is force-sold. |
+| 40% (`kill_drawdown_pct`) | Writes `state/KILL` with `ack_required`, logs a `kill_trip`, and flattens every paper sleeve. |
 
 There is no 5% or 7.5% exposure cut. A 4% loss versus the UTC day-start equity still blocks new buys in that sleeve until the next UTC day. It does not freeze, kill, or sell. The engine never clears `state/DRAWDOWN_FREEZE` or `state/KILL`.
 
 The two acknowledgements are not interchangeable:
 
 - The AI operator may clear a **10% freeze** with `rhbot ack-drawdown --reason "..."`. The audit event is `drawdown_ack`, with actor `operator` and that reason. `rhbot status` and `rhbot report` include those acknowledgements. The command does not reset the portfolio peak. After it, the freeze stays disarmed until drawdown recovers above −10% and then falls below −10% again.
-- A **40% kill** is human-only. Automation may trip it and must never clear it. The only clear path is `rhbot resume --ack`, which rebases each sleeve peak and the combined peak to current equity. It does not add cash. The operator must not run it. `ack-drawdown` does not clear `state/KILL`.
+- A **40% kill** is human-only. Automation may trip it and must never clear it. The only clear path is `rhbot resume --ack`. That acknowledgement does not move sleeve peaks or the combined peak. The peak rises only when equity prints a new high. Resume records the current peak so the same episode does not flatten again; a recovery under 40%, or a new high, lets a later breach kill. It does not add cash. The operator must not run it. `ack-drawdown` does not clear `state/KILL`.
 
 Other critical health problems still block resume.
 
@@ -81,7 +81,7 @@ Each cycle also fills a no-overlay shadow ledger: the same strategies and the sa
 
 `state/bot.sqlite` holds sleeves, positions, fills, open-order rows, equity snapshots, candle cache, and the `events` table. Each event stores the previous row's hash and `sha256(prev + payload)`. Database triggers reject updates and deletes on `events`, `fills`, and `trade_log`. `rhbot audit verify` replays the chain and, when a heartbeat exists, checks that its `audit_head` matches the log. Health also replays cash and positions from fills.
 
-A risk denial is an audit event of kind `risk_denial` and a matching `trade_log` row. A 10% paper freeze is kind `drawdown_freeze`, with the limit `drawdown_freeze_pct`. An operator acknowledgement is kind `drawdown_ack`, with the actor and the reason, and it does not reset the peak. A 40% paper kill is kind `kill_trip`, with `ack_required`, the reason `max_drawdown`, and the limit `max_drawdown_pct`. Each risk event carries the limit that was hit and the observed value. `rhbot report` lists denials, freezes, acknowledgements, and kills on their own, plus the no-overlay shadow book. A fidelity mismatch is a separate check: stored cash or positions do not match a replay of the fills. Offline replay (`rhbot/backtest.py`) calls the same `Engine.run_once` path, so the same risk engine writes those events and the same shadow book. It does not clear a freeze or a kill.
+A risk denial is an audit event of kind `risk_denial` and a matching `trade_log` row. A 10% paper pause is kind `drawdown_freeze`, with the limit `pause_drawdown_pct`. An operator acknowledgement is kind `drawdown_ack`, with the actor and the reason, and it does not reset the peak. A 40% paper kill is kind `kill_trip`, with `ack_required`, the reason `max_drawdown`, and the limit `kill_drawdown_pct`. Each risk event carries the limit that was hit and the observed value. `rhbot status` and the heartbeat distinguish `buy_pause` from `kill_switch` and include `peak_equity`, `drawdown_pct`, `ack_required`, and `rearm_eligible`. Client order ids are `sleeve-symbol-side-UTC-day`, with no random suffix. `rhbot report` lists denials, freezes, acknowledgements, and kills on their own, plus the no-overlay shadow book. A fidelity mismatch is a separate check: stored cash or positions do not match a replay of the fills. Offline replay (`rhbot/backtest.py`) calls the same `Engine.run_once` path, so the same risk engine writes those events and the same shadow book. It does not clear a freeze or a kill.
 
 ## Operator surface
 

@@ -13,8 +13,8 @@ max_total_exposure_pct: "1"
 max_daily_loss_pct: "0.04"
 # Paper only. Measured on the combined portfolio peak. Config may only tighten
 # these. Do not carry them into a live phase.
-drawdown_freeze_pct: "0.10"
-max_drawdown_pct: "0.40"
+pause_drawdown_pct: "0.10"
+kill_drawdown_pct: "0.40"
 max_trades_per_day: 2
 max_quote_age_seconds: 30
 max_daily_turnover_pct: "1"

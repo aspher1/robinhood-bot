@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import signal
 import time
-import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -25,6 +24,7 @@ from rhbot.ops import (
     iso,
     kill_active,
     read_kill,
+    resume_needs_ack,
     sd_notify,
     utcnow,
     write_heartbeat,
@@ -228,9 +228,28 @@ class Engine:
         return q8(equity)
 
     def heartbeat_body(self) -> dict:
+        buy_pause = freeze_active(self.settings.state_dir)
+        kill = read_kill(self.settings.state_dir)
+        peak_raw = self.ledger.get_meta("portfolio_peak")
+        equity_raw = self.ledger.get_meta("portfolio_equity")
+        if peak_raw:
+            peak = D(peak_raw)
+            marked = D(equity_raw) if equity_raw else peak
+            dd = peak_drawdown(marked, peak)
+            peak_equity = money_str(peak)
+            drawdown_pct = money_str(dd)
+        else:
+            peak_equity = None
+            dd = Decimal(0)
+            drawdown_pct = money_str(dd)
         return {
-            "kill_switch": kill_active(self.settings.state_dir),
-            "drawdown_freeze": freeze_active(self.settings.state_dir),
+            "kill_switch": kill is not None,
+            "buy_pause": buy_pause,
+            "drawdown_freeze": buy_pause,
+            "peak_equity": peak_equity,
+            "drawdown_pct": drawdown_pct,
+            "ack_required": (kill is not None and resume_needs_ack(kill)) or buy_pause,
+            "rearm_eligible": (not buy_pause) and dd < self.settings.pause_drawdown_pct,
             "last_decision_at": self.ledger.get_meta("last_decision_at"),
             "last_quote_ok_at": self.ledger.get_meta("last_quote_ok_at"),
             "last_loop_ok_at": self.ledger.get_meta("last_loop_ok_at"),
@@ -313,6 +332,10 @@ class Engine:
         filled: list[Fill] = []
         for intent in orders:
             client_order_id = "shadow-" + self._client_id(strategy.name, intent, market_now)
+            existing = self.ledger.get_shadow_fill(client_order_id)
+            if existing is not None:
+                filled.append(existing)
+                continue
             decision = self.risk.evaluate(
                 intent,
                 self._shadow_context(strategy.name, snapshot, market_now),
@@ -442,13 +465,25 @@ class Engine:
         """
         equity, peak = self._mark_portfolio(market_now, snapshot)
         dd = peak_drawdown(equity, peak)
-        reason = kill_reason(equity, peak, self.settings)
-        if reason:
-            self._trip_drawdown(reason, market_now, snapshot, equity=equity, peak=peak)
-            return equity, peak
+        if dd >= self.settings.kill_drawdown_pct:
+            # A human resume records this peak without moving it. The same
+            # episode must not flatten again. A new high, or a recovery under
+            # the kill line, clears that watermark.
+            if (self.ledger.get_meta("kill_ack_peak") or "") != money_str(peak):
+                reason = kill_reason(equity, peak, self.settings)
+                self._trip_drawdown(
+                    reason or f"max_drawdown {q8(dd)} >= {self.settings.kill_drawdown_pct}",
+                    market_now,
+                    snapshot,
+                    equity=equity,
+                    peak=peak,
+                )
+                return equity, peak
+        elif self.ledger.get_meta("kill_ack_peak"):
+            self.ledger.set_meta("kill_ack_peak", "")
         if kill_active(self.settings.state_dir):
             return equity, peak
-        if dd >= self.settings.drawdown_freeze_pct:
+        if dd >= self.settings.pause_drawdown_pct:
             self._raise_freeze(market_now, equity, peak, dd)
         elif not freeze_active(self.settings.state_dir) and self.ledger.get_meta("drawdown_ack_peak"):
             # Recovered above the freeze line. The next breach of this or a new peak may alert.
@@ -462,7 +497,7 @@ class Engine:
         if (self.ledger.get_meta("drawdown_ack_peak") or "") == money_str(peak):
             return
         observed = format(q8(dd), "f")
-        reason = f"drawdown_freeze {observed} >= {self.settings.drawdown_freeze_pct}"
+        reason = f"drawdown_freeze {observed} >= {self.settings.pause_drawdown_pct}"
         engage_freeze(self.settings.state_dir, reason, "risk")
         self.ledger.record_risk_event(
             "drawdown_freeze",
@@ -471,8 +506,8 @@ class Engine:
             symbol="",
             side="",
             reason="drawdown_freeze",
-            limit_name="drawdown_freeze_pct",
-            limit_value=format(self.settings.drawdown_freeze_pct, "f"),
+            limit_name="pause_drawdown_pct",
+            limit_value=format(self.settings.pause_drawdown_pct, "f"),
             observed=observed,
             client_order_id="",
             detail=reason,
@@ -499,8 +534,8 @@ class Engine:
                 symbol="",
                 side="",
                 reason="max_drawdown",
-                limit_name="max_drawdown_pct",
-                limit_value=format(self.settings.max_drawdown_pct, "f"),
+                limit_name="kill_drawdown_pct",
+                limit_value=format(self.settings.kill_drawdown_pct, "f"),
                 observed=observed,
                 client_order_id="",
                 detail=reason,
@@ -530,8 +565,9 @@ class Engine:
                 self.ledger.set_meta("last_auth_ok_at", iso(wall))
 
     def _client_id(self, sleeve: str, intent: OrderIntent, market_now: datetime) -> str:
-        stamp = market_now.strftime("%Y%m%dT%H%M%S")
-        return f"{sleeve}-{intent.symbol}-{intent.side}-{stamp}-{uuid.uuid4().hex[:12]}"
+        """One id per sleeve, symbol, side, and UTC day. No random entropy."""
+        day = ensure_utc(market_now).date().isoformat()
+        return f"{sleeve}-{intent.symbol}-{intent.side}-{day}"
 
 
 def _intent_payload(intent: OrderIntent) -> dict:

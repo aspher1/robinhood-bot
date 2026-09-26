@@ -35,8 +35,10 @@ def test_hard_caps_match_the_risk_policy():
     assert "dd_cut_quarter" not in HARD_CAPS
     assert "exposure_cap_at_half" not in HARD_CAPS
     assert "exposure_cap_at_quarter" not in HARD_CAPS
-    assert HARD_CAPS["drawdown_freeze_pct"] == Decimal("0.10")
-    assert HARD_CAPS["max_drawdown_pct"] == Decimal("0.40")
+    assert HARD_CAPS["pause_drawdown_pct"] == Decimal("0.10")
+    assert HARD_CAPS["kill_drawdown_pct"] == Decimal("0.40")
+    assert "drawdown_freeze_pct" not in HARD_CAPS
+    assert "max_drawdown_pct" not in HARD_CAPS
     assert HARD_CAPS["max_quote_age_seconds"] == 30
     assert HARD_CAPS["max_spread_per_side"] == Decimal("0.02")
 
@@ -68,6 +70,10 @@ def test_engine_never_clears_the_kill_file():
     assert "_sell_down" not in text
     assert "exposure_cut" not in text
     assert "LiveBroker(" not in text
+    assert "rebase_peaks" not in text
+    assert "uuid" not in text
+    cli = (ROOT.parent / "rhbot" / "cli.py").read_text(encoding="utf-8")
+    assert "rebase_peaks" not in cli
 
 
 def test_package_has_no_live_order_path():

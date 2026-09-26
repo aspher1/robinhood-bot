@@ -66,7 +66,7 @@ def _parser() -> argparse.ArgumentParser:
     resume.add_argument(
         "--ack",
         action="store_true",
-        help="Required after a drawdown kill. Acknowledges the loss and rebases the peak.",
+        help="Required after a 40% drawdown kill. Human acknowledgement. Does not move the peak.",
     )
     resume.set_defaults(func=cmd_resume)
 
@@ -194,13 +194,22 @@ def cmd_resume(args: argparse.Namespace) -> int:
         )
         return 2
     if needs_ack and (settings.state_dir / "bot.sqlite").exists():
+        # Remember this peak so the same episode does not flatten again.
+        # Sleeve peaks and the portfolio peak stay where they are.
         ledger = Ledger(settings)
         try:
-            ledger.rebase_peaks()
+            peak = ledger.get_meta("portfolio_peak") or ""
+            if peak:
+                ledger.set_meta("kill_ack_peak", peak)
         finally:
             ledger.close()
     clear_kill(settings.state_dir)
-    _log_if_db(settings, "resume", {"by": "operator", "ack": bool(args.ack)})
+    actor = "human" if args.ack else "operator"
+    _log_if_db(
+        settings,
+        "resume",
+        {"by": actor, "ack": bool(args.ack), "peak_unchanged": True},
+    )
     _emit({"ok": True, "kill_switch": False, "ack": bool(args.ack)})
     return 0
 
@@ -209,7 +218,7 @@ def cmd_ack_drawdown(args: argparse.Namespace) -> int:
     """Clear a paper buy-freeze. Does not touch the kill file or the drawdown peak.
 
     The actor is the AI operator. A 40% kill still requires a human
-    ``rhbot resume --ack``. This command must not call ``rebase_peaks``.
+    ``rhbot resume --ack``. Neither command moves the portfolio peak.
     """
     reason = str(args.reason).strip()
     if not reason:
