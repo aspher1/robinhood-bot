@@ -10,13 +10,150 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from rhbot.config import FROZEN_SMA_WINDOW, FROZEN_STARTING_CASH, FROZEN_SYMBOLS, FROZEN_TREND_BAND, Settings
-from rhbot.models import Bar, Fill, MarketSnapshot, OrderIntent
-from rhbot.money import q_cent
+from rhbot.errors import DataError
+from rhbot.models import Bar, Fill, MarketSnapshot, OrderIntent, Quote
+from rhbot.money import D, q8, q_cent
+from rhbot.overlay import mark_to_bid_equity
+from rhbot.pricing import plan_fill
+from rhbot.risk import EPS
 
 
 def closed_bars(bars: list[Bar], now: datetime) -> list[Bar]:
     cutoff = now - timedelta(days=1)
     return sorted((bar for bar in bars if bar.ts <= cutoff), key=lambda bar: bar.ts)
+
+
+def initial_sleeve_cash() -> dict[str, str]:
+    """Half the trend book for each coin. Losses stay on that coin."""
+    half = q8(FROZEN_STARTING_CASH / Decimal(len(FROZEN_SYMBOLS)))
+    return {symbol: format(half, "f") for symbol in FROZEN_SYMBOLS}
+
+
+def sleeve_cash_map(state: dict) -> dict[str, Decimal]:
+    raw = state.get("sleeve_cash")
+    if not isinstance(raw, dict):
+        raw = initial_sleeve_cash()
+    out: dict[str, Decimal] = {}
+    for symbol in FROZEN_SYMBOLS:
+        try:
+            out[symbol] = D(raw.get(symbol, "0"))
+        except (TypeError, ValueError):
+            out[symbol] = Decimal(0)
+    return out
+
+
+def _exposure_after(symbol: str, added: Decimal, positions: dict, quotes: dict[str, Quote]) -> Decimal | None:
+    total = Decimal(0)
+    for name in set(positions) | {symbol}:
+        quote = quotes.get(name)
+        if quote is None:
+            return None
+        qty = positions.get(name, Decimal(0))
+        if name == symbol:
+            qty += added
+        total += qty * quote.mid
+    return total
+
+
+def order_fits_caps(
+    symbol: str,
+    amount: Decimal,
+    *,
+    sleeve_cash: Decimal,
+    ledger_cash: Decimal,
+    equity: Decimal,
+    positions: dict,
+    quotes: dict[str, Quote],
+    turnover_today: Decimal,
+    turnover_base: Decimal,
+    settings: Settings,
+) -> bool:
+    """True when ``amount`` stays inside the existing buy caps, after the cost."""
+    if amount <= 0:
+        return False
+    quote = quotes.get(symbol)
+    if quote is None:
+        return False
+    if amount > sleeve_cash + EPS or amount > ledger_cash + EPS:
+        return False
+    turnover_cap = turnover_base * settings.max_daily_turnover_pct + EPS
+    if turnover_today + amount > turnover_cap:
+        return False
+    intent = OrderIntent(symbol, "buy", "trend_entry", quote_amount=amount)
+    try:
+        qty, _px, _cash, _cost, notional = plan_fill(intent, quote, settings.cost_per_side)
+    except DataError:
+        return False
+    trade_cap_pct = min(settings.max_position_pct, settings.max_total_exposure_pct)
+    cap = equity * trade_cap_pct + EPS
+    if notional > cap:
+        return False
+    if (positions.get(symbol, Decimal(0)) + qty) * quote.mid > cap:
+        return False
+    exposure = _exposure_after(symbol, qty, positions, quotes)
+    if exposure is None:
+        return False
+    if exposure > equity * settings.max_total_exposure_pct + EPS:
+        return False
+    return True
+
+
+def largest_entry_quote(
+    symbol: str,
+    *,
+    sleeve_cash: Decimal,
+    ledger_cash: Decimal,
+    equity: Decimal,
+    positions: dict,
+    quotes: dict[str, Quote],
+    turnover_today: Decimal,
+    turnover_base: Decimal,
+    settings: Settings,
+) -> Decimal:
+    """Largest cent size that fits this coin's cash and the existing caps."""
+    ceiling = min(sleeve_cash, ledger_cash)
+    if ceiling < settings.min_order_notional:
+        return Decimal(0)
+    hi = int(q_cent(ceiling) * 100)
+    lo = int(settings.min_order_notional * 100)
+    best = 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        amount = Decimal(mid) / Decimal(100)
+        if order_fits_caps(
+            symbol,
+            amount,
+            sleeve_cash=sleeve_cash,
+            ledger_cash=ledger_cash,
+            equity=equity,
+            positions=positions,
+            quotes=quotes,
+            turnover_today=turnover_today,
+            turnover_base=turnover_base,
+            settings=settings,
+        ):
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if best == 0:
+        return Decimal(0)
+    amount = Decimal(best) / Decimal(100)
+    while best > 0 and not order_fits_caps(
+        symbol,
+        amount,
+        sleeve_cash=sleeve_cash,
+        ledger_cash=ledger_cash,
+        equity=equity,
+        positions=positions,
+        quotes=quotes,
+        turnover_today=turnover_today,
+        turnover_base=turnover_base,
+        settings=settings,
+    ):
+        best -= 1
+        amount = Decimal(best) / Decimal(100)
+    return amount if best else Decimal(0)
 
 
 def has_latest_closed_bar(bars: list[Bar], now: datetime) -> bool:
@@ -40,6 +177,7 @@ class TrendDaily:
             "last_decision_date": None,
             "evaluated_on": {},
             "holding_since": {},
+            "sleeve_cash": initial_sleeve_cash(),
         }
 
     def decide(
@@ -55,6 +193,14 @@ class TrendDaily:
         evaluated = dict(state.get("evaluated_on") or {})
         orders: list[OrderIntent] = []
         notes: list[str] = []
+        opening_cash = sleeve_cash_map(state)
+        work_sleeve = dict(opening_cash)
+        work_cash = cash
+        work_equity = equity
+        work_positions = dict(positions)
+        turnover = Decimal(0)
+        # Same-day turnover room. The risk check measures quote against day-start equity.
+        turnover_base = equity
         for symbol in FROZEN_SYMBOLS:
             if evaluated.get(symbol) == today:
                 notes.append(f"{symbol}:already_decided_today")
@@ -101,9 +247,20 @@ class TrendDaily:
                 )
                 notes.append(f"{symbol}:exit")
                 continue
-            # One sleeve per coin: half the book, which is the full cash of that sleeve.
-            sleeve_cash = q_cent(FROZEN_STARTING_CASH / Decimal(len(FROZEN_SYMBOLS)))
-            buy_amount = min(sleeve_cash, q_cent(cash))
+            if view.quotes.get(symbol) is None:
+                notes.append(f"{symbol}:missing_quote")
+                continue
+            buy_amount = largest_entry_quote(
+                symbol,
+                sleeve_cash=work_sleeve[symbol],
+                ledger_cash=work_cash,
+                equity=work_equity,
+                positions=work_positions,
+                quotes=view.quotes,
+                turnover_today=turnover,
+                turnover_base=turnover_base,
+                settings=self.settings,
+            )
             evaluated[symbol] = today
             if buy_amount < self.settings.min_order_notional:
                 notes.append(f"{symbol}:below_min")
@@ -117,14 +274,27 @@ class TrendDaily:
                 )
             )
             notes.append(f"{symbol}:enter")
+            quote = view.quotes[symbol]
+            qty, _px, cash_delta, _cost, notional = plan_fill(
+                orders[-1], quote, self.settings.cost_per_side
+            )
+            work_cash = q8(work_cash + cash_delta)
+            work_positions[symbol] = q8(work_positions.get(symbol, Decimal(0)) + qty)
+            work_sleeve[symbol] = q8(work_sleeve[symbol] + cash_delta)
+            turnover = q8(turnover + notional)
+            work_equity = mark_to_bid_equity(
+                work_cash, work_positions, view.quotes, self.settings.cost_per_side
+            )
         updated = dict(state)
+        updated["sleeve_cash"] = {
+            symbol: format(q8(amount), "f") for symbol, amount in opening_cash.items()
+        }
         updated["evaluated_on"] = evaluated
         if evaluated and all(evaluated.get(symbol) == today for symbol in FROZEN_SYMBOLS):
             updated["last_decision_date"] = today
         return orders, updated, ";".join(notes) or "no_trade"
 
     def commit(self, state: dict, fills: list[Fill], positions: dict, now: datetime) -> dict:
-        del fills
         today = now.astimezone(timezone.utc).date().isoformat()
         holding = dict(state.get("holding_since") or {})
         for symbol in FROZEN_SYMBOLS:
@@ -133,8 +303,14 @@ class TrendDaily:
                 holding.setdefault(symbol, today)
             else:
                 holding.pop(symbol, None)
+        cash_map = sleeve_cash_map(state)
+        for fill in fills:
+            if fill.symbol not in cash_map:
+                continue
+            cash_map[fill.symbol] = q8(cash_map[fill.symbol] + fill.cash_delta)
         updated = dict(state)
         updated["holding_since"] = holding
+        updated["sleeve_cash"] = {symbol: format(q8(amount), "f") for symbol, amount in cash_map.items()}
         return updated
 
     @staticmethod

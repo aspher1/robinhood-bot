@@ -35,7 +35,7 @@ Each strategy is a pure function from bars, quotes, positions, and its own state
 | --- | --- |
 | `buy_and_hold` | On the first cycle, split cash across BTC and ETH and then hold. |
 | `dca_weekly` | Buy `dca_notional` (default $19.23) of one coin every 7 days from paper day 1, BTC then ETH. |
-| `trend_daily` | Once per UTC day, hold a symbol when its last closed daily close is above its N-day average by the no-trade band; otherwise go to cash. A minimum hold applies in both directions after the first entry. |
+| `trend_daily` | Once per UTC day, hold a symbol when its last closed daily close is above its N-day average by the no-trade band; otherwise go to cash. BTC and ETH keep separate cash. An entry is that coin's cash, capped by the existing 50% per trade, 50% per coin, and 100% total limits after the 1% cost. Under $10 is skipped. A minimum hold applies in both directions after the first entry. |
 
 N and the band were chosen before any backtest: 200 days and 2%. The minimum hold is the risk floor, 7 days. `rhbot/backtest.py` replays those same functions over bars you already have. It does not search parameters.
 

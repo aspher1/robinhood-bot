@@ -83,7 +83,9 @@ def test_trend_enters_above_band_and_holds_inside_it(tmp_path, now):
         hot, strategy.initial_state(), {}, Decimal("1000"), Decimal("1000"), now
     )
     assert {item.symbol for item in orders} == {"BTC-USD", "ETH-USD"}
-    assert all(item.side == "buy" and item.quote_amount == Decimal("500.00") for item in orders)
+    assert all(item.side == "buy" and item.quote_amount is not None and item.quote_amount > 0 for item in orders)
+    assert orders[0].quote_amount == Decimal("500.00")
+    assert orders[1].quote_amount <= Decimal("500.00")
     assert "enter" in reason
 
     again, _, reason2 = strategy.decide(hot, state, {}, Decimal("1000"), Decimal("1000"), now)

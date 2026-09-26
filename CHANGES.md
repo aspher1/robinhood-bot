@@ -4,7 +4,7 @@
 
 Paper-only BTC/ETH bot.
 
-- Three sleeves, each starting at $1,000. Buy-and-hold deploys once. The daily trend uses a 200-day average and a 2% band, with a 7-day minimum hold and no re-entry cooldown. Each coin's sleeve buys its full cash on entry and sells the position on exit. Weekly DCA (F-002 item 5, Randy's decision) buys one coin every 7 days from paper day 1, BTC then ETH, at $19.23 (`$1,000 / 52`, rounded down to the cent). That clears the $10 minimum, which is unchanged. The average and the band were chosen up front and are not fitted. The hold is the risk floor.
+- Three sleeves, each starting at $1,000. Buy-and-hold deploys once. The daily trend uses a 200-day average and a 2% band, with a 7-day minimum hold and no re-entry cooldown. BTC and ETH keep separate cash inside that book. Each entry is the minimum of that coin's cash and the largest size the existing caps allow (50% per trade, 50% per coin, 100% total, after the 1% cost). A size under $10 is skipped. The coin is sold on exit. Weekly DCA (F-002 item 5, Randy's decision) buys one coin every 7 days from paper day 1, BTC then ETH, at $19.23 (`$1,000 / 52`, rounded down to the cent). That clears the $10 minimum, which is unchanged. The average and the band were chosen up front and are not fitted. The hold is the risk floor.
 - Public Coinbase bid/ask for marks, fills, and the spread cap. No API key required. Kraken parsers are diagnostic only and are not a trading quote source. Fills cost at least 1% per side. Config can raise that cost and cannot lower it.
 - v1 paper does not use Robinhood quotes. A missing key is not a fallback, and health does not report that fallback as degraded.
 - Risk checks before every simulated fill. Hard caps in code, which config may only tighten: BTC-USD and ETH-USD, long-only spot, no margin or shorting, 50% per coin, 100% total exposure, 50% per trade, $10 minimum, 2 strategy trades per day per book (F-003, Randy's decision; risk-reduction sells do not count), 100% daily turnover, 7-day minimum hold, quotes older than 30 seconds rejected, spread wider than 2% per side skipped. The same client order id returns the original fill. One strategy order per symbol per day. There is no 5% or 7.5% forced sell.
@@ -69,7 +69,7 @@ Randy approved marking every sleeve at the same mark-to-bid the 10% freeze and 4
 
 ### Risk review after replay and calendar hold
 
-These only tighten. Strategy sizing versus the 50% per-trade cap and resume-after-kill peak behavior are unchanged.
+These only tighten. Resume-after-kill peak behavior is unchanged.
 
 - Every `state/KILL` clear requires `rhbot resume --ack --human-code`. The resume event says `human` only when that code matches `RHBOT_HUMAN_RESUME_FILE`.
 - A quote with no bid or ask is `missing_bid_ask`. A quote 30 seconds old or older is `stale_quote`.
@@ -79,6 +79,10 @@ These only tighten. Strategy sizing versus the 50% per-trade cap and resume-afte
 - A flatten retry uses a new client order id each attempt, so a second flatten the same UTC day can sell. `flatten --paper` is not ok when a position remains.
 - A killed DCA book logs `killed` once per state change. The report freeze column counts `freeze_trip`.
 - The safety scan covers the whole repo, Coinbase and Kraken order paths, and `getattr` write bypasses. `mid` is `(bid + ask) / 2` when both exist. Exposure caps still use that mid.
+
+### Trend entry size (Risk P1-5)
+
+A trend entry is no longer a fixed $500. Each coin's cash is tracked on its own, so a loss on one does not shrink the other. The order is the minimum of that cash and the largest notional the existing caps allow: 50% per trade, 50% per coin, and 100% total, after the 1% cost. The caps, the $10 minimum, turnover, trades per day, the hold, the band, and the average are unchanged. A result under $10 is skipped and logged (`below_min`).
 
 ### Quote source (Risk P1-3)
 
