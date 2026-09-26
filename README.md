@@ -1,18 +1,18 @@
-# rhbot
+# BTC & ETH Paper Trading Bot
 
-A paper-only bot for BTC and ETH. It pretends to trade so you can see whether a slow rule beats just holding, after a realistic cost. It cannot place, change, or cancel a real Robinhood order. There is no code path that does that.
+This is a practice bot for Bitcoin and Ethereum. It watches prices, makes **simulated** buys and sells with virtual cash, and shows how three fixed approaches compare after estimated trading costs. You can inspect its decisions and results without risking money. It cannot place, change, or cancel a real order.
 
-You do not need an API key. Marks, fills, and the spread cap use Coinbase's public bid/ask. Kraken is diagnostic only. Every simulated buy and sell pays 1% by default, which is about what a small Robinhood crypto account pays per side. Each strategy has its own $1,000 paper account, so they can be compared on the same footing.
+Each approach starts with its own virtual $1,000. The bot uses public Coinbase bid and ask prices to value positions and simulate fills, so no account or API key is needed. Kraken is diagnostic only and is not a fallback for missing Coinbase quotes. By default, the bot checks prices every 60 seconds, applies the fixed rules and risk checks, records pretend fills, and produces status and performance reports. Simulated trades include at least a 1% cost per side. Results are an experiment, not a promise of profit.
 
-## What it trades
+## The three approaches
 
-Only `BTC-USD` and `ETH-USD`. Three sleeves:
+The bot only simulates spot trades in `BTC-USD` and `ETH-USD`. Each approach has a separate paper portfolio:
 
-| Sleeve | What it does |
+| Approach | In plain language |
 | --- | --- |
-| Buy and hold | Splits the cash between BTC and ETH once, then sits there. This is the benchmark. |
-| Weekly DCA | Buys one coin every 7 days, BTC then ETH, at $19.23. |
-| Daily trend | Once a day, holds a coin when its last closed daily price is at least 2% above the 200-day average. Otherwise it goes to cash. It waits 7 days before selling, and it can buy again the next day. |
+| Buy and hold | Splits the virtual cash between BTC and ETH, then holds them. This is the comparison baseline. |
+| Weekly DCA | Makes one simulated $19.23 purchase every 7 days, alternating BTC and ETH. |
+| Daily trend | Checks yesterday's closing price against a 200-day average. It buys when the close is more than 2% above the average and sells when it is more than 2% below, after a minimum 7-day hold. Between those levels, it keeps its current position. |
 
 The 200-day average and the 2% band were picked before any backtest. The 7-day hold is the risk floor. They are not the winners of a search. Change them only in a reviewed pull request, not because one week looked good.
 
@@ -100,7 +100,7 @@ Kraken parsers are diagnostic only. They do not price marks, fills, or the sprea
 
 ## Tests
 
-The suite is offline. HTTP is mocked or skipped. It covers fees and fills, each strategy, position and exposure caps, the kill switch, drawdown, the audit hash chain, and a scan that fails if any bot code names a Robinhood order endpoint or issues an HTTP POST, PUT, PATCH, or DELETE. GitHub Actions runs `pytest` on push and on pull requests.
+Most tests use offline snapshots or mocked HTTP; the CLI flatten integration test also requests public market data. The suite covers fees and fills, each strategy, position and exposure caps, the kill switch, drawdown, the audit hash chain, and a scan that fails if any bot code names a Robinhood order endpoint or issues an HTTP POST, PUT, PATCH, or DELETE. GitHub Actions runs `pytest` on push and on pull requests.
 
 ## Real money
 
