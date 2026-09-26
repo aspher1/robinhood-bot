@@ -92,6 +92,10 @@ A risk denial is an audit event of kind `risk_denial` and a matching `trade_log`
 
 `rhbot selftest` validates config, checks the read-only signature helper, buys and flattens a throwaway book, trips the kill path, and verifies the hash chain. It uses a temporary directory so a drill cannot stop the running book.
 
+`rhbot dashboard --output <new.html>` builds a standalone HTML view from saved report, health, equity, fills, and selected audit events. It is a static observation, with no JavaScript, external assets, or trading controls. Each read uses a read-only ledger connection; sections may reflect different instants if the engine is writing concurrently. History is bounded and any chart sampling is labeled. It does not fetch quotes or start the paper clock.
+
+`rhbot export fills|equity --output <new.csv>` exports a UTC window of saved paper rows, with exact stored decimal strings. `--include-shadow` adds separately labeled no-overlay rows. Output files are created exclusively outside the state directory, so these operator commands cannot overwrite the ledger, heartbeat, kill file, or an existing report.
+
 ## Out of scope
 
 Stocks, options, margin, shorting, intraday signals, model-chosen trades, unofficial Robinhood clients, and any real order.

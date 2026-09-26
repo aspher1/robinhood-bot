@@ -60,6 +60,18 @@ def _parser() -> argparse.ArgumentParser:
     report.add_argument("--md", action="store_true", help="Print Markdown instead of JSON")
     report.set_defaults(func=cmd_report)
 
+    dashboard = sub.add_parser("dashboard", parents=[common], help="Save a standalone paper-performance dashboard")
+    dashboard.add_argument("--since", default="7d", help="History window such as 24h, 7d, or 30d")
+    dashboard.add_argument("--output", required=True, help="New HTML file outside the state directory")
+    dashboard.set_defaults(func=cmd_dashboard)
+
+    export = sub.add_parser("export", parents=[common], help="Export recorded paper data to CSV")
+    export.add_argument("dataset", choices=("fills", "equity"))
+    export.add_argument("--since", default="30d", help="Window such as 24h, 7d, or 30d")
+    export.add_argument("--include-shadow", action="store_true", help="Also include the no-overlay comparison books")
+    export.add_argument("--output", required=True, help="New CSV file outside the state directory")
+    export.set_defaults(func=cmd_export)
+
     kill = sub.add_parser("kill", parents=[common], help="Stop new simulated orders")
     kill.add_argument("--reason", required=True)
     kill.set_defaults(func=cmd_kill)
@@ -155,6 +167,44 @@ def cmd_report(args: argparse.Namespace) -> int:
         print(render_markdown(body))
     else:
         _emit(body)
+    return 0
+
+
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    from rhbot.artifacts import write_new_artifact
+    from rhbot.dashboard import render_dashboard
+    from rhbot.insights import build_dashboard
+
+    settings = load_settings(args.config, args.state_dir)
+    data = build_dashboard(settings, args.since)
+    path = write_new_artifact(args.output, render_dashboard(data), settings.state_dir)
+    _emit({
+        "ok": True,
+        "output": str(path),
+        "mode": "paper",
+        "started": data["started"],
+        "health": data["health"]["health"],
+        "generated_at": data["generated_at"],
+    })
+    return 0
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    from rhbot.artifacts import write_new_artifact
+    from rhbot.exports import build_csv
+
+    settings = load_settings(args.config, args.state_dir)
+    content, count = build_csv(settings, args.dataset, args.since, include_shadow=args.include_shadow)
+    path = write_new_artifact(args.output, content, settings.state_dir)
+    _emit({
+        "ok": True,
+        "output": str(path),
+        "mode": "paper",
+        "dataset": args.dataset,
+        "since": args.since,
+        "include_shadow": args.include_shadow,
+        "rows": count,
+    })
     return 0
 
 

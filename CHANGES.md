@@ -1,5 +1,10 @@
 # Changes
 
+## In development
+
+- A standalone browser dashboard for saved paper performance, cash, positions, sampled equity history, health, drawdown state, and recent fills and decisions. It reads saved data without making requests or changing the ledger.
+- CSV exports for recorded fills and equity, with exact stored decimals and optional separately labeled shadow books. New output files are written outside the state directory and cannot replace existing files.
+
 ## 0.1.0
 
 Paper-only BTC/ETH bot.

@@ -4,6 +4,8 @@ This is a practice bot for Bitcoin and Ethereum. It watches prices, makes **simu
 
 Each approach starts with its own virtual $1,000. The bot uses public Coinbase bid and ask prices to value positions and simulate fills, so no account or API key is needed. Kraken is diagnostic only and is not a fallback for missing Coinbase quotes. By default, the bot checks prices every 60 seconds, applies the fixed rules and risk checks, records pretend fills, and produces status and performance reports. Simulated trades include at least a 1% cost per side. Results are an experiment, not a promise of profit.
 
+You can also save a visual dashboard to open in any browser, or export the recorded trades and balance history to a spreadsheet. Both work from saved paper records and require no network connection.
+
 ## The three approaches
 
 The bot only simulates spot trades in `BTC-USD` and `ETH-USD`. Each approach has a separate paper portfolio:
@@ -59,6 +61,31 @@ State lives in the directory you pass (default `./state`):
 | `bot.sqlite` | Cash, positions, fills, and the audit log |
 | `heartbeat.json` | Proof the loop finished recently |
 | `KILL` | When this file exists, strategies cannot open new risk. Flatten can still sell |
+
+## See the results in your browser
+
+After the bot has recorded some paper cycles, save a dashboard:
+
+```bash
+rhbot dashboard --since 7d --state-dir state --output reports/paper-7d.html
+```
+
+Open `reports/paper-7d.html` in your browser. It shows each strategy's recorded equity, cash, return after costs, positions, equity history, recent simulated trades, and decision activity. It also shows health, quote age, and whether a strategy is frozen or killed. The comparison books show what the same strategies recorded without the drawdown overlay.
+
+This is a saved snapshot. Generate a new file to see newer results. Health and balances reflect the latest saved state; `--since` selects the performance and history window. The bot can continue recording during generation, so the sections are read separately rather than captured as one database transaction. Charts show up to 360 actual observations per strategy, including the last observation before the window when available. Sampling is labeled and can omit intermediate highs and lows. The recent-fill and activity tables show up to 50 records each. No browser scripts, hosted service, or external assets are needed.
+
+Before the first cycle, the dashboard shows an empty state. Generating it does not start the bot or create a trading ledger.
+
+## Export to a spreadsheet
+
+```bash
+rhbot export fills --since 30d --state-dir state --output reports/fills-30d.csv
+rhbot export equity --since 30d --include-shadow --state-dir state --output reports/equity-30d.csv
+```
+
+`fills` includes the recorded side, quantity, price, trading cost, cash change, reason, and order identifier. `equity` includes saved cash and portfolio values over time. Decimal values retain their stored precision. The `book` column distinguishes `paper` from the optional `shadow` comparison books. Shadow equity has a blank drawdown column because the shadow table does not store that value. Formula-like text is prefixed with an apostrophe so spreadsheet software treats it as text.
+
+Exports include records within the requested UTC window through generation time. Both commands print a JSON receipt with the output path; CSV exports also report the row count. They create missing output folders, refuse to overwrite an existing file, and require output outside the bot's state directory. Choose a new filename for each snapshot.
 
 ## Commands
 
