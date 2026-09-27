@@ -92,6 +92,14 @@ rhbot audit replay --since 7d --state-dir state
 
 Who is allowed to run which command is in `TEAM.md`. How the pieces fit is in `ARCHITECTURE.md`.
 
+## AI decision gate
+
+In `rhbot run`, each daily trend **entry** goes to an AI advisor before the risk checks. The Cursor agent CLI is tried first and the Codex CLI second. The advisor can only approve the order as it is or veto it. A veto means no trade, and the trend sleeve keeps what it holds until the rule asks again the next UTC day. It never creates, resizes, or adds an order. Exits are never gated — they are risk-reducing, and a veto during an AI outage must never trap the book in a falling position. Buy-and-hold and weekly DCA are never gated. The `trend_daily` shadow book reuses the live book's logged verdicts instead of calling the AI again, so `overlay_impact` still measures only the overlay. Replay, backtest, and selftest never call it.
+
+If the advisor is slow, missing, rate-limited, over its daily cap (10 calls by default), or answers in a form the bot cannot read, the answer is a veto. Every verdict is an `ai_gate` event in the audit log, with the backend, confidence, reason, and latency.
+
+Turn it off with `ai_gate.enabled: false` in `config.yaml` (restart), or at once with `touch state/AI_GATE_OFF`. See `config.example.yaml` for the other settings. It needs no API key here. Each CLI uses its own login.
+
 ## Quotes
 
 v1 paper uses Coinbase public bid/ask. Set `market_data: public` and `public_provider: coinbase`. A missing Coinbase quote fails the whole cycle closed: health goes critical (`quote_hard_stop`) and that cycle fills nothing. A quote 30 seconds old or older, or one with no bid or ask, denies new orders and sets the same hard stop. The bot does not fall back to Robinhood or Kraken. A reduce_only kill or flatten sell can still use the last valid bid/ask.

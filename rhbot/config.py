@@ -7,7 +7,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from rhbot.errors import ConfigError
 from rhbot.money import D
@@ -69,6 +69,49 @@ def reject_live_env() -> None:
             raise ConfigError(f"{key} cannot enable live trading; this process is paper-only")
 
 
+AI_GATE_BACKENDS = ("cursor", "codex")
+
+
+class AIGateSettings(BaseModel):
+    """Advisory veto on trend_daily intents in the live loop. It can only remove an order."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    backends: tuple[str, ...] = AI_GATE_BACKENDS
+    # One budget per cycle, shared by every review in it. It stays well under
+    # the 180 s systemd watchdog and heartbeat window with the 60 s loop.
+    timeout_s: int = 60
+    max_calls_per_day: int = 10
+    cursor_model: str | None = None
+    codex_model: str | None = None
+
+    @field_validator("backends", mode="before")
+    @classmethod
+    def _backends(cls, value: object) -> tuple[str, ...]:
+        if isinstance(value, str) or not isinstance(value, (list, tuple)):
+            raise ValueError("ai_gate.backends must be a list")
+        return tuple(str(item) for item in value)
+
+    @model_validator(mode="after")
+    def _bounds(self) -> AIGateSettings:
+        problems: list[str] = []
+        if not self.backends:
+            problems.append("ai_gate.backends cannot be empty")
+        unknown = [name for name in self.backends if name not in AI_GATE_BACKENDS]
+        if unknown:
+            problems.append(f"ai_gate.backends has unknown entries: {unknown}")
+        if len(set(self.backends)) != len(self.backends):
+            problems.append("ai_gate.backends contains a duplicate")
+        if not 5 <= self.timeout_s <= 90:
+            problems.append("ai_gate.timeout_s must be between 5 and 90")
+        if not 0 <= self.max_calls_per_day <= 100:
+            problems.append("ai_gate.max_calls_per_day must be between 0 and 100")
+        if problems:
+            raise ValueError("; ".join(problems))
+        return self
+
+
 class Settings(BaseModel):
     """Paper bot settings. ``mode`` cannot be anything but paper."""
 
@@ -102,6 +145,7 @@ class Settings(BaseModel):
     # v1 paper quotes are Coinbase public bid/ask. Kraken is diagnostic only.
     market_data: str = "public"
     public_provider: str = "coinbase"
+    ai_gate: AIGateSettings = Field(default_factory=AIGateSettings)
 
     @field_validator(
         "starting_cash",

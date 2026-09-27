@@ -1,5 +1,19 @@
 # Changes
 
+## 0.2.0
+
+AI decision gate (Randy's request). Advisory only: it can veto a `trend_daily` entry and nothing else. The 200-day average, 2% band, and 7-day hold are unchanged; the gate only advises on entries.
+
+- New `rhbot/ai_gate.py`. `review(intent, context)` returns APPROVE or VETO with a confidence (0 to 1), a one-sentence reason, the backend, and the latency. The Cursor agent CLI is tried first, then the Codex CLI. Each binary is found from a list of candidate paths, then `PATH`. The model must answer `DECISION`, `CONFIDENCE`, and `REASON` lines. Parsing is lenient. Anything it cannot parse is a veto.
+- Fails closed. A timeout, a missing binary, a quota or rate-limit message, a subprocess error, or the daily cap (`max_calls_per_day`, default 10, counted from the audit log so a restart does not reset it) is a veto with the cause recorded. The gate never raises into the engine.
+- The engine asks the gate in `rhbot run` only, after `trend_daily` decides and before risk. The gate filters **entries only**: a veto removes that buy order, and the sleeve keeps its position. Exits are never gated — they are risk-reducing, and a fail-closed veto during an AI outage must never trap the book in a falling position. The day's decision stays settled, so the rule asks again the next UTC day. An approval sends the order to risk unchanged, and risk still checks it. The gate never creates, resizes, or adds an order. Buy-and-hold, weekly DCA, drawdown flattens, and `flatten --paper` are never gated. Replay, backtest, `audit replay`, and selftest never call it.
+- The `trend_daily` shadow book reuses the live book's logged verdicts for the same UTC day instead of calling the AI again: one AI call per (day, symbol), and the shadow stays a clean no-overlay counterfactual, so `overlay_impact` still measures only the overlay. The shadow never launches a backend; an entry with no logged verdict is skipped (fail closed). If the live book holds a position while the shadow is flat (possible only after a transient risk denial desyncs their marks), the shadow skips entries on days the live book proposes none, and mirrors again at the next full entry/exit round-trip.
+- Each review gets one time budget per cycle (`timeout_s`, default 60, at most 90), so the loop stays inside the 180-second watchdog. A review that never reached a backend because the budget ran out is retried on a later cycle. An approval stands for the rest of that UTC day, so a transient risk denial does not spend another call.
+- Every verdict is a hash-chained `ai_gate` event: sleeve, symbol, side, action, decision, confidence, reason, backend, latency_ms, backend_calls, retry, and failures.
+- The CLI runs in an empty temporary directory. The quote key, the human resume secret, and every other `RH_*` and `RHBOT_*` variable are removed from its environment. Codex runs with `--sandbox read-only`.
+- Config: an `ai_gate` section (`enabled`, `backends`, `timeout_s`, `max_calls_per_day`, optional `cursor_model` and `codex_model`). It defaults to on. Turn it off with `enabled: false` or by creating `<state_dir>/AI_GATE_OFF`, which takes effect on the next cycle. Hard caps, risk checks, and brokers are unchanged.
+- `rhbot audit replay` does not run the gate. After a live veto, live and replay can differ from that day on.
+
 ## 0.1.0
 
 Paper-only BTC/ETH bot.

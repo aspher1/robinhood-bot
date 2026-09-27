@@ -9,6 +9,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 
+from rhbot.ai_gate import APPROVE, VETO, AIGate, Verdict, action_for, build_context, gate_disabled
 from rhbot.brokers.paper import PaperBroker
 from rhbot.config import Settings, frozen_params_hash, reject_live_env
 from rhbot.data.public import PublicMarketData
@@ -72,7 +73,7 @@ def ensure_utc(ts: datetime) -> datetime:
 
 
 class Engine:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, *, ai_gate: AIGate | None = None):
         reject_live_env()
         if settings.mode != "paper":
             from rhbot.errors import ConfigError
@@ -88,6 +89,9 @@ class Engine:
         self.public = PublicMarketData("coinbase")
         self.quotes = self.public
         self.ledger.set_meta("quote_source", "coinbase")
+        # Only serve() attaches the advisory gate. Replay, backtest, and selftest
+        # call run_once without one.
+        self.ai_gate = ai_gate
 
     def run_once(self, now: datetime | None = None, snapshot: MarketSnapshot | None = None) -> dict:
         market_now = ensure_utc(now or utcnow())
@@ -237,6 +241,8 @@ class Engine:
         return {"fills": fills_out, "errors": errors, "remaining": remaining}
 
     def serve(self, *, once: bool = False, sleep=time.sleep) -> None:
+        if self.ai_gate is None and self.settings.ai_gate.enabled:
+            self.ai_gate = AIGate(self.settings.ai_gate)
         sd_notify("READY=1")
         stop = {"flag": False}
 
@@ -359,9 +365,20 @@ class Engine:
             },
             market_now,
         )
+        transient: set[str] = set()
+        if strategy.name == "trend_daily" and orders and self._ai_gate_active():
+            # The gate filters entries only. Exits are risk-reducing and must
+            # never be blocked: a fail-closed veto during an AI outage would
+            # otherwise trap the book in a falling position.
+            entries = [o for o in orders if o.side == "buy"]
+            if entries:
+                reviewed, transient = self._ai_gate_review(
+                    entries, snapshot, positions, market_now
+                )
+                kept = {id(o) for o in reviewed}
+                orders = [o for o in orders if o.side != "buy" or id(o) in kept]
         filled: list[Fill] = []
         fresh: list[Fill] = []
-        transient: set[str] = set()
         ctx = self._context(strategy.name, snapshot, market_now)
         for intent in orders:
             if kill_active(self.settings.state_dir):
@@ -397,6 +414,160 @@ class Engine:
         self.ledger.snapshot(strategy.name, equity, market_now)
         return equity
 
+    def _ai_gate_active(self) -> bool:
+        if self.ai_gate is None:
+            return False
+        if gate_disabled(self.settings.ai_gate.enabled, self.settings.state_dir):
+            return False
+        return self.ledger.get_meta("mode") != "replay"
+
+    def _ai_gate_review(
+        self,
+        orders: list[OrderIntent],
+        snapshot: MarketSnapshot,
+        positions: dict,
+        market_now: datetime,
+    ) -> tuple[list[OrderIntent], set[str]]:
+        """Drop vetoed trend entries. Approved ones reach risk unchanged.
+
+        Entries only: exits bypass the gate (see _run_sleeve). A veto keeps
+        today's trend mark, so the rule asks again tomorrow. Only a review
+        that never reached a backend (cycle budget used up) is retried by a
+        later cycle the same day. Returns (kept, symbols to retry).
+        """
+        day = market_now.date().isoformat()
+        prior = self._ai_gate_events(day)
+        used = sum(int(item.get("backend_calls") or 0) for item in prior)
+        deadline = time.monotonic() + self.settings.ai_gate.timeout_s
+        kept: list[OrderIntent] = []
+        retry: set[str] = set()
+        for intent in orders:
+            verdict = self._ai_gate_verdict(intent, prior, snapshot, positions, market_now, used, deadline)
+            used += verdict.backend_calls
+            self.ledger.log_event(
+                "ai_gate",
+                {
+                    "sleeve": "trend_daily",
+                    "symbol": intent.symbol,
+                    "side": intent.side,
+                    "action": action_for(intent),
+                    **verdict.event_payload(),
+                },
+                market_now,
+            )
+            if verdict.approved:
+                kept.append(intent)
+            elif verdict.retry:
+                retry.add(intent.symbol)
+        return kept, retry
+
+    def _ai_gate_verdict(
+        self,
+        intent: OrderIntent,
+        prior: list[dict],
+        snapshot: MarketSnapshot,
+        positions: dict,
+        market_now: datetime,
+        used: int,
+        deadline: float,
+    ) -> Verdict:
+        # An approval stands for the rest of the UTC day, so a transient risk
+        # denial retried next cycle does not spend another call.
+        cached = self._ai_gate_cached_verdict(intent, prior)
+        if cached is not None:
+            return cached
+        try:
+            context = build_context(
+                intent,
+                bars=snapshot.bars.get(intent.symbol, []),
+                now=market_now,
+                position_qty=positions.get(intent.symbol, Decimal(0)),
+                entry_price=self._entry_price("trend_daily", intent.symbol),
+                book_drawdown=self._book_drawdown("trend_daily"),
+                overlay_state=self._overlay_state("trend_daily"),
+            )
+            assert self.ai_gate is not None
+            return self.ai_gate.review(intent, context, calls_used=used, deadline=deadline)
+        except Exception as exc:
+            return Verdict(
+                decision=VETO,
+                confidence=0.0,
+                reason=f"fail closed: gate error {type(exc).__name__}",
+                backend="none",
+                latency_ms=0,
+            )
+
+    def _ai_gate_cached_verdict(
+        self, intent: OrderIntent, prior: list[dict]
+    ) -> Verdict | None:
+        """A logged APPROVE for this (symbol, side) today, else None."""
+        for item in prior:
+            if (
+                item.get("symbol") == intent.symbol
+                and item.get("side") == intent.side
+                and item.get("decision") == APPROVE
+            ):
+                source = str(item.get("backend") or "").removeprefix("cached:")
+                return Verdict(
+                    decision=APPROVE,
+                    confidence=float(item.get("confidence") or 0),
+                    reason=str(item.get("reason") or ""),
+                    backend=f"cached:{source}",
+                    latency_ms=0,
+                )
+        return None
+
+    def _ai_gate_shadow_filter(
+        self, orders: list[OrderIntent], market_now: datetime
+    ) -> list[OrderIntent]:
+        """Apply the live book's logged gate verdicts to shadow entries.
+
+        The shadow reuses verdicts instead of launching backends: one AI call
+        per (day, symbol), and the shadow stays a clean no-overlay
+        counterfactual. Exits bypass the gate. An entry with no logged
+        verdict for today is skipped: fail closed, exactly like the live book.
+        """
+        day = market_now.date().isoformat()
+        prior = self._ai_gate_events(day)
+        kept: list[OrderIntent] = []
+        for intent in orders:
+            if intent.side != "buy":
+                kept.append(intent)
+                continue
+            verdict = self._ai_gate_cached_verdict(intent, prior)
+            if verdict is not None and verdict.approved:
+                kept.append(intent)
+        return kept
+
+    def _ai_gate_events(self, day: str) -> list[dict]:
+        rows = self.ledger.conn.execute(
+            "SELECT payload FROM events WHERE kind='ai_gate' AND substr(ts, 1, 10)=? ORDER BY seq",
+            (day,),
+        ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
+
+    def _entry_price(self, sleeve: str, symbol: str) -> Decimal | None:
+        """Average fill price of the open position, or None when flat."""
+        qty = Decimal(0)
+        cost = Decimal(0)
+        for row in self.ledger.fills_for(sleeve):
+            if row["symbol"] != symbol:
+                continue
+            delta = D(row["qty_delta"])
+            if delta > 0:
+                cost += delta * D(row["fill_price"])
+            elif qty > 0:
+                cost -= cost * (-delta / qty)
+            qty += delta
+            if qty <= 0:
+                qty = Decimal(0)
+                cost = Decimal(0)
+        return q8(cost / qty) if qty > 0 else None
+
+    def _book_drawdown(self, sleeve: str) -> Decimal:
+        row = self.ledger.overlay_row(sleeve)
+        return D(row["dd"]) if row is not None else Decimal(0)
+
     def _run_shadow_sleeve(self, strategy, market_now: datetime, snapshot: MarketSnapshot) -> None:
         """Same strategy and caps, without the 10% freeze or the 40% kill.
 
@@ -416,6 +587,8 @@ class Engine:
         orders, new_state, _reason = strategy.decide(
             snapshot, state, positions, cash, equity, market_now
         )
+        if strategy.name == "trend_daily" and orders and self._ai_gate_active():
+            orders = self._ai_gate_shadow_filter(orders, market_now)
         filled: list[Fill] = []
         transient: set[str] = set()
         ctx = self._shadow_context(shadow, snapshot, market_now)

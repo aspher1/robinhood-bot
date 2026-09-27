@@ -1,6 +1,6 @@
 # Operating team
 
-The bot is operated by an AI team lead, **Coin Ceo Bot**, and five agents that report to it. The team watches, reports, and stops the paper book. It does not decide trades. Strategies are fixed functions. Every simulated order is checked by the risk engine in code.
+The bot is operated by an AI team lead, **Coin Ceo Bot**, and five agents that report to it. The team watches, reports, and stops the paper book. It does not decide trades. Strategies are fixed functions. An AI advisor may veto a `trend_daily` entry, but it cannot change what any strategy proposes. Every simulated order is checked by the risk engine in code.
 
 Real money requires Randy's written approval and is out of scope. No role can grant that approval.
 

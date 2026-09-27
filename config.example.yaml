@@ -32,3 +32,23 @@ loop_seconds: 60
 # Kraken is diagnostic only. There is no Robinhood fallback.
 market_data: public
 public_provider: coinbase
+# Advisory AI veto on trend_daily entries (exits are never gated), in `rhbot run` only.
+# It can only drop a proposed order; risk checks still run on what it approves.
+# Buy-and-hold and weekly DCA are never gated. Replay and backtest never call it.
+# Every verdict is an `ai_gate` event in the audit log. A timeout, missing CLI,
+# quota error, unparseable answer, or the daily cap is a veto.
+# Turn it off with `enabled: false` (restart), or at once by creating
+# `<state_dir>/AI_GATE_OFF`. No API keys belong here; the CLIs use their own login.
+ai_gate:
+  enabled: true
+  # Tried in order. cursor = Cursor agent CLI, codex = Codex CLI.
+  backends:
+    - cursor
+    - codex
+  # Seconds shared by every review in one cycle (5-90).
+  timeout_s: 60
+  # Backend invocations per UTC day, counted from the audit log (0-100).
+  max_calls_per_day: 10
+  # Optional. Leave unset to use each CLI's default model.
+  # cursor_model: null
+  # codex_model: null

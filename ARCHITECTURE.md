@@ -6,6 +6,10 @@ Paper-only BTC and ETH. Three independent sleeves share one process and one data
 Coinbase public bid/ask (no key) --> engine cycle --> strategy intents
                                                      |
                                                      v
+                                     AI advisory gate (trend_daily entries
+                                     only, `rhbot run` only; veto drops the
+                                                     |  order and logs it)
+                                                     v approve
                                               risk engine (code)
                                                      |
                                                      v
@@ -32,6 +36,8 @@ A missing Coinbase quote fails the whole cycle closed: the engine records `quote
 ## Strategies
 
 Each strategy is a pure function from bars, quotes, positions, and its own state to order intents. The engine is the only thing that fills.
+
+In `rhbot run` only, a `trend_daily` entry passes an AI advisory gate before risk. The advisor (Cursor agent CLI first, Codex CLI second) may only veto the proposed entry or approve it unchanged; it cannot create, resize, or add orders. Anything the advisor cannot answer — a timeout, a missing binary, a quota or rate-limit message, an unparseable answer, or the daily call cap — is a veto. Every verdict is a hash-chained `ai_gate` event. Exits are never gated. Buy-and-hold and weekly DCA are never gated. The `trend_daily` shadow book reuses the live book's logged verdicts instead of calling the advisor, so `overlay_impact` still measures only the overlay. Replay, backtest, and selftest never call it.
 
 | Sleeve | Behavior |
 | --- | --- |
