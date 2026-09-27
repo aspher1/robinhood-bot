@@ -1,7 +1,11 @@
 from datetime import datetime, timezone
 from decimal import Decimal
 
+import httpx
+import pytest
+
 from rhbot.data.public import (
+    PublicMarketData,
     parse_coinbase_candles,
     parse_coinbase_ticker,
     parse_kraken_candles,
@@ -9,6 +13,7 @@ from rhbot.data.public import (
 )
 from rhbot.data.robinhood import TokenBucket, parse_best_bid_ask
 from rhbot.errors import RateLimitError
+from rhbot.errors import DataError
 
 
 def test_coinbase_and_kraken_parsers():
@@ -86,3 +91,65 @@ def test_read_budget_is_100_per_minute():
     assert raised
     clock["now"] = 60.0
     bucket.take()
+
+
+def test_coinbase_quote_batch_reuses_one_client_and_preserves_order(monkeypatch):
+    urls = []
+    clients = []
+
+    def respond(request):
+        urls.append(str(request.url))
+        return httpx.Response(
+            200,
+            json={
+                "price": "100",
+                "time": "2026-03-16T15:00:00Z",
+                "bid": "99",
+                "ask": "101",
+            },
+        )
+
+    def make_client():
+        client = httpx.Client(transport=httpx.MockTransport(respond))
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr("rhbot.data.http.json_client", make_client)
+    quotes = PublicMarketData().fetch_quotes(["BTC-USD", "ETH-USD"])
+    assert list(quotes) == ["BTC-USD", "ETH-USD"]
+    assert urls == [
+        "https://api.exchange.coinbase.com/products/BTC-USD/ticker",
+        "https://api.exchange.coinbase.com/products/ETH-USD/ticker",
+    ]
+    assert len(clients) == 1
+    assert clients[0].is_closed
+
+
+def test_quote_batch_closes_client_on_failure(monkeypatch):
+    clients = []
+
+    def make_client():
+        client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(503)))
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr("rhbot.data.http.json_client", make_client)
+    with pytest.raises(DataError, match="coinbase ticker http 503"):
+        PublicMarketData().fetch_quotes(["BTC-USD", "ETH-USD"])
+    assert len(clients) == 1
+    assert clients[0].is_closed
+
+
+def test_injected_quote_transport_does_not_create_client(monkeypatch):
+    def no_client():
+        raise AssertionError("injected transport should not create an HTTP client")
+
+    monkeypatch.setattr("rhbot.data.http.json_client", no_client)
+    seen = []
+
+    def transport(url):
+        seen.append(url)
+        return 200, {"price": "100", "time": "2026-03-16T15:00:00Z"}, {}
+
+    PublicMarketData(transport=transport).fetch_quotes(["BTC-USD", "ETH-USD"])
+    assert [url.split("/")[-2] for url in seen] == ["BTC-USD", "ETH-USD"]

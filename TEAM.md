@@ -49,7 +49,7 @@ Watches the process and is the only role that routinely restarts it.
 | --- | --- |
 | Is it up, and did it do something recently? | `rhbot status`, `rhbot health` |
 | Stop new simulated orders | `rhbot kill --reason "..."` which creates `state/KILL` |
-| Allow orders again after health is clear | `rhbot resume` |
+| Clear a manual `state/KILL` after health is clear (human only; the operator must not run this) | `rhbot resume --ack --human-code <code>` |
 | Acknowledge a 10% paper freeze (AI operator; does not move the peak) | `rhbot ack-drawdown --strategy trend_daily --by operator --note "..."` |
 | Clear a 40% paper kill (human only; the operator must not run this) | `rhbot resume --ack --human-code <code>` |
 | Preflight, including the kill path | `rhbot selftest` |
@@ -59,10 +59,12 @@ Watches the process and is the only role that routinely restarts it.
 
 Suggested rhythm: health every 15 minutes; if health is critical twice in a row, restart once; if it is still critical after that, kill and escalate to Coin Ceo Bot and Randy. Do not restart in a loop.
 
-May not edit strategy or risk code, read keys, resume over a broken ledger, or clear a 40% drawdown kill. That kill is human-only. The operator may acknowledge a 10% freeze and may not treat that acknowledgement as permission to resume.
+May not edit strategy or risk code, read keys, resume over a broken ledger, or clear a manual or 40% drawdown kill. Both clears are human-only. The operator may acknowledge a 10% freeze and may not treat that acknowledgement as permission to resume.
 
 ## Reporting
 
 Writes the P&L story. Uses `rhbot report --since 24h` (also `7d` and `30d`) and `rhbot audit verify`. Daily note to Randy is the 24h report in plain language. Weekly note adds the 7-day report, selftest (Operations runs it), and the audit check.
+
+May save a read-only browser snapshot with `rhbot dashboard --since 7d --output reports/paper.html`, or export recorded `fills` and `equity` to CSV with `rhbot export`. Use a new output filename outside the state directory. The dashboard is static and its generated time must stay visible when discussing results. Creating either output does not start a paper run or acknowledge a pause or kill.
 
 May not change positions, edit code, or treat the paper ledger as a live brokerage statement. P&L is net of the configured per-side cost. The buy-and-hold figure in the report is the no-overlay shadow sleeve. The `no_overlay` block shows each sleeve without the 10% freeze and without the 40% kill, and `overlay_effect` is the live book minus that shadow.

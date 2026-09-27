@@ -1464,6 +1464,11 @@ def test_p2_five_dollar_position_is_fully_sold(tmp_path, monkeypatch):
     bot.run_once(now=wall, snapshot=snapshot(wall))
     _plant(bot)
     bot.ledger.close()
+    # The CLI constructs a new engine. Supply a fresh quote to test the
+    # flatten command without depending on the public candles endpoint.
+    from rhbot.engine import Engine
+
+    monkeypatch.setattr(Engine, "load_market", lambda self: snapshot(utcnow()))
     assert main(["flatten", "--paper", "--state-dir", str(flat_dir)]) == 0
     bot = engine(flat_dir, sma_window=200)
     assert bot.ledger.positions("trend_daily") == {}

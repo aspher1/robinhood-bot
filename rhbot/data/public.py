@@ -8,6 +8,7 @@ is the quote; it is not added again on top of the 1% floor.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from decimal import Decimal
 from email.utils import parsedate_to_datetime
@@ -214,34 +215,41 @@ class PublicMarketData:
 
     def fetch_quotes(self, symbols: list[str]) -> dict[str, Quote]:
         quotes: dict[str, Quote] = {}
-        for symbol in symbols:
-            if symbol not in KRAKEN_PAIRS:
-                raise DataError(f"unsupported symbol {symbol}")
-            if self.provider == "coinbase":
-                url = (
-                    "https://api.exchange.coinbase.com/products/"
-                    f"{quote(symbol, safe='')}/ticker"
-                )
-                status, body, _headers = self._get(url)
-                if status != 200:
-                    raise DataError(f"coinbase ticker http {status}")
-                quotes[symbol] = parse_coinbase_ticker(symbol, body)
-            else:
-                # Diagnostic ticker. Not a v1 paper mark, fill, or spread source.
-                pair = KRAKEN_PAIRS[symbol]
-                url = f"https://api.kraken.com/0/public/Ticker?pair={pair}"
-                status, body, headers = self._get(url)
-                if status != 200:
-                    raise DataError(f"kraken ticker http {status}")
-                trade_url = f"https://api.kraken.com/0/public/Trades?pair={pair}"
-                trade_status, trade_body, _trade_headers = self._get(trade_url)
-                trade_time = parse_kraken_trade_time(trade_body) if trade_status == 200 else None
-                quotes[symbol] = parse_kraken_ticker(symbol, body, headers, trade_time=trade_time)
+        if self._transport is None and symbols:
+            from rhbot.data.http import json_client
+
+            batch = json_client()
+        else:
+            batch = nullcontext(None)
+        with batch as client:
+            for symbol in symbols:
+                if symbol not in KRAKEN_PAIRS:
+                    raise DataError(f"unsupported symbol {symbol}")
+                if self.provider == "coinbase":
+                    url = (
+                        "https://api.exchange.coinbase.com/products/"
+                        f"{quote(symbol, safe='')}/ticker"
+                    )
+                    status, body, _headers = self._get(url, client=client)
+                    if status != 200:
+                        raise DataError(f"coinbase ticker http {status}")
+                    quotes[symbol] = parse_coinbase_ticker(symbol, body)
+                else:
+                    # Diagnostic ticker. Not a v1 paper mark, fill, or spread source.
+                    pair = KRAKEN_PAIRS[symbol]
+                    url = f"https://api.kraken.com/0/public/Ticker?pair={pair}"
+                    status, body, headers = self._get(url, client=client)
+                    if status != 200:
+                        raise DataError(f"kraken ticker http {status}")
+                    trade_url = f"https://api.kraken.com/0/public/Trades?pair={pair}"
+                    trade_status, trade_body, _trade_headers = self._get(trade_url, client=client)
+                    trade_time = parse_kraken_trade_time(trade_body) if trade_status == 200 else None
+                    quotes[symbol] = parse_kraken_ticker(symbol, body, headers, trade_time=trade_time)
         return quotes
 
-    def _get(self, url: str) -> tuple[int, object, dict[str, str]]:
+    def _get(self, url: str, *, client=None) -> tuple[int, object, dict[str, str]]:
         if self._transport is not None:
             return self._transport(url)
         from rhbot.data.http import get_json
 
-        return get_json(url)
+        return get_json(url, client=client) if client is not None else get_json(url)

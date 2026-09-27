@@ -60,6 +60,31 @@ State lives in the directory you pass (default `./state`):
 | `heartbeat.json` | Proof the loop finished recently |
 | `KILL` | When this file exists, strategies cannot open new risk. Flatten can still sell |
 
+## See the results in your browser
+
+After the bot has recorded some paper cycles, save a dashboard:
+
+```bash
+rhbot dashboard --since 7d --state-dir state --output reports/paper-7d.html
+```
+
+Open `reports/paper-7d.html` in your browser. It shows each strategy's recorded equity, cash, return after costs, positions, equity history, recent simulated trades, and decision activity. It also shows health, quote age, and whether a strategy is frozen or killed. The comparison books show what the same strategies recorded without the drawdown overlay.
+
+This is a saved snapshot. Generate a new file to see newer results. Health and balances reflect the latest saved state; `--since` selects the performance and history window. The bot can continue recording during generation, so the sections are read separately rather than captured as one database transaction. Charts show up to 360 actual observations per strategy, including the last observation before the window when available. Sampling is labeled and can omit intermediate highs and lows. The recent-fill and activity tables show up to 50 records each. No browser scripts, hosted service, or external assets are needed.
+
+Before the first cycle, the dashboard shows an empty state. Generating it does not start the bot or create a trading ledger.
+
+## Export to a spreadsheet
+
+```bash
+rhbot export fills --since 30d --state-dir state --output reports/fills-30d.csv
+rhbot export equity --since 30d --include-shadow --state-dir state --output reports/equity-30d.csv
+```
+
+`fills` includes the recorded side, quantity, price, trading cost, cash change, reason, and order identifier. `equity` includes saved cash and portfolio values over time. Decimal values retain their stored precision. The `book` column distinguishes `paper` from the optional `shadow` comparison books. Shadow equity has a blank drawdown column because the shadow table does not store that value. Formula-like text is prefixed with an apostrophe so spreadsheet software treats it as text.
+
+Exports include records within the requested UTC window through generation time. Both commands print a JSON receipt with the output path; CSV exports also report the row count. They create missing output folders, refuse to overwrite an existing file, and require output outside the bot's state directory. Choose a new filename for each snapshot.
+
 ## Commands
 
 All of these print JSON. Exit codes are 0 (ok or not started yet), 1 (degraded), and 2 (critical, or the command was refused).
@@ -78,7 +103,7 @@ rhbot audit verify --state-dir state
 rhbot audit replay --since 7d --state-dir state
 ```
 
-`$CODE` is the secret in `RHBOT_HUMAN_RESUME_FILE`. Resume without `--ack` and that `--human-code` does not clear a kill.
+Before a kill needs clearing, Randy should create a private, nonempty text file outside the repository containing the human resume code. Set `RHBOT_HUMAN_RESUME_FILE` to that file's path in the environment of the `rhbot resume` command; `$CODE` in the example must match its contents. Keep the file and code out of git and bot automation. Only Randy should run resume. Clearing either a manual `state/KILL` or a 40% per-book kill requires `--ack` and `--human-code`. The command refuses to resume if another critical health problem remains.
 
 `status` and `health` answer "did it actually do something recently?": last successful cycle, the quote age from the last cycle, and error counts. A quote that was fresh during the cycle stays acceptable until the next loop window. The risk engine still rejects a quote older than 30 seconds at order time.
 

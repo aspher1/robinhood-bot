@@ -727,7 +727,7 @@ def render_markdown(report: dict) -> str:
 def audit_verify(settings: Settings) -> dict:
     if not _db_path(settings).exists():
         return {"ok": True, "events": 0, "detail": "not_started", "audit_head": None}
-    ledger = Ledger(settings)
+    ledger = Ledger(settings, readonly=True)
     try:
         ok, detail = ledger.verify_chain()
         head = ledger.head_hash()
