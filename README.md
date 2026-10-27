@@ -21,7 +21,7 @@
 
 <!-- portfolio-intro:end -->
 
-# rhbot
+## Running the paper research engine
 
 A paper-only bot for BTC and ETH. It pretends to trade so you can see whether a slow rule beats just holding, after a realistic cost. It cannot place, change, or cancel a real Robinhood order. There is no code path that does that.
 
