@@ -1,3 +1,24 @@
+<!-- portfolio-intro:start -->
+# rhbot | Paper Crypto Strategy Research
+
+**A Python research project comparing simulated BTC and ETH strategies to buy-and-hold after modeled transaction costs.** The emphasis is repeatable evaluation, risk controls and operational transparency, not trading claims.
+
+**Tech:** Python 3.12, Coinbase public bid/ask quotes, SQLite audit records, pytest, GitHub Actions.
+
+**Engineering highlights**
+- Independent simulated portfolios for buy-and-hold, weekly DCA and daily trend strategies.
+- Drawdown controls, human acknowledgments and an explicit kill-switch path.
+- CLI health reports, audit verification and comparative P&L reporting.
+- Offline tests and a CI workflow, including safeguards against broker-order integration.
+
+**Start here:** [Architecture](ARCHITECTURE.md) · [Security](SECURITY.md) · [Tests](tests/) · [CI](.github/workflows/ci.yml)
+
+**Scope:** Entirely **paper-only**. Despite the repository name, this project cannot execute Robinhood orders, and its results do not demonstrate profitable strategies. Fee assumptions and simulated fills are modeling choices, not production measurements.
+
+---
+
+<!-- portfolio-intro:end -->
+
 # rhbot
 
 A paper-only bot for BTC and ETH. It pretends to trade so you can see whether a slow rule beats just holding, after a realistic cost. It cannot place, change, or cancel a real Robinhood order. There is no code path that does that.
