@@ -1,6 +1,8 @@
 <!-- portfolio-intro:start -->
 # rhbot | Paper Crypto Strategy Research
 
+[![CI status](https://github.com/aspher1/robinhood-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/aspher1/robinhood-bot/actions/workflows/ci.yml)
+
 **A Python research project comparing simulated BTC and ETH strategies to buy-and-hold after modeled transaction costs.** The emphasis is repeatable evaluation, risk controls and operational transparency, not trading claims.
 
 **Tech:** Python 3.12, Coinbase public bid/ask quotes, SQLite audit records, pytest, GitHub Actions.
