@@ -90,6 +90,8 @@ A risk denial is an audit event of kind `risk_denial` and a matching `trade_log`
 
 `rhbot` prints JSON and uses exit codes 0 (ok or idle), 1 (degraded), and 2 (critical or bad input). `report --md` is the one command that prints Markdown instead. See `TEAM.md` for which role runs which command.
 
+`rhbot dashboard`, `rhbot export trades`, and `rhbot export equity` read the paper ledger only. They do not start the bot, fetch prices, or change bot state. No API key. The HTML page has three separate sections: Saved results (recorded equity, P&L, and trades), Stale health (heartbeat or quotes are old; the numbers are still the last saved marks), and Incomplete data (no ledger yet, a book has no equity snapshots, reconcile failed, or a kill flatten did not finish). Returns and the buy-and-hold benchmark on the page are percent, the same percent `rhbot report` already prints. They are not dollars. The equity CSV column `drawdown_fraction` keeps the stored fraction (0.10 means 10% off the peak), not a percent. CSV timestamps stay ISO. The page clock is `YYYY-MM-DD HH:MM:SS UTC`. `export trades` is simulated fills. `export equity` is equity snapshots. Omit `--out` to print to stdout. `--since` on dashboard matches report (`24h`, `7d`, `30d`). `rhbot status` and `rhbot report` stay the place that shows each book's overlay drawdown.
+
 `rhbot selftest` validates config, checks the read-only signature helper, buys and flattens a throwaway book, trips the kill path, and verifies the hash chain. It uses a temporary directory so a drill cannot stop the running book.
 
 ## Out of scope

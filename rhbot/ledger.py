@@ -733,6 +733,40 @@ class Ledger:
             ).fetchall()
         )
 
+    def recent_decisions(self, limit: int = 40) -> list[dict]:
+        import json
+
+        rows = self.conn.execute(
+            "SELECT seq, ts, payload FROM events WHERE kind='decision' ORDER BY seq DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        found: list[dict] = []
+        for row in rows:
+            payload = json.loads(row["payload"])
+            orders = payload.get("orders")
+            if not isinstance(orders, list):
+                orders = []
+            sleeve = payload.get("sleeve")
+            reason = payload.get("reason")
+            found.append(
+                {
+                    "seq": int(row["seq"]),
+                    "ts": str(row["ts"]),
+                    "sleeve": "" if sleeve is None else str(sleeve),
+                    "reason": "" if reason is None else str(reason),
+                    "orders": orders,
+                }
+            )
+        return found
+
+    def all_fills(self) -> list[sqlite3.Row]:
+        return list(self.conn.execute("SELECT * FROM fills ORDER BY id").fetchall())
+
+    def all_snapshots(self) -> list[sqlite3.Row]:
+        return list(
+            self.conn.execute("SELECT * FROM equity_snapshots ORDER BY id").fetchall()
+        )
+
     def count_events(self, kind: str, sleeve: str | None = None) -> int:
         if sleeve is None:
             row = self.conn.execute(
